@@ -1439,6 +1439,11 @@ void drawNodesBoundingBoxes(
 	});
 }
 
+// Capacity of the visibleNodes buffer allocated in kernel_render. Fisheye
+// disables frustum culling, so wide lenses inside a large cloud can exceed it.
+// Writes past the cap are dropped and the count is clamped after visibility.
+constexpr uint32_t MAX_VISIBLE_NODES = 100'000;
+
 void compute_visibility_disjunct(
 	uint32_t& numVisibleNodes,
 	uint32_t& numVisiblePoints,
@@ -1497,6 +1502,7 @@ void compute_visibility_disjunct(
 
 	auto makeVisible = [&](Node* node){
 		uint32_t visibleNodeIndex = atomicAdd(&numVisibleNodes, 1);
+		if(visibleNodeIndex >= MAX_VISIBLE_NODES) return;
 		visibleNodes[visibleNodeIndex] = *node;
 
 		if(node->numPoints > 0){
@@ -1864,6 +1870,7 @@ void compute_visibility_add(
 		
 		if(visible){
 			uint32_t visibleNodeIndex = atomicAdd(&numVisibleNodes, 1);
+			if(visibleNodeIndex >= MAX_VISIBLE_NODES) return;
 			visibleNodes[visibleNodeIndex] = nodes[nodeIndex];
 
 			if(node->numPoints > 0){
@@ -2035,6 +2042,12 @@ void kernel_render(
 	// visibleNodes = nodes;
 	// numVisibleNodes = numNodes;
 
+	grid.sync();
+
+	// the counter keeps counting past the cap; draw only what was stored
+	if(grid.thread_rank() == 0 && numVisibleNodes > MAX_VISIBLE_NODES){
+		numVisibleNodes = MAX_VISIBLE_NODES;
+	}
 	grid.sync();
 
 	{ // draw nodes, boxes, lines, ...
@@ -2376,11 +2389,14 @@ void kernel_render(
 			int vx = i % volW;
 			int vy = i / volW;
 
-			// Ray through the centre of this quarter-res pixel. Unproject the
-			// far plane and aim from the camera through it.
-			float ndcx = ((float(vx) + 0.5f) / float(volW)) * 2.0f - 1.0f;
-			float ndcy = ((float(vy) + 0.5f) / float(volH)) * 2.0f - 1.0f;
+			// volBuf is scratch memory that also serves other kernels, and the
+			// composite reads every entry, so clear it before any early return
+			// (fisheye corners beyond the lens, or nothing to march through).
+			volBuf[3*i + 0] = 0.0f;
+			volBuf[3*i + 1] = 0.0f;
+			volBuf[3*i + 2] = 0.0f;
 
+			// Ray through the centre of this quarter-res pixel.
 			float3 dir;
 			if(!pixelRayDir((float(vx) + 0.5f) / float(volW) * uniforms.width,
 							(float(vy) + 0.5f) / float(volH) * uniforms.height, dir)) return;

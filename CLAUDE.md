@@ -13,11 +13,14 @@ Git remotes: `upstream` = m-schuetz/SimLOD. The user's own repo is private. Work
 ```
 mkdir build
 cd build
-cmake .. -G "Visual Studio 17 2022" -A x64
+cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 cmake --build . --config Release
 ```
 
-- Build **Release**. Debug currently fails (CMake adds `/O2` in every config, which clashes with `/RTC1`).
+- The policy flag is needed with CMake 4.x, because the fetched GLFW declares `cmake_minimum_required` < 3.5.
+- The CUDA `.cu` files cannot be syntax-checked with plain `nvcc`. NVRTC compiles them with device as the default execution space. To check them, run the built exe from the repo root for a few seconds and look for `=== COMPILING:` lines followed by errors in stdout.
+
+- Build **Release** for normal use. Debug is much slower, but it is useful for host-side debugging.
 - Requires CUDA ≥ 12.0 (links `CUDA::nvJitLink`) and CMake ≥ 3.26, despite what `CMakeLists.txt` declares.
 - There are no tests and no linter. Verification means building and running, then dropping a point cloud onto the window.
 - Post-build copies `modules/` next to the exe. The `.cu` files are compiled **at runtime** with NVRTC, so CUDA edits do not need a C++ rebuild.
