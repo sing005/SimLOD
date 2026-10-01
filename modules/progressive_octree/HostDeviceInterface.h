@@ -155,8 +155,9 @@ struct Uniforms{
 	float3   camUp;
 
 	// navigation and markers (apply_navigate.ps1)
-	int      pickX;             // pixel to pick this frame, -1 = none
+	int      pickX;             // pixel to pick, -1 = none; held until answered
 	int      pickY;
+	int      pickSeq;           // request id; the kernel answers each id once
 	int      numMarkers;
 	int      showMarkers;       // apply_markers2.ps1: 0 hides the balls, markers are kept
 	float    markerX[32];       // placed markers, renderer frame (apply_markers2.ps1: 32)
@@ -207,6 +208,7 @@ struct Stats{
 	float    pickWX                     = 0;   // its position, renderer frame
 	float    pickWY                     = 0;
 	float    pickWZ                     = 0;
+	int      pickSeqDone                = 0;   // id of the last pick request answered (hit or miss)
 	uint32_t numChunksPoints            = 0;
 	uint32_t numChunksVoxels            = 0;
 
