@@ -19,19 +19,13 @@ set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT $
 set_target_properties(${PROJECT_NAME} PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
                                                VS_DEBUGGER_COMMAND           "$<TARGET_FILE:${PROJECT_NAME}>"
                                                VS_DEBUGGER_ENVIRONMENT       "PATH=%PATH%;${CMAKE_PREFIX_PATH}")
-# Build options based on CMAKE_BUILD_TYPE
-function(configure_build_type)
-	if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-		target_compile_options(${PROJECT_NAME} PRIVATE -O0 -g)
-	elseif (CMAKE_BUILD_TYPE STREQUAL "Release")
-		target_compile_options(${PROJECT_NAME} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/O2> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O3>)
-	else()
-		message(WARNING "No CMAKE_BUILD_TYPE specified, defaulting to Release settings.")
-		set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Default build type: Release" FORCE)
-		target_compile_options(${PROJECT_NAME} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/O2> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O3>)
-	endif ()
-endfunction()
-configure_build_type()
+# Optimisation flags come from CMake's per-config defaults (/O2 or -O3 in
+# Release, none in Debug). Single-config generators default to Release.
+# Multi-config generators (Visual Studio) leave CMAKE_BUILD_TYPE empty.
+if (NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+	message(STATUS "No CMAKE_BUILD_TYPE specified, defaulting to Release.")
+	set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
+endif ()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     include
