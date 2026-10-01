@@ -78,12 +78,37 @@ struct CudaModule{
 		string cuda_include = std::format("-I {}/include", cuda_path);
 		string cudastd_include = std::format("-I {}/include/cuda/std", cuda_path);
 		
+		// Compile for the GPU that is actually present (the link step below
+		// already targets it). Hardcoded compute_86 failed to link on older
+		// cards and left newer ones (e.g. Ada, compute 8.9) on the 8.6 feature
+		// set. Use the newest architecture this NVRTC supports that does not
+		// exceed the device's.
+		int deviceArch = 86;
+		{
+			CUdevice dev;
+			int major = 0, minor = 0;
+			if(cuDeviceGet(&dev, 0) == CUDA_SUCCESS
+				&& cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) == CUDA_SUCCESS
+				&& cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) == CUDA_SUCCESS){
+				deviceArch = major * 10 + minor;
+			}
+		}
+		int compileArch = 0;
+		{
+			int numArchs = 0;
+			nvrtcGetNumSupportedArchs(&numArchs);
+			std::vector<int> archs(numArchs);
+			if(numArchs > 0) nvrtcGetSupportedArchs(archs.data());
+			for(int a : archs) if(a <= deviceArch && a > compileArch) compileArch = a;
+			if(compileArch == 0) compileArch = deviceArch;
+		}
+		string optArch = std::format("--gpu-architecture=compute_{}", compileArch);
+
 		nvrtcProgram prog;
 		string source = readFile(path);
 		nvrtcCreateProgram(&prog, source.c_str(), name.c_str(), 0, NULL, NULL);
-		std::vector<const char*> opts = { 
-			// "--gpu-architecture=compute_89",
-			"--gpu-architecture=compute_86",
+		std::vector<const char*> opts = {
+			optArch.c_str(),
 			"--use_fast_math",
 			"--extra-device-vectorization",
 			"-lineinfo",
