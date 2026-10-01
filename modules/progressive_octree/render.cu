@@ -1906,7 +1906,11 @@ void kernel_render(
 		*frameStartTimestamp = nanotime();
 	}
 
-	uniforms = _uniforms;
+	// One thread copies the ~2 KB uniforms into the device global. Every thread
+	// used to do it, which on an 80k-thread launch meant ~150 MB of redundant
+	// global stores per frame.
+	if(grid.thread_rank() == 0) uniforms = _uniforms;
+	grid.sync();
 	Allocator _allocator(buffer, 0);
 	allocator = &_allocator;
 
@@ -1948,6 +1952,11 @@ void kernel_render(
 	float* volBuf = allocator->alloc<float*>(volW * volH * 3 * sizeof(float));
 	if(grid.thread_rank() == 0){ _numEmitting = 0; _numDrawn = 0; _numTargets = 0; }
 
+	// Recount the occupancy grid first: the light grid below is derived from
+	// these counts, and the host requests both together after a reallocation.
+	grid.sync();
+	refillVoxelGrid(nodes);   // apply_grid_refill.ps1: only when the host says stale
+
 	// ---- build the light transmittance grid (apply_keylight.ps1) ----------
 	// Only when the host says it is stale: after a load, or when a light
 	// control moves. Otherwise this is skipped entirely and the light costs
@@ -1962,9 +1971,11 @@ void kernel_render(
 
 			float trans = 1.0f;
 			for(int s = 1; s <= uniforms.lightSteps; s++){
-				int sx = cx + int(uniforms.lightDirX * float(s) + 0.5f);
-				int sy = cy + int(uniforms.lightDirY * float(s) + 0.5f);
-				int sz = cz + int(uniforms.lightDirZ * float(s) + 0.5f);
+				// round to nearest; int(x + 0.5f) truncates toward zero, which
+				// shortened shadows for negative light-direction components
+				int sx = cx + __float2int_rn(uniforms.lightDirX * float(s));
+				int sy = cy + __float2int_rn(uniforms.lightDirY * float(s));
+				int sz = cz + __float2int_rn(uniforms.lightDirZ * float(s));
 				// left the grid: open sky from here on, stop accumulating
 				if(sx < 0 || sy < 0 || sz < 0) break;
 				if(sx >= uniforms.gridX || sy >= uniforms.gridY || sz >= uniforms.gridZ) break;
@@ -1979,7 +1990,6 @@ void kernel_render(
 		grid.sync();
 	}
 	grid.sync();
-	refillVoxelGrid(nodes);   // apply_grid_refill.ps1: only when the host says stale
 
 	// clear framebuffer
 	processRange(0, uniforms.width * uniforms.height, [&](int pixelIndex){
@@ -2132,6 +2142,44 @@ void kernel_render(
 
 	// if(false)
 	if(grid.thread_rank() == 0) stats->stageNs[1] = nanotime() - tStart;   // apply_stage_timers.ps1
+
+	// ---- pick (apply_navigate.ps1) ----------------------------------------
+	// After the scan is drawn but before debug geometry (voxel-grid view,
+	// event markers), so a pick always lands on the scan: read the depth
+	// under the requested pixel, turn it back into a world position, hand it
+	// to the host via Stats. Each request id is answered exactly once and the
+	// answer is left in place, so the host cannot miss it however far its
+	// asynchronous Stats copy lags behind.
+	grid.sync();
+	if(grid.thread_rank() == 0 && uniforms.pickSeq != stats->pickSeqDone){
+		int valid = 0;
+		// Reject the background explicitly. The clear writes 0x7f800000, which
+		// is +infinity; comparing a float against 1.0e30 relies on that bit
+		// pattern decoding cleanly, and a NaN would pass every comparison.
+		// Test the bits.
+		if(uniforms.pickX >= 0 && uniforms.pickY >= 0
+		   && uniforms.pickX < int(uniforms.width) && uniforms.pickY < int(uniforms.height)){
+			uint64_t fbv = framebuffer[uniforms.pickX + int(uniforms.width) * uniforms.pickY];
+			uint32_t dbits = uint32_t(fbv >> 32);
+			float depth = *((float*)&dbits);
+			float3 rd;
+			bool hitGeometry = (dbits != 0x7f800000u)          // not the cleared background
+							&& ((dbits & 0x7f800000u) != 0x7f800000u)   // not inf or NaN
+							&& depth > 0.0f && depth < 1.0e6f;
+			if(hitGeometry && pixelRayDir(float(uniforms.pickX) + 0.5f, float(uniforms.pickY) + 0.5f, rd)){
+				float dist = depthToDistance(depth, rd);
+				stats->pickWX = uniforms.camPos.x + rd.x * dist;
+				stats->pickWY = uniforms.camPos.y + rd.y * dist;
+				stats->pickWZ = uniforms.camPos.z + rd.z * dist;
+				valid = 1;
+			}
+		}
+		stats->pickValid = valid;
+		__threadfence();
+		stats->pickSeqDone = uniforms.pickSeq;   // written last
+	}
+	grid.sync();   // nothing may draw over the pixel while thread 0 reads it
+
 	// ---- voxel grid debug view (apply_voxel_grid.ps1) ------------------
 	// Draws the centre of every occupied cell, coloured by count: blue for
 	// sparse, through green, to red for dense. A verification view, like the
@@ -2183,36 +2231,6 @@ void kernel_render(
 		});
 		grid.sync();
 	}
-
-	// ---- pick (apply_navigate.ps1) ----------------------------------------
-	// After everything solid is drawn: read the depth under the requested
-	// pixel, turn it back into a world position, hand it to the host via
-	// Stats. One thread, once per frame, only when asked.
-	if(grid.thread_rank() == 0){
-		stats->pickValid = 0;
-		// Reject the background explicitly. The clear writes 0x7f800000, which
-		// is +infinity; comparing a float against 1.0e30 relies on that bit
-		// pattern decoding cleanly, and a NaN would pass every comparison.
-		// Test the bits.
-		if(uniforms.pickX >= 0 && uniforms.pickY >= 0
-		   && uniforms.pickX < int(uniforms.width) && uniforms.pickY < int(uniforms.height)){
-			uint64_t fbv = framebuffer[uniforms.pickX + int(uniforms.width) * uniforms.pickY];
-			uint32_t dbits = uint32_t(fbv >> 32);
-			float depth = *((float*)&dbits);
-			float3 rd;
-			bool hitGeometry = (dbits != 0x7f800000u)          // not the cleared background
-							&& ((dbits & 0x7f800000u) != 0x7f800000u)   // not inf or NaN
-							&& depth > 0.0f && depth < 1.0e6f;
-			if(hitGeometry && pixelRayDir(float(uniforms.pickX) + 0.5f, float(uniforms.pickY) + 0.5f, rd)){
-				float dist = depthToDistance(depth, rd);
-				stats->pickWX = uniforms.camPos.x + rd.x * dist;
-				stats->pickWY = uniforms.camPos.y + rd.y * dist;
-				stats->pickWZ = uniforms.camPos.z + rd.z * dist;
-				stats->pickValid = 1;
-			}
-		}
-	}
-	grid.sync();
 
 	// ---- placed markers (apply_navigate.ps1) ----------------------------
 	// The checkerboard centres the user has picked. Drawn as a white cluster
