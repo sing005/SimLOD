@@ -1,0 +1,54 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # Only the pieces the host build links against. The .cu kernels are
+      # compiled at runtime by NVRTC on the user's machine, so they are not
+      # built (or checked) here.
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.4.1'
+          method: network
+          sub-packages: '["nvcc", "cudart", "nvrtc", "nvrtc_dev", "nvjitlink"]'
+
+      # CMAKE_POLICY_VERSION_MINIMUM: the fetched GLFW declares a minimum below
+      # 3.5, which CMake 4.x rejects without it.
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
+      - name: Build (Release)
+        run: cmake --build build --config Release -- -m
+
+      # Everything SimLOD.exe needs next to it. Running it still requires a
+      # CUDA 12.x toolkit on the target machine (CUDA_PATH must be set: NVRTC
+      # compiles the kernels against its headers at startup).
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "dist/SimLOD"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item build/Release/SimLOD.exe, build/Release/laszip.dll $out
+          if (Test-Path build/Release/SimLOD.pdb) { Copy-Item build/Release/SimLOD.pdb $out }
+          Copy-Item -Recurse modules $out/modules
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: SimLOD-windows-x64
+          path: dist/SimLOD
+          retention-days: 14
