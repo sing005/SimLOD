@@ -1,3 +1,4 @@
+// include/OrbitControls.h
 
 #pragma once
 
@@ -58,7 +59,10 @@ struct OrbitControls{
 
 		//auto rotation = rotYaw;
 		//auto rotation = rotPitch * rotYaw;
-		auto rotation = rotPitch * rotYaw;
+		// apply_markers2.ps1: update() builds world as rotYaw * rotPitch; this
+		// had them the other way round, so getPosition() (Copy camera) did not
+		// report the camera the renderer was actually using.
+		auto rotation = rotYaw * rotPitch;
 
 		return rotation;
 	}
@@ -122,20 +126,29 @@ struct OrbitControls{
 	}
 
 	void onMouseScroll(double xoffset, double yoffset){
-		//cout << xoffset << ", " << yoffset << endl;
-
-		// +1: zoom in
-		// -1: zoom out
-
-		if(yoffset < 0.0){
+		// +1 in, -1 out. Orbiting from a distance, the wheel zooms by scaling
+		// the radius. Standing inside the forest - radius under half a metre,
+		// which is what Go to centre sets - scaling 0.001 m by 1.1 moves the
+		// camera a tenth of a millimetre, so the wheel WALKS instead: a step
+		// along the view direction. (apply_navigate.ps1)
+		if(walkMode){
+			// translate_local moves the TARGET; the camera sits one radius
+			// behind it. Pinning the radius each step is what keeps the two
+			// together - without it, looking around lets the camera drift
+			// back, radius grows past the old 0.5 m test, and the wheel
+			// silently reverts to zooming, which at a steep pitch reads as
+			// rising rather than advancing. (fix_walk_targets.ps1)
+			double step = walkStep * (yoffset > 0.0 ? 1.0 : -1.0);
+			translate_local(0.0, 0.0, step);   // fix_walk_axis: z is forward, y is screen-up
+			radius = 0.001;
+		}else if(yoffset < 0.0){
 			radius = radius * 1.1;
 		}else{
 			radius = radius / 1.1;
 		}
-
-		//cout << radius << endl;
-
 	}
+	bool   walkMode = false;   // set by Go to centre / the Walk button
+	double walkStep = 0.75;    // metres per wheel notch when walking
 
 	void update(){
 		glm::dvec3 up    = {0, 0, 1};

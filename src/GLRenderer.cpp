@@ -312,10 +312,26 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 			ssFPS << this->fps;
 			string strFps = ssFPS.str();
 
-			ImGui::SetNextWindowPos(ImVec2(10, 30));
-			ImGui::SetNextWindowSize(windowSize_perf);
+			// movable + collapse-to-title (apply_windows.ps1)
+			static bool   perfCollapsed = false;
+			static ImVec2 perfSaved     = ImVec2(0, 0);
+			ImGui::SetNextWindowPos(ImVec2(10, 30), ImGuiCond_FirstUseEver);
+			if(perfCollapsed){
+				float w = ImGui::CalcTextSize("Performance").x
+						+ ImGui::GetStyle().WindowPadding.x * 2.0f
+						+ ImGui::GetFrameHeight() + ImGui::GetFontSize();
+				ImGui::SetNextWindowSize(ImVec2(w, 0.0f), ImGuiCond_Always);
+			}else{
+				ImGui::SetNextWindowSize(perfSaved.x > 0.0f ? perfSaved : windowSize_perf,
+										 ImGuiCond_FirstUseEver);
+			}
 
 			ImGui::Begin("Performance");
+			{
+				bool nc = ImGui::IsWindowCollapsed();
+				if(!nc){ ImVec2 s = ImGui::GetWindowSize(); if(s.x > 0.0f) perfSaved = s; }
+				perfCollapsed = nc;
+			}
 			string fpsStr = rightPad("FPS:", 30) + strFps;
 			ImGui::Text(fpsStr.c_str());
 

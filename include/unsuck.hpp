@@ -739,8 +739,14 @@ template <typename... Args>
 inline void printfmt(std::string_view fmt, const Args&... args) {
 #ifdef __cpp_lib_format
 	struct thousandsSeparator : std::numpunct<char> {
-		char_type do_thousands_sep() const override { return '\''; }
-		string_type do_grouping() const override { return "\3"; }
+		// MSVC 19.4x mis-resolves the inherited typedefs char_type and
+		// string_type inside this local class in a variadic template, and
+		// substitutes the pack type, producing basic_string<DWORD>. The
+		// concrete types are exactly equivalent: numpunct<char>::char_type
+		// is char and ::string_type is std::string. punct_facet above
+		// already writes them this way.
+		char        do_thousands_sep() const override { return '\''; }
+		std::string do_grouping()      const override { return "\3"; }
 	};
 	auto thousands = std::make_unique<thousandsSeparator>();
 	auto locale = std::locale(std::cout.getloc(), thousands.release());

@@ -24,11 +24,11 @@ function(configure_build_type)
 	if (CMAKE_BUILD_TYPE STREQUAL "Debug")
 		target_compile_options(${PROJECT_NAME} PRIVATE -O0 -g)
 	elseif (CMAKE_BUILD_TYPE STREQUAL "Release")
-		target_compile_options(${PROJECT_NAME} PRIVATE -O3)
+		target_compile_options(${PROJECT_NAME} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/O2> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O3>)
 	else()
 		message(WARNING "No CMAKE_BUILD_TYPE specified, defaulting to Release settings.")
 		set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Default build type: Release" FORCE)
-		target_compile_options(${PROJECT_NAME} PRIVATE -O3)
+		target_compile_options(${PROJECT_NAME} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/O2> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O3>)
 	endif ()
 endfunction()
 configure_build_type()
@@ -47,7 +47,11 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 target_link_libraries(${PROJECT_NAME}
 	CUDA::cuda_driver
-	CUDA::nvrtc)
+	CUDA::nvrtc
+	# CudaModularProgram.h includes <nvJitLink.h> and calls the API, but
+	# upstream never links the library. Added in CUDA 12.0; the CMake
+	# imported target CUDA::nvJitLink exists from CMake 3.26.
+	CUDA::nvJitLink)
 
 ## OpenGL
 find_package(OpenGL REQUIRED)
