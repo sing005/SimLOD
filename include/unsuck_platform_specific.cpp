@@ -28,7 +28,11 @@ void toClipboard(string str) {
 
 uint64_t getPhysicalSectorSize(string path) {
 
-	std::string rootPath = fs::path(path).root_path().string();
+	// absolute first: a relative path has no root, the device query below then
+	// fails, and a sector size of 0 became a divide by zero in the loaders
+	std::error_code ec;
+	fs::path absolutePath = fs::absolute(fs::path(path), ec);
+	std::string rootPath = (ec ? fs::path(path) : absolutePath).root_path().string();
 	rootPath = rootPath.substr(0, rootPath.find_last_of("\\"));
 	rootPath = rootPath.substr(0, rootPath.find_last_of("/"));
 
@@ -52,16 +56,23 @@ uint64_t getPhysicalSectorSize(string path) {
 	};
 	STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR diskAlignment = { 0 };
 
-	DeviceIoControl(hDevice,
-		IOCTL_STORAGE_QUERY_PROPERTY,
-		&storageQuery,
-		sizeof(STORAGE_PROPERTY_QUERY),
-		&diskAlignment,
-		sizeof(STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR),
-		&outsize,
-		NULL
-	);
+	BOOL ok = FALSE;
+	if(hDevice != INVALID_HANDLE_VALUE){
+		ok = DeviceIoControl(hDevice,
+			IOCTL_STORAGE_QUERY_PROPERTY,
+			&storageQuery,
+			sizeof(STORAGE_PROPERTY_QUERY),
+			&diskAlignment,
+			sizeof(STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR),
+			&outsize,
+			NULL
+		);
+		CloseHandle(hDevice);   // was leaked once per loaded batch
+	}
 
+	// Unbuffered reads must be sector-aligned. If the query fails (network
+	// share, unusual driver), 4096 covers every common physical sector size.
+	if(!ok || diskAlignment.BytesPerPhysicalSector == 0) return 4096;
 	return diskAlignment.BytesPerPhysicalSector;
 }
 

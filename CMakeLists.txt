@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.22)
+# 3.26: first version with the CUDA::nvJitLink imported target used below
+cmake_minimum_required(VERSION 3.26)
 project(SimLOD)
 
 include(FetchContent)
@@ -13,7 +14,8 @@ add_executable(${PROJECT_NAME}
 	src/GLRenderer.cpp
     include/unsuck_platform_specific.cpp	
     modules/progressive_octree/LasLoader.cpp	
-    modules/progressive_octree/SimlodLoader.cpp	
+    modules/progressive_octree/SimlodLoader.cpp
+	modules/progressive_octree/CrashHandler.cpp
 	modules/progressive_octree/main_progressive_octree.cpp)
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
 set_target_properties(${PROJECT_NAME} PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
@@ -27,6 +29,14 @@ if (NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif ()
 
+# Release builds also emit a .pdb so the crash handler can name the function
+# and line in its stack trace. Keep the .pdb next to SimLOD.exe when copying
+# the build to another machine. /OPT:REF,ICF keep the exe as small as without.
+if (MSVC)
+	target_compile_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Release>:/Zi>)
+	target_link_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+endif ()
+
 target_include_directories(${PROJECT_NAME} PRIVATE
     include
 	modules/CudaPrint
@@ -35,9 +45,9 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 # Dependencies
 
 ## CUDA toolkit
-find_package(CUDAToolkit 11.8 REQUIRED)
+find_package(CUDAToolkit 12.0 REQUIRED)   # nvJitLink arrived in CUDA 12.0
 target_include_directories(${PROJECT_NAME} PRIVATE
-	CUDAToolkit_INCLUDE_DIRS)
+	${CUDAToolkit_INCLUDE_DIRS})
 
 target_link_libraries(${PROJECT_NAME}
 	CUDA::cuda_driver
