@@ -625,9 +625,9 @@ void insertPoints(
 		// passes through here exactly once. Spilled points re-enter through
 		// the loop below and are deliberately NOT counted again.
 		if(_voxelGrid != nullptr){
-			int cx = int(point.x / _cellSize);
-			int cy = int(point.y / _cellSize);
-			int cz = int(point.z / _cellSize);
+			int cx = int(floorf(point.x / _cellSize));
+			int cy = int(floorf(point.y / _cellSize));
+			int cz = int(floorf(point.z / _cellSize));
 			if(cx >= 0 && cx < _gridX && cy >= 0 && cy < _gridY && cz >= 0 && cz < _gridZ){
 				atomicAdd(&_voxelGrid[cx + _gridX * (cy + _gridY * cz)], 1u);
 			}
