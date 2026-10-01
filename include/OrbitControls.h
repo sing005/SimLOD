@@ -119,13 +119,21 @@ struct OrbitControls{
 			auto ux = diff.x / 1000.0;
 			auto uy = diff.y / 1000.0;
 
-			translate_local(-ux * radius, uy * radius, 0);
+			// pan scales with the orbit radius; in walk mode the radius is
+			// pinned near zero, so use the walk step instead (10 steps per
+			// 1000 px) or right-drag would not move the camera at all
+			double panScale = walkMode ? walkStep * 10.0 : radius;
+			translate_local(-ux * panScale, uy * panScale, 0);
 		}
 		
 		mousePos = newMousePos;
 	}
 
 	void onMouseScroll(double xoffset, double yoffset){
+		// horizontal-only scroll (trackpad swipe, tilt wheel) used to count as
+		// "backwards" in walk mode and "zoom in" when orbiting
+		if(yoffset == 0.0) return;
+
 		// +1 in, -1 out. Orbiting from a distance, the wheel zooms by scaling
 		// the radius. Standing inside the forest - radius under half a metre,
 		// which is what Go to centre sets - scaling 0.001 m by 1.1 moves the
