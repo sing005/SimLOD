@@ -28,6 +28,7 @@ using namespace fmt;
 #include "laszip_api.h"
 
 #include "HostDeviceInterface.h"
+#include "CrashHandler.h"
 
 // Uniforms is passed to the kernels by value, and CUDA caps kernel parameters
 // at 4 KB. Growing past that fails at launch, not at compile time, without this.
@@ -139,6 +140,9 @@ struct {
 	bool benchmarkRendering          = false;
 	float LOD                        = 0.2f;
 	float minNodeSize                = 64.0f;
+	bool  adaptiveDetail             = true;    // coarsen LOD when frames exceed the budget
+	float frameBudgetMs              = 33.0f;   // render-kernel time to aim for (30 fps)
+	bool  vsync                      = true;    // cap at display refresh: saves power and heat
 	int pointSize                    = 1;
 	float fovy                       = 60.0f;
 	bool enableEDL                   = false;   // reference has no outlines (apply_look.ps1)
@@ -371,6 +375,7 @@ PinnedMemPool pinnedMemPool;
 #include <unordered_map>
 
 static std::ofstream g_logFile;
+static std::string   g_logPath;   // the crash handler appends here too
 static bool          g_logOpened = false;
 static size_t        g_logBytes  = 0;
 static constexpr size_t LOG_MAX_BYTES = 20'000'000;   // one run; a 42 MB log was seen
@@ -415,6 +420,7 @@ static void logLine(const char* fmt, ...){
 	#endif
 		char name[256];
 		std::strftime(name, sizeof(name), "log/simlod_%Y-%m-%d_%H%M%S.log", &tmv);
+		g_logPath = name;
 		g_logFile.open(name);
 		if(g_logFile.is_open()){
 			printf("[log ] writing to %s\n", name);
@@ -1021,8 +1027,38 @@ static void ensureVoxelGrid(){
 // requests are settled here, once, at the start of each frame.
 static bool g_frameGridRefill = false;   // render kernel recounts the occupancy grid
 static bool g_frameLightDirty = false;   // render kernel rebuilds light transmittance
+static float g_adaptReduce    = 0.0f;    // adaptive detail: 0 = as configured, 1 = cheapest
+
+// Adaptive detail keeps the render kernel near the frame budget by lowering
+// one reduction level that drives two costs:
+//  - the LOD threshold (minNodeSize, up to 4x): fewer, coarser nodes far away
+//  - the splat-size cap (down to a quarter): near the camera every point of
+//    the nearest leaves is drawn regardless of LOD, as a splat of up to
+//    maxSplatPx squared pixels, so on a dense scan seen up close this is the
+//    cost that dominates (measured: LOD alone at 16x left a 54 M point scan
+//    at 140 ms per frame).
+// Reduces faster than it restores, which damps oscillation from the one- to
+// two-frame lag of the asynchronous Stats copy.
+static void updateAdaptiveDetail(){
+	if(!settings.adaptiveDetail || settings.frameBudgetMs <= 0.0f){
+		g_adaptReduce = 0.0f;
+		return;
+	}
+	if(stats.stageNs[6] == 0) return;   // no measurement yet
+	double ms = double(stats.stageNs[6]) / 1e6;
+	if(ms > settings.frameBudgetMs * 1.10)      g_adaptReduce += 0.03f;
+	else if(ms < settings.frameBudgetMs * 0.70) g_adaptReduce -= 0.015f;
+	g_adaptReduce = std::clamp(g_adaptReduce, 0.0f, 1.0f);
+}
+static float effectiveMinNodeSize(){ return settings.minNodeSize * (1.0f + 3.0f * g_adaptReduce); }
+static int   effectiveMaxSplatPx(){
+	int px = int(float(settings.maxSplatPx) * (1.0f - 0.75f * g_adaptReduce) + 0.5f);
+	return std::max(2, std::min(px, settings.maxSplatPx));
+}
 
 static void beginFrameState(){
+	updateAdaptiveDetail();
+
 	ensureVoxelGrid();
 	ensureLightGrid(settings.lightOn);
 
@@ -1136,7 +1172,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.colorByLOD               = settings.colorByLOD;
 	uniforms.colorWhite               = settings.colorWhite;
 	uniforms.LOD                      = settings.LOD;
-	uniforms.minNodeSize              = settings.minNodeSize;
+	uniforms.minNodeSize              = effectiveMinNodeSize();
 	uniforms.pointSize                = settings.pointSize;
 	uniforms.useHighQualityShading    = settings.useHighQualityShading;
 	uniforms.persistentBufferCapacity = persistentBufferCapacity;
@@ -1289,7 +1325,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.skyB             = settings.skyColour[2];
 	uniforms.pointWorldSize   = settings.pointWorldSize;
 	uniforms.pointShading     = settings.pointShading;
-	uniforms.maxSplatPx       = settings.maxSplatPx;
+	uniforms.maxSplatPx       = effectiveMaxSplatPx();
 	uniforms.grain            = settings.grain;
 	uniforms.vignette         = settings.vignette;
 	{
@@ -1385,14 +1421,15 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	// Each line is written only when its text changes, and the fast-moving
 	// ones (timings, camera, events) at most every 5 seconds.
 	{
-		logIfChanged("stage", 5.0, "[host] stage ms: setup %.1f  points %.1f  extras %.1f  edl %.1f  volumetric %.1f  bloom %.1f  composite %.1f  total %.1f\n",
+		logIfChanged("stage", 5.0, "[host] stage ms: setup %.1f  points %.1f  extras %.1f  edl %.1f  volumetric %.1f  bloom %.1f  composite %.1f  total %.1f  | visible %.1f M pts %.1f M voxels, drawn %.1f M\n",
 			double(stats.stageNs[0])/1e6, double(stats.stageNs[1]-stats.stageNs[0])/1e6, double(stats.stageNs[2]-stats.stageNs[1])/1e6,
 			double(stats.stageNs[3]-stats.stageNs[2])/1e6, double(stats.stageNs[4]-stats.stageNs[3])/1e6, double(stats.stageNs[5]-stats.stageNs[4])/1e6,
-			double(stats.stageNs[6]-stats.stageNs[5])/1e6, double(stats.stageNs[6])/1e6);
+			double(stats.stageNs[6]-stats.stageNs[5])/1e6, double(stats.stageNs[6])/1e6,
+			stats.numVisiblePoints / 1e6, stats.numVisibleVoxels / 1e6, stats.numDrawn / 1e6);
 		logIfChanged("camera", 5.0, "[host] lens=%d fov=%.0f cam=(%.1f %.1f %.1f) pitch=%.0f radius=%.3f detail=%.0f splatCap=%d\n",
 			settings.lensMode, settings.lensMode ? settings.fisheyeFov : settings.fovy,
 			uniforms.camPos.x, uniforms.camPos.y, uniforms.camPos.z,
-			renderer->controls->pitch * 57.2958, renderer->controls->radius, settings.minNodeSize, settings.maxSplatPx);
+			renderer->controls->pitch * 57.2958, renderer->controls->radius, effectiveMinNodeSize(), effectiveMaxSplatPx());
 		logIfChanged("events", 5.0, "[host] numEvents=%d  gain=%.3f  calls=%d  density=%.3f\n",
 			uniforms.numEvents, uniforms.emissionGain, (int)g_calls.size(), settings.pointDensity);
 		logIfChanged("box", 0.0, "[host] box min=(%.2f %.2f %.2f) max=(%.2f %.2f %.2f), load offset (subtracted from every point) = (%.2f %.2f %.2f)\n",
@@ -2164,24 +2201,16 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 	setThreadPriorityHigh(t);
 }
 
-int main(){
+int main(int argc, char** argv){
 
-	// ---- last-words handler (fix_crash_instrument.ps1) -------------------
-	// A hard crash on Windows kills the process silently. MSVC delivers an
-	// access violation as SIGSEGV, so a signal handler gets one chance to
-	// write to the run log before the process dies. Uses <csignal> rather
-	// than <windows.h>, which defines 'near' and 'far' as macros and would
-	// break the Camera struct that uses both names.
-	std::signal(SIGSEGV, [](int){
-		logLine("[CRASH] SIGSEGV - access violation. Last [host] block above is the state at the time.\n");
-		fflush(stdout);
-		std::_Exit(139);
-	});
-	std::signal(SIGILL, [](int){
-		logLine("[CRASH] SIGILL - illegal instruction\n");
-		fflush(stdout);
-		std::_Exit(132);
-	});
+	// ---- last-words handlers ---------------------------------------------
+	// A hard crash on Windows kills the process silently. The structured-
+	// exception filter (CrashHandler.cpp) catches access violations, divide
+	// by zero and the like on every thread and writes a symbolised stack
+	// trace to the run log. The old SIGSEGV handler only covered the main
+	// thread and could not say where the fault was.
+	logLine("[host] SimLOD starting\n");   // opens the run log, so its path is known
+	installCrashHandler(g_logPath.c_str());
 	std::signal(SIGABRT, [](int){
 		logLine("[CRASH] SIGABRT - abort() called, usually an assertion or a failed allocation\n");
 		fflush(stdout);
@@ -2238,8 +2267,70 @@ int main(){
 	cudaprint.init();
 	
 	spawnUploader(renderer);
-	
+
+	// Command line: SimLOD.exe [cloud.las|.laz|.simlod ...] [--view yaw pitch radius tx ty tz]
+	// Files load as if dropped on the window; --view sets the camera afterwards
+	// (target in the renderer frame, i.e. relative to the cloud's minimum corner),
+	// which makes timings and screenshots reproducible.
+	bool haveView = false;
+	double view[6] = {0, 0, 0, 0, 0, 0};
+	vector<string> argFiles;
+	for(int i = 1; i < argc; i++){
+		string arg = argv[i];
+		if(arg == "--view" && i + 6 < argc){
+			for(int k = 0; k < 6; k++) view[k] = std::atof(argv[i + 1 + k]);
+			haveView = true;
+			i += 6;
+		}else if(arg == "--set" && i + 1 < argc){
+			// --set name=value, for the settings that matter most on a small GPU
+			string kv = argv[++i];
+			size_t eq = kv.find('=');
+			string key = kv.substr(0, eq);
+			double v = (eq == string::npos) ? 1.0 : std::atof(kv.c_str() + eq + 1);
+			if     (key == "hqs")      settings.useHighQualityShading = v != 0.0;
+			else if(key == "splat")    settings.maxSplatPx            = int(v);
+			else if(key == "detail")   settings.minNodeSize           = float(v);
+			else if(key == "adaptive") settings.adaptiveDetail        = v != 0.0;
+			else if(key == "budget")   settings.frameBudgetMs         = float(v);
+			else if(key == "vsync")    settings.vsync                 = v != 0.0;
+			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync)\n", key);
+		}else if(iEndsWith(arg, "las") || iEndsWith(arg, "laz") || iEndsWith(arg, "simlod")){
+			std::error_code ec;
+			auto absolute = std::filesystem::absolute(arg, ec);   // dropped files are absolute too
+			argFiles.push_back(ec ? arg : absolute.string());
+		}else{
+			printfmt("ignoring command-line argument: {}\n", arg);
+		}
+	}
+	if(argc > 1){
+		logLine("[host] command line: %d file(s)%s\n", int(argFiles.size()), haveView ? ", --view" : "");
+		for(auto& f : argFiles) logLine("[host]   %s\n", f.c_str());
+	}
+
 	reload();
+
+	// Load command-line files the way a drop does: through reset() on the
+	// first frame, which locks the loader threads out first. Calling reload()
+	// here with real files deadlocked against the already-running loaders.
+	bool startCameraPending = false;
+	if(!argFiles.empty()){
+		paths = argFiles;   // replaces the "NONE" placeholder
+		requestReset = true;
+		startCameraPending = true;
+	}
+	auto applyStartCamera = [&](){
+		renderer->controls->yaw    = -1.15;
+		renderer->controls->pitch  = -0.57;
+		renderer->controls->radius = sqrt(boxSize.x * boxSize.x + boxSize.y * boxSize.y + boxSize.z * boxSize.z);
+		renderer->controls->target = { boxSize.x * 0.5f, boxSize.y * 0.5f, boxSize.z * 0.1f };
+		if(haveView){
+			renderer->controls->yaw    = view[0];
+			renderer->controls->pitch  = view[1];
+			renderer->controls->radius = view[2];
+			renderer->controls->target = { view[3], view[4], view[5] };
+		}
+	};
+	if(argFiles.empty() && haveView) applyStartCamera();
 
 	renderer->onFileDrop([&](vector<string> files){
 		vector<string> pointCloudFiles;
@@ -2379,6 +2470,13 @@ int main(){
 
 		if(requestReset){
 			reset(renderer);
+			if(startCameraPending){ applyStartCamera(); startCameraPending = false; }   // boxSize is known now
+		}
+
+		{   // GLRenderer starts with vsync off (glfwSwapInterval(0)); follow the setting
+			static int appliedSwapInterval = -1;
+			int wanted = settings.vsync ? 1 : 0;
+			if(wanted != appliedSwapInterval){ glfwSwapInterval(wanted); appliedSwapInterval = wanted; }
 		}
 
 		beginFrameState();
@@ -2680,6 +2778,17 @@ int main(){
 				ImGui::Text("   %.2f M actually drawn this frame", stats.numDrawn / 1e6);
 				ImGui::SliderFloat("Detail",           &settings.minNodeSize,    8.0f, 256.0f);
 				tipFor("Level-of-detail threshold in pixels. Higher draws coarser summaries sooner and costs less.");
+				ImGui::Checkbox("Adaptive detail", &settings.adaptiveDetail);
+				tipFor("Coarsens the level of detail automatically while a frame takes longer than the budget, and refines it again when there is headroom. Keeps the view responsive on smaller GPUs and over Remote Desktop.");
+				if(settings.adaptiveDetail){
+					ImGui::SameLine(0.0f);
+					ImGui::SetNextItemWidth(110.0f);
+					ImGui::SliderFloat("Budget ms", &settings.frameBudgetMs, 10.0f, 100.0f, "%.0f");
+					tipFor("Render time to aim for. 33 ms is 30 frames a second; raise it for more detail, lower it for smoother motion.");
+					ImGui::Text("   reduced %.0f%%: detail %.0f px, splat cap %d px", 100.0f * g_adaptReduce, effectiveMinNodeSize(), effectiveMaxSplatPx());
+				}
+				ImGui::Checkbox("VSync", &settings.vsync);
+				tipFor("Caps the frame rate at the display refresh. Saves GPU power and heat, which matters on a laptop GPU; turn it off only to measure raw speed.");
 				ImGui::SliderInt  ("Max splat px",     &settings.maxSplatPx,     2, 64);
 				tipFor("Cap on how large a near point may be drawn. Lower if the frame rate drops when the camera is close to foliage.");
 			}
