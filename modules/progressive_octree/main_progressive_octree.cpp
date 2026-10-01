@@ -453,6 +453,7 @@ static int    g_activeEvents = 0;        // for the GUI readout
 
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 // ---- survey frame (apply_markers2.ps1) ------------------------------------
 // The mic survey gives each checkerboard a position in ITS frame (centre,
 // north, east). The pick gives the same board a position in the FILE frame
@@ -494,31 +495,58 @@ static void fileToSurvey(double x, double y, double z, double& sx, double& sy, d
 }
 
 
+// Strict numeric cell parse: the whole cell (bar surrounding whitespace) must
+// be a finite number. std::stof would throw on "" or "north" and abort the app.
+static bool parseNumber(const std::string& cell, double& out){
+	const char* begin = cell.c_str();
+	char* end = nullptr;
+	out = std::strtod(begin, &end);
+	if(end == begin) return false;
+	while(*end == ' ' || *end == '\t' || *end == '\r') end++;
+	return *end == '\0' && std::isfinite(out);
+}
+
+static std::vector<std::string> splitCsvLine(const std::string& line){
+	std::vector<std::string> f;
+	std::stringstream ss(line);
+	std::string cell;
+	while(std::getline(ss, cell, ',')) f.push_back(cell);
+	return f;
+}
+
 static void loadCallSchedule(const std::string& path){
 	g_calls.clear();
 	std::ifstream in(path);
 	if(!in){ std::cout << "[calls] cannot open " << path << std::endl; return; }
 	std::string line;
 	std::getline(in, line);                     // header
+	int lineNo = 1, skipped = 0;
 	while(std::getline(in, line)){
-		if(line.empty()) continue;
-		std::vector<std::string> f;
-		std::stringstream ss(line);
-		std::string cell;
-		while(std::getline(ss, cell, ',')) f.push_back(cell);
-		if(f.size() < 10) continue;
+		lineNo++;
+		if(line.empty() || line == "\r") continue;
+		std::vector<std::string> f = splitCsvLine(line);
+		double freq, x, y, z, t0, dur;
+		if(f.size() < 10
+			|| !parseNumber(f[2], freq) || !parseNumber(f[4], x) || !parseNumber(f[5], y)
+			|| !parseNumber(f[6], z)    || !parseNumber(f[7], t0) || !parseNumber(f[8], dur)){
+			logLine("[calls] %s line %d: malformed row skipped\n", path.c_str(), lineNo);
+			skipped++;
+			continue;
+		}
 		ScheduledCall c;
-		c.freqHz   = std::stof(f[2]);
-		c.x        = std::stof(f[4]);
-		c.y        = std::stof(f[5]);
-		c.z        = std::stof(f[6]);
-		c.tStart   = std::stod(f[7]);
-		c.duration = std::stod(f[8]);
+		c.freqHz   = float(freq);
+		c.x        = float(x);
+		c.y        = float(y);
+		c.z        = float(z);
+		c.tStart   = t0;
+		c.duration = dur;
 		if(g_callsInSurvey && g_surveyValid) surveyToFile(c.x, c.y, c.z);   // apply_markers2.ps1
 		g_calls.push_back(c);
 	}
 	g_callsLoaded = !g_calls.empty();
-	std::cout << "[calls] loaded " << g_calls.size() << " calls from " << path << std::endl;
+	std::cout << "[calls] loaded " << g_calls.size() << " calls from " << path;
+	if(skipped > 0) std::cout << " (" << skipped << " malformed rows skipped, see log)";
+	std::cout << std::endl;
 }
 
 // Warm for low frequency, cool for high. Stretched across 240-310 Hz so the
@@ -704,45 +732,84 @@ static bool fitSurveyFrame(){
 }
 
 // markers.csv (apply_markers2.ps1): file coordinates, label, survey coordinates
+// Points are stored as float(file - boxMin) with boxMin itself a float, so
+// double(boxMin) + double(rel) recovers file coordinates exactly. Write them
+// with fixed decimals: the default stream precision (6 significant digits)
+// rounds a georeferenced northing such as 5.9e6 to the nearest 10 m.
 static void saveMarkersCsv(){
 	std::ofstream f("markers.csv");
+	if(!f.is_open()){
+		logLine("[pick] cannot open markers.csv for writing\n");
+		notice("Could not write markers.csv (is it open in another program?)");
+		return;
+	}
 	f << "mic,label,x,y,z,sx,sy,sz,has_survey\n";
 	for(const Marker& mk : g_markers){
-		f << mk.mic << "," << mk.label << ","
-		  << (mk.x + boxMin.x) << "," << (mk.y + boxMin.y) << "," << (mk.z + boxMin.z) << ","
-		  << mk.sx << "," << mk.sy << "," << mk.sz << "," << (mk.hasSurvey ? 1 : 0) << "\n";
+		// commas or line breaks in a label would shift every later column
+		char label[sizeof(mk.label)];
+		snprintf(label, sizeof(label), "%s", mk.label);
+		for(char* c = label; *c; c++) if(*c == ',' || *c == '"' || *c == '\n' || *c == '\r') *c = ' ';
+
+		char row[512];
+		snprintf(row, sizeof(row), "%d,%s,%.6f,%.6f,%.6f,%.9g,%.9g,%.9g,%d\n",
+			mk.mic, label,
+			double(mk.x) + double(boxMin.x), double(mk.y) + double(boxMin.y), double(mk.z) + double(boxMin.z),
+			double(mk.sx), double(mk.sy), double(mk.sz), mk.hasSurvey ? 1 : 0);
+		f << row;
+	}
+	f.close();
+	if(f.fail()){
+		logLine("[pick] write to markers.csv failed\n");
+		notice("Writing markers.csv failed");
+		return;
 	}
 	logLine("[pick] wrote %d markers to markers.csv (file coordinates)\n", int(g_markers.size()));
 	notice("Saved %d markers to markers.csv", int(g_markers.size()));
 }
 static void loadMarkersCsv(){
+	// markers are kept relative to boxMin, which is +infinity until a cloud loads
+	if(!std::isfinite(boxMin.x) || !std::isfinite(boxMin.y) || !std::isfinite(boxMin.z)){
+		notice("Load a point cloud before loading markers");
+		return;
+	}
 	std::ifstream in("markers.csv");
 	if(!in){ notice("markers.csv not found next to SimLOD.exe"); return; }
 	std::vector<Marker> loaded;
 	std::string line;
 	std::getline(in, line);   // header
+	int lineNo = 1, skipped = 0;
 	while(std::getline(in, line)){
-		if(line.empty()) continue;
-		std::vector<std::string> f;
-		std::stringstream ss(line);
-		std::string cell;
-		while(std::getline(ss, cell, ',')) f.push_back(cell);
-		if(f.size() < 5) continue;
+		lineNo++;
+		if(line.empty() || line == "\r") continue;
+		std::vector<std::string> f = splitCsvLine(line);
+		double mic, x, y, z;
+		if(f.size() < 5 || !parseNumber(f[0], mic)
+			|| !parseNumber(f[2], x) || !parseNumber(f[3], y) || !parseNumber(f[4], z)){
+			logLine("[pick] markers.csv line %d: malformed row skipped\n", lineNo);
+			skipped++;
+			continue;
+		}
 		Marker m{};
-		m.mic = std::stoi(f[0]);
+		m.mic = int(mic);
 		snprintf(m.label, sizeof(m.label), "%s", f[1].c_str());
-		m.x = std::stof(f[2]) - boxMin.x;
-		m.y = std::stof(f[3]) - boxMin.y;
-		m.z = std::stof(f[4]) - boxMin.z;
-		if(f.size() >= 9){ m.sx = std::stof(f[5]); m.sy = std::stof(f[6]); m.sz = std::stof(f[7]); m.hasSurvey = std::stoi(f[8]) != 0; }
+		m.x = float(x - double(boxMin.x));
+		m.y = float(y - double(boxMin.y));
+		m.z = float(z - double(boxMin.z));
+		double sx, sy, sz, has;
+		if(f.size() >= 9 && parseNumber(f[5], sx) && parseNumber(f[6], sy)
+			&& parseNumber(f[7], sz) && parseNumber(f[8], has)){
+			m.sx = float(sx); m.sy = float(sy); m.sz = float(sz);
+			m.hasSurvey = has != 0.0;
+		}
 		loaded.push_back(m);
 		if(loaded.size() >= 32) break;
 	}
 	g_markers = loaded;
 	g_nextMic = 1;
 	for(const Marker& m : g_markers) g_nextMic = std::max(g_nextMic, m.mic + 1);
-	logLine("[pick] loaded %d markers from markers.csv\n", int(g_markers.size()));
-	notice("Loaded %d markers from markers.csv", int(g_markers.size()));
+	logLine("[pick] loaded %d markers from markers.csv (%d malformed rows skipped)\n", int(g_markers.size()), skipped);
+	if(skipped > 0) notice("Loaded %d markers; skipped %d malformed rows (see log)", int(g_markers.size()), skipped);
+	else            notice("Loaded %d markers from markers.csv", int(g_markers.size()));
 }
 static int    g_pickReqX = -1, g_pickReqY = -1;   // pixel requested this frame
 static bool   g_pickWaiting = false;              // result expected in Stats next frame
@@ -2185,9 +2252,9 @@ int main(){
 					double dist = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
 					logLine("[pick] marker %d at renderer (%.3f %.3f %.3f) = file (%.3f %.3f %.3f)  %.2f m from the camera\n",
 						g_markers.back().mic, stats.pickWX, stats.pickWY, stats.pickWZ,
-						stats.pickWX + boxMin.x, stats.pickWY + boxMin.y, stats.pickWZ + boxMin.z, dist);
+						double(stats.pickWX) + boxMin.x, double(stats.pickWY) + boxMin.y, double(stats.pickWZ) + boxMin.z, dist);
 					notice("Marker %d placed at file (%.2f, %.2f, %.2f), %.1f m away%s",
-						g_markers.back().mic, stats.pickWX + boxMin.x, stats.pickWY + boxMin.y, stats.pickWZ + boxMin.z, dist,
+						g_markers.back().mic, double(stats.pickWX) + boxMin.x, double(stats.pickWY) + boxMin.y, double(stats.pickWZ) + boxMin.z, dist,
 						dist < 1.0 ? "  - under 1 m: probably foliage at the near clip, not the board" : "");
 				}else{
 					notice("Marker limit of 32 reached");
@@ -2576,7 +2643,7 @@ int main(){
 					}
 					ImGui::SameLine(0.0f);
 					if(ImGui::SmallButton("x")) removeIdx = int(i);
-					ImGui::Text("   file    %9.3f %9.3f %9.3f", mk.x + boxMin.x, mk.y + boxMin.y, mk.z + boxMin.z);
+					ImGui::Text("   file    %9.3f %9.3f %9.3f", double(mk.x) + boxMin.x, double(mk.y) + boxMin.y, double(mk.z) + boxMin.z);
 					float sv[3] = { mk.sx, mk.sy, mk.sz };
 					ImGui::Text("   survey"); ImGui::SameLine(0.0f);
 					ImGui::SetNextItemWidth(230.0f);
