@@ -26,6 +26,11 @@ uint32_t* errorValue;
 AllocatorGlobal* allocator_persistent;
 Stats* stats = nullptr;
 
+// voxel occupancy grid (apply_voxel_grid.ps1), set per launch from uniforms
+uint32_t* _voxelGrid = nullptr;
+int   _gridX = 0, _gridY = 0, _gridZ = 0;
+float _cellSize = 1.0f;
+
 Point* backlog_voxels      = nullptr;
 Node** backlog_targets     = nullptr;
 uint32_t* numBacklogVoxels = nullptr;
@@ -615,7 +620,19 @@ void insertPoints(
 	// INSERT POINTS FROM CURRENT BATCH
 	processRange(numPoints, [&](int pointID){
 		Point point = points[pointID];
-		
+
+		// voxel occupancy grid (apply_voxel_grid.ps1). Every batch point
+		// passes through here exactly once. Spilled points re-enter through
+		// the loop below and are deliberately NOT counted again.
+		if(_voxelGrid != nullptr){
+			int cx = int(point.x / _cellSize);
+			int cy = int(point.y / _cellSize);
+			int cz = int(point.z / _cellSize);
+			if(cx >= 0 && cx < _gridX && cy >= 0 && cy < _gridY && cz >= 0 && cz < _gridZ){
+				atomicAdd(&_voxelGrid[cx + _gridX * (cy + _gridY * cz)], 1u);
+			}
+		}
+
 		insertPoint(point);
 	});
 
@@ -826,6 +843,12 @@ void kernel_construct(
 	grid.sync();
 
 	stats = _stats;
+
+	_voxelGrid = (uint32_t*)uniforms.voxelGridPtr;
+	_gridX     = uniforms.gridX;
+	_gridY     = uniforms.gridY;
+	_gridZ     = uniforms.gridZ;
+	_cellSize  = uniforms.cellSize;
 
 	Allocator _allocator(buffer, 0);
 	allocator = &_allocator;

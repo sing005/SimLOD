@@ -25,3 +25,17 @@ build/
 .generated_cuda_programs/render.cu__utils.cu/cubin
 .generated_cuda_programs/reset.cu__utils.cu/cubin
 build_old/
+.generated_cuda_programs/
+
+# backups left by the old patch scripts
+*.bak
+*.bak_*
+
+# runtime output
+log/
+*.log
+markers.csv
+
+# point-cloud data (too large for git)
+*.las
+*.laz
