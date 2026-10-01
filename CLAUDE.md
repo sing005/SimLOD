@@ -20,10 +20,24 @@ cmake --build . --config Release
 - The policy flag is needed with CMake 4.x, because the fetched GLFW declares `cmake_minimum_required` < 3.5.
 - The CUDA `.cu` files cannot be syntax-checked with plain `nvcc`. NVRTC compiles them with device as the default execution space. To check them, run the built exe from the repo root for a few seconds and look for `=== COMPILING:` lines followed by errors in stdout.
 
-- Build **Release** for normal use. Debug is much slower, but it is useful for host-side debugging.
-- Requires CUDA ≥ 12.0 (links `CUDA::nvJitLink`) and CMake ≥ 3.26, despite what `CMakeLists.txt` declares.
-- There are no tests and no linter. Verification means building and running, then dropping a point cloud onto the window.
+- Build **Release** for normal use. Debug is much slower, but it is useful for host-side debugging. Release also writes `SimLOD.pdb`; keep it next to the exe so crash traces have line numbers.
+- Requires CUDA ≥ 12.0 (links `CUDA::nvJitLink`) and CMake ≥ 3.26. At runtime `CUDA_PATH` must point to a CUDA 12 toolkit, because NVRTC compiles the kernels against its headers.
+- There are no tests and no linter. Verification means building and running.
 - Post-build copies `modules/` next to the exe. The `.cu` files are compiled **at runtime** with NVRTC, so CUDA edits do not need a C++ rebuild.
+- CI (`.github/workflows/build.yml`) builds Release on Windows for each pull request and uploads a runnable bundle. It does not compile the `.cu` files.
+
+**Running reproducibly** (run from the repo root so `./modules` resolves):
+
+```
+build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> --set hqs=0 --set splat=8 --set adaptive=0 --set vsync=0
+```
+
+- Files load as if dropped on the window.
+- `--view` places the camera. The target is in the renderer frame, i.e. relative to the cloud's minimum corner.
+- `--set` accepts `hqs`, `splat`, `detail`, `adaptive`, `budget` and `vsync`.
+- Timings go to the run log as `[host] stage ms:` lines. Measure only after loading finishes: frame cost changes a lot while the octree is still being built.
+- Kill with `timeout N`. Stdout is buffered and lost on kill, but the log file is flushed every line.
+- `.laz` decompresses slowly (about 4 min for 54 M points). Convert to `.las` with `laspy` for repeated runs.
 
 ## Architecture
 
@@ -39,7 +53,7 @@ cmake --build . --config Release
 - All kernels are launched with `cuLaunchCooperativeKernel` and synchronise across the whole grid with `grid.sync()`. Any early `return` before a `grid.sync()` must be uniform across all threads.
 - Work is split with `processRange` from `utils.h.cu`.
 
-**Hot reload.** `CudaModularProgram` (`include/CudaModularProgram.h`) watches each `.cu` file and recompiles it when it changes. This only works if the working directory is the repo root, because the files are loaded from `./modules/...`. The GPU architecture is hardcoded to `compute_86` there.
+**Hot reload.** `CudaModularProgram` (`include/CudaModularProgram.h`) watches each `.cu` file and recompiles it when it changes. This only works if the working directory is the repo root, because the files are loaded from `./modules/...`. It compiles for the present GPU's compute capability.
 
 **Shared host/device structs.**
 - `HostDeviceInterface.h` defines `Uniforms` (per-frame settings passed **by value** as a kernel parameter) and `Stats` (counters and pick results written by the GPU).
@@ -48,16 +62,25 @@ cmake --build . --config Release
 - Fixed arrays in these structs, such as `MAX_EVENTS` and the 32-entry marker arrays, are bounds-checked on the host.
 
 **Per-frame flow.**
-1. `getUniforms()` copies `settings` into `Uniforms`. It also lazily (re)allocates the voxel and light grids via `ensureVoxelGrid` / `ensureLightGrid` and sets the `g_gridRefill` / `g_lightDirty` flags.
-2. `updateOctree()` and `renderCUDA()` launch the kernels.
-3. `Stats` is read back with `cuMemcpyDtoHAsync`, so host reads lag the GPU by a frame or more.
+1. `beginFrameState()` runs once per frame. It (re)allocates the voxel and light grids, settles the one-shot `g_gridRefill` / `g_lightDirty` requests into `g_frameGridRefill` / `g_frameLightDirty`, and updates adaptive detail.
+2. `renderCUDA()` and `updateOctree()` launch the kernels. Each calls `getUniforms()`, which copies `settings` and frame state into `Uniforms`.
+3. `Stats` is read back with an unsynchronised `cuMemcpyDtoHAsync`, so host reads lag by a frame or more and a single read can be half-copied. Results the host must not miss use a request id that the kernel answers once and leaves in place (see `pickSeq` / `pickSeqDone`).
 
-`getUniforms()` is called several times per frame, so side effects in it repeat.
+`getUniforms()` runs for every kernel launch, so it must stay free of side effects such as allocation and flag clearing; those belong in `beginFrameState()`.
+
+**Adaptive detail.**
+- `updateAdaptiveDetail()` steers `g_adaptReduce` from the render kernel's time against `settings.frameBudgetMs`.
+- It scales both the LOD threshold and the splat-size cap.
+- On dense scans viewed up close, the cost is splatting the nearest full-resolution leaves, which LOD alone cannot reduce.
+- High-quality shading (on by default) draws every point twice, in a depth pass and a colour pass.
 
 **Global state.** Host state lives in file-scope globals prefixed `g_` (grids, markers, call schedule, survey fit). The rendering settings struct is `settings` (anonymous struct at about line 124).
 
 **Runtime outputs.** These are written to the working directory and are git-ignored:
-- `log/simlod_<timestamp>.log`, written by `logLine()`, which also installs signal handlers.
+- `log/simlod_<timestamp>.log`, written by `logLine()`.
+  - Periodic status lines go through `logIfChanged()`.
+  - Each run is capped at 20 MB, and only the newest 10 logs are kept.
+  - `CrashHandler.cpp` appends a symbolised stack trace on any unhandled exception. Start any crash investigation there.
 - `markers.csv`.
 
 ## Working rules for this repo
@@ -65,5 +88,6 @@ cmake --build . --config Release
 - Edit source files directly and commit to git. Do not use or extend the old text-replacement patch scripts (`../apply_*.ps1`, `../fix_*.ps1`). Do not create `.bak` copies, because git history replaces them.
 - Strip provenance comments of the form "added by apply_xxx.ps1" when touching nearby code. Do not add new ones.
 - Changes to `Uniforms` or `Stats` must be made in `HostDeviceInterface.h` only, with matching host fill code in `getUniforms()`.
-- The high-quality point path in `render.cu` duplicates the point filtering (density, stray cull, find/isolate) from `drawPoint`. Change both copies together.
+- Point filtering exists twice in `render.cu`: in `drawPoint` for the standard path, and in `hqsAcceptPoint` for both high-quality passes. A change to which points are drawn must go into both.
+- Files under `modules/` and `include/` use CRLF line endings. `sed -i` in Git Bash rewrites them as LF, so use the Edit tool, or restore CRLF before committing.
 - Point-cloud data (`*.las`, `*.laz`) is never committed. Test data lives outside the repo in `../Laspy/` and `../rotokare_test_kit/`.

@@ -321,7 +321,7 @@ inline uint32_t gridCountAt(int cx, int cy, int cz){
 }
 inline uint32_t gridCountAtPos(float x, float y, float z){
 	float c = uniforms.cellSize;
-	return gridCountAt(int(x / c), int(y / c), int(z / c));
+	return gridCountAt(int(floorf(x / c)), int(floorf(y / c)), int(floorf(z / c)));
 }
 // True when the cell is empty but foliage lies within `reach` cells along any
 // axis: in air, but not in open sky. Six axis rays, so 6*reach lookups.
@@ -356,7 +356,7 @@ inline bool isStrayPoint(float px, float py, float pz){
 	if(!uniforms.useVoxelGrid || uniforms.voxelGridPtr == 0) return false;
 
 	float c = uniforms.cellSize;
-	int cx = int(px / c), cy = int(py / c), cz = int(pz / c);
+	int cx = int(floorf(px / c)), cy = int(floorf(py / c)), cz = int(floorf(pz / c));
 
 	uint32_t n = gridCountAt(cx, cy, cz);
 	if(uniforms.cullReach > 0){
@@ -380,7 +380,7 @@ inline bool isStrayPoint(float px, float py, float pz){
 inline float lightAt(float px, float py, float pz){
 	if(uniforms.lightGridPtr == 0) return 1.0f;
 	float c = uniforms.cellSize;
-	int cx = int(px / c), cy = int(py / c), cz = int(pz / c);
+	int cx = int(floorf(px / c)), cy = int(floorf(py / c)), cz = int(floorf(pz / c));
 	if(cx < 0 || cy < 0 || cz < 0) return 1.0f;
 	if(cx >= uniforms.gridX || cy >= uniforms.gridY || cz >= uniforms.gridZ) return 1.0f;
 	const float* g = (const float*)uniforms.lightGridPtr;
@@ -414,17 +414,22 @@ inline uint32_t applyKeyLight(uint32_t c, float trans){
 // Depth-tested like any point, so a ball behind a trunk is hidden by it, and
 // written a hair nearer than its own depth so it wins against the very point
 // it was picked from.
+// Screen pixels per metre at view depth `depth` for the current lens. The
+// fisheye is equidistant (radius proportional to angle), so its scale is
+// (height/2)/halfFov pixels per radian; the perspective focal length would
+// make fisheye splats several times too large.
+inline float pxPerMetreAt(float depth){
+	float d = fmaxf(depth, 0.05f);
+	if(uniforms.lensMode == 0) return uniforms.focalPx / d;
+	float halfFov = uniforms.fisheyeFov * 0.5f * 0.017453292f;
+	return ((0.5f * uniforms.height) / halfFov) / d;
+}
+
 inline void drawMarkerBall(float px, float py, float pz, uint64_t* framebuffer){
 	int x, y; float depth;
 	if(!projectPoint(px, py, pz, x, y, depth)) return;
 	if(depth < uniforms.nearClip) return;
-	float pxPerMetre;
-	if(uniforms.lensMode == 0){
-		pxPerMetre = uniforms.focalPx / fmaxf(depth, 0.05f);
-	}else{
-		float halfFov = uniforms.fisheyeFov * 0.5f * 0.017453292f;
-		pxPerMetre = ((0.5f * uniforms.height) / halfFov) / fmaxf(depth, 0.05f);
-	}
+	float pxPerMetre = pxPerMetreAt(depth);
 	int R = int(0.5f * uniforms.markerScale * pxPerMetre + 0.5f);
 	if(R < 3)  R = 3;
 	if(R > 64) R = 64;
@@ -452,7 +457,7 @@ inline void drawMarkerBall(float px, float py, float pz, uint64_t* framebuffer){
 // cannot cost thousands of atomics.
 inline int splatRadiusPx(float depth){
 	if(uniforms.pointWorldSize <= 0.0f) return uniforms.pointSize;
-	float px = uniforms.pointWorldSize * uniforms.focalPx / fmaxf(depth, 0.05f);
+	float px = uniforms.pointWorldSize * pxPerMetreAt(depth);
 	int R = int(px + 0.5f);
 	if(R < 1) R = 1;
 	if(R > uniforms.maxSplatPx) R = uniforms.maxSplatPx;
@@ -492,19 +497,6 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer){
 	// 90.7 M samples and rejected them AFTER the load, which is why turning
 	// density down barely changed the frame time.
 
-	// stray-point culling (apply_stray_cull.ps1). Unlike density this cannot be
-	// strided away - whether a point is a stray depends on where it is, so it
-	// has to be read first. One grid lookup, and nearby points share a cell, so
-	// it caches well.
-	// "Show culled only" with the threshold at 0 used to blank the screen:
-	// nothing was stray, so "only the strays" was nothing. Now the checkbox
-	// does nothing until there is a threshold for it to show.
-	bool stray = isStrayPoint(point.x, point.y, point.z);
-	if(uniforms.showCulledOnly && uniforms.minNeighbours > 0){ if(!stray) return; }
-	else if(stray) return;
-	countUp(&_numDrawn);         // counted AFTER the density gate, so the Stats
-								 // line shows exactly what density is doing
-
 	int x, y; float depth;
 	if(!projectPoint(point.x, point.y, point.z, x, y, depth)) return;   // apply_fisheye.ps1
 	if(depth < uniforms.nearClip) return;
@@ -512,6 +504,16 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer){
 	if(x > 1 && x < uniforms.width  - 2.0)
 	if(y > 1 && y < uniforms.height - 2.0)
 	{
+		// stray-point culling (apply_stray_cull.ps1). Up to seven grid reads,
+		// so it runs only for points that land on screen; projection is
+		// cheaper and rejects everything behind or beside the camera first.
+		// "Show culled only" with the threshold at 0 used to blank the screen:
+		// nothing was stray, so "only the strays" was nothing. Now the checkbox
+		// does nothing until there is a threshold for it to show.
+		bool stray = isStrayPoint(point.x, point.y, point.z);
+		if(uniforms.showCulledOnly && uniforms.minNeighbours > 0){ if(!stray) return; }
+		else if(stray) return;
+		countUp(&_numDrawn);     // on-screen points that pass density and the cull
 
 		bool isTarget = false;   // fix_find_targets.ps1: needed later for the size boost,
 		                         // so it must live outside the colour if/else below
@@ -593,9 +595,53 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer){
 	}
 }
 
+// Point density as a loop stride: keep every step-th point.
+inline int densityStep(){
+	if(uniforms.pointDensity >= 0.999f) return 1;
+	float d = uniforms.pointDensity < 0.0005f ? 0.0005f : uniforms.pointDensity;
+	int step = int(1.0f / d + 0.5f);
+	return step < 1 ? 1 : step;
+}
+
+// ---- shared point test for the high-quality (HQS) passes ------------------
+// The depth pass and the colour pass must agree exactly on which points exist,
+// where they land and how large they are, or the depth test hides points the
+// colour pass then cannot draw. The four loops used to repeat this inline and
+// had drifted: find/isolate and the target size boost were in the colour pass
+// only, so isolated targets behind foliage stayed hidden.
+inline bool hqsAcceptPoint(const Point& point, Node* node,
+                           int& x, int& y, float& depth, int& R, uint32_t& color, bool& isTarget){
+	if(!projectPoint(point.x, point.y, point.z, x, y, depth)) return false;   // apply_fisheye.ps1
+	if(!(depth > 0.0f) || depth < uniforms.nearClip) return false;
+	if(!(x > 1 && x < uniforms.width  - 2.0)) return false;
+	if(!(y > 1 && y < uniforms.height - 2.0)) return false;
+
+	// stray-point culling, after the cheaper on-screen test (apply_stray_cull.ps1)
+	bool stray = isStrayPoint(point.x, point.y, point.z);
+	if(uniforms.showCulledOnly && uniforms.minNeighbours > 0){ if(!stray) return false; }
+	else if(stray) return false;
+
+	color = point.color;
+	if(uniforms.colorByNode){
+		color = (node->getID() % 127) * 123456789;
+	}else if(uniforms.colorByLOD){
+		color = getLodColor(node->level);
+	}
+	if(RIGHTSIDE_NODECOLORS && x > uniforms.width / 2){
+		color = (node->getID() % 127) * 123456789;
+	}
+
+	isTarget = isSurveyTarget(color);
+	if(uniforms.findIsolate != 0 && uniforms.findTargets != 0 && !isTarget) return false;
+
+	R = splatRadiusPx(depth);   // world-sized (apply_look.ps1)
+	if(isTarget) R += uniforms.findBoost;   // fix_find_targets.ps1
+	return true;
+}
+
 void drawNode(Chunk* chunk, Node* node, uint32_t numElements, uint64_t* framebuffer){
 	auto block = cg::this_thread_block();
-	
+
 	int chunkIndex = 0;
 
 	// ---- density as a STRIDE (apply_stride_density.ps1) -------------------
@@ -609,12 +655,7 @@ void drawNode(Chunk* chunk, Node* node, uint32_t numElements, uint64_t* framebuf
 	// walk, no 16-byte load, no hash. The traversal shrinks by the same factor
 	// as the density. Deterministic, so the same points are kept frame to
 	// frame, as with the hash.
-	int step = 1;
-	if(uniforms.pointDensity < 0.999f){
-		float d = uniforms.pointDensity < 0.0005f ? 0.0005f : uniforms.pointDensity;
-		step = int(1.0f / d + 0.5f);
-		if(step < 1) step = 1;
-	}
+	int step = densityStep();
 
 	for(
 		int pointIndex = block.thread_rank() * step; 
@@ -695,9 +736,9 @@ void countNodeIntoGrid(Chunk* chunk, uint32_t numElements){
 		int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
 		Point point = chunk->points[pointInChunkIndex];
 
-		int cx = int(point.x / c);
-		int cy = int(point.y / c);
-		int cz = int(point.z / c);
+		int cx = int(floorf(point.x / c));
+		int cy = int(floorf(point.y / c));
+		int cz = int(floorf(point.z / c));
 		if(cx >= 0 && cx < uniforms.gridX && cy >= 0 && cy < uniforms.gridY && cz >= 0 && cz < uniforms.gridZ){
 			atomicAdd(&g[cx + uniforms.gridX * (cy + uniforms.gridY * cz)], 1u);
 		}
@@ -795,6 +836,10 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 
 	if(!uniforms.showPoints) return;
 
+	// density as a loop stride, as in drawNode: skipped points are never read,
+	// and both passes step identically so they keep the same points
+	int hqsStep = densityStep();
+
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
 
@@ -853,11 +898,11 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 			Chunk* chunk = node->points;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank(); pointIndex < node->numPoints; pointIndex += block.num_threads()){
+			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numPoints; pointIndex += block.num_threads() * hqsStep){
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
-				if(chunkIndex < targetChunkIndex){
+				while(chunkIndex < targetChunkIndex && chunk->next != nullptr){
 					chunk = chunk->next;
 					chunkIndex++;
 				}
@@ -865,42 +910,13 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
 				Point point = chunk->points[pointInChunkIndex];
 
-				// Point density (apply_density_hqs.ps1). This was missing: density
-				// lived only in drawPoint, which the HQS path never calls, so with
-				// High-Quality-Shading ticked the slider did nothing whatsoever.
-				// Same hash and the same place in all four loops, so the depth pass
-				// and the colour pass always drop exactly the same points.
-				if(uniforms.pointDensity < 0.999f){
-					uint32_t dhx = *((uint32_t*)&point.x);
-					uint32_t dhy = *((uint32_t*)&point.y);
-					uint32_t dhz = *((uint32_t*)&point.z);
-					uint32_t dh  = insectHash(dhx ^ (dhy * 0x9e3779b9u) ^ (dhz * 0x85ebca6bu));
-					if(insectUnit(dh) > uniforms.pointDensity) continue;   // NOT return: plain for loop, not a lambda
-				}
-
-				// stray-point culling (apply_stray_cull.ps1). Same test in all four HQS
-				// loops so the depth pass and the colour pass agree about which points
-				// exist. Anchored on the two lines above, which are identical whether
-				// apply_sweep_fixes.ps1 inserted this block or repaired an earlier one.
-				{
-					bool hqStray = isStrayPoint(point.x, point.y, point.z);
-					if(uniforms.showCulledOnly && uniforms.minNeighbours > 0){ if(!hqStray) continue; }
-					else if(hqStray) continue;
-				}
-
-				int x, y; float depth;
-				if(!projectPoint(point.x, point.y, point.z, x, y, depth)) continue;   // apply_fisheye.ps1, HQS
-				if(depth < uniforms.nearClip) continue;
-
-				if(x > 1 && x < uniforms.width  - 2.0)
-				if(y > 1 && y < uniforms.height - 2.0)
-				if(depth > 0.0f)
+				int x, y, R; float depth; uint32_t color; bool isTarget;
+				if(!hqsAcceptPoint(point, node, x, y, depth, R, color, isTarget)) continue;
 				{
 					// HQS depth pass, brought into line with drawPoint by
 					// apply_test_source.ps1: centred, optionally round, and
 					// clamped to width-1/height-1. Must match the colour pass
 					// below exactly or the depth test and the colour disagree.
-					int   R    = splatRadiusPx(depth);   // world-sized, HQS (apply_look.ps1)
 					float half = float(R - 1) * 0.5f;
 					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
 					for(int ox = 0; ox < R; ox++)
@@ -945,40 +961,17 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 			Chunk* chunk = node->voxelChunks;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank(); pointIndex < node->numVoxels; pointIndex += block.num_threads()){
+			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numVoxels; pointIndex += block.num_threads() * hqsStep){
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
-				if(chunkIndex < targetChunkIndex){
+				while(chunkIndex < targetChunkIndex && chunk->next != nullptr){
 					chunk = chunk->next;
 					chunkIndex++;
 				}
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
 				Point point = chunk->points[pointInChunkIndex];
-
-				// Point density (apply_density_hqs.ps1). This was missing: density
-				// lived only in drawPoint, which the HQS path never calls, so with
-				// High-Quality-Shading ticked the slider did nothing whatsoever.
-				// Same hash and the same place in all four loops, so the depth pass
-				// and the colour pass always drop exactly the same points.
-				if(uniforms.pointDensity < 0.999f){
-					uint32_t dhx = *((uint32_t*)&point.x);
-					uint32_t dhy = *((uint32_t*)&point.y);
-					uint32_t dhz = *((uint32_t*)&point.z);
-					uint32_t dh  = insectHash(dhx ^ (dhy * 0x9e3779b9u) ^ (dhz * 0x85ebca6bu));
-					if(insectUnit(dh) > uniforms.pointDensity) continue;   // NOT return: plain for loop, not a lambda
-				}
-
-				// stray-point culling (apply_stray_cull.ps1). Same test in all four HQS
-				// loops so the depth pass and the colour pass agree about which points
-				// exist. Anchored on the two lines above, which are identical whether
-				// apply_sweep_fixes.ps1 inserted this block or repaired an earlier one.
-				{
-					bool hqStray = isStrayPoint(point.x, point.y, point.z);
-					if(uniforms.showCulledOnly && uniforms.minNeighbours > 0){ if(!hqStray) continue; }
-					else if(hqStray) continue;
-				}
 
 				// cull voxels in areas where child nodes are visible
 				float3 posuv = (float3{point.x, point.y, point.z} - nodeMin) / nodeSize;
@@ -996,20 +989,14 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				// 	if(node->children[childIndex]->visible) continue;
 				// }
 
-				int x, y; float depth;
-				if(!projectPoint(point.x, point.y, point.z, x, y, depth)) continue;   // apply_fisheye.ps1, HQS
-				if(depth < uniforms.nearClip) continue;
-
-				if(x > 1 && x < uniforms.width  - 2.0)
-				if(y > 1 && y < uniforms.height - 2.0)
-				if(depth > 0.0f)
+				int x, y, R; float depth; uint32_t color; bool isTarget;
+				if(!hqsAcceptPoint(point, node, x, y, depth, R, color, isTarget)) continue;
 				{
 
 					// HQS depth pass, brought into line with drawPoint by
 					// apply_test_source.ps1: centred, optionally round, and
 					// clamped to width-1/height-1. Must match the colour pass
 					// below exactly or the depth test and the colour disagree.
-					int   R    = splatRadiusPx(depth);   // world-sized, HQS (apply_look.ps1)
 					float half = float(R - 1) * 0.5f;
 					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
 					for(int ox = 0; ox < R; ox++)
@@ -1044,11 +1031,6 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 
 	grid.sync();
 
-	auto inDebugZone = [&](int x, int y){
-		if(x > uniforms.width / 2)  return true;
-		else                        return false;
-	};
-
 	// COLOR
 	while(true){
 
@@ -1076,11 +1058,11 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 			Chunk* chunk = node->points;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank(); pointIndex < node->numPoints; pointIndex += block.num_threads()){
+			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numPoints; pointIndex += block.num_threads() * hqsStep){
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
-				if(chunkIndex < targetChunkIndex){
+				while(chunkIndex < targetChunkIndex && chunk->next != nullptr){
 					chunk = chunk->next;
 					chunkIndex++;
 				}
@@ -1090,59 +1072,12 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
 				Point point = chunk->points[pointInChunkIndex];
 
-				// Point density (apply_density_hqs.ps1). This was missing: density
-				// lived only in drawPoint, which the HQS path never calls, so with
-				// High-Quality-Shading ticked the slider did nothing whatsoever.
-				// Same hash and the same place in all four loops, so the depth pass
-				// and the colour pass always drop exactly the same points.
-				if(uniforms.pointDensity < 0.999f){
-					uint32_t dhx = *((uint32_t*)&point.x);
-					uint32_t dhy = *((uint32_t*)&point.y);
-					uint32_t dhz = *((uint32_t*)&point.z);
-					uint32_t dh  = insectHash(dhx ^ (dhy * 0x9e3779b9u) ^ (dhz * 0x85ebca6bu));
-					if(insectUnit(dh) > uniforms.pointDensity) continue;   // NOT return: plain for loop, not a lambda
-				}
-
-				// stray-point culling (apply_stray_cull.ps1). Same test in all four HQS
-				// loops so the depth pass and the colour pass agree about which points
-				// exist. Anchored on the two lines above, which are identical whether
-				// apply_sweep_fixes.ps1 inserted this block or repaired an earlier one.
+				int x, y, R; float depth; uint32_t color; bool isTarget;
+				if(!hqsAcceptPoint(point, node, x, y, depth, R, color, isTarget)) continue;
 				{
-					bool hqStray = isStrayPoint(point.x, point.y, point.z);
-					if(uniforms.showCulledOnly && uniforms.minNeighbours > 0){ if(!hqStray) continue; }
-					else if(hqStray) continue;
-				}
-
-				int x, y; float depth;
-				if(!projectPoint(point.x, point.y, point.z, x, y, depth)) continue;   // apply_fisheye.ps1, HQS
-				if(depth < uniforms.nearClip) continue;
-
-				if(x > 1 && x < uniforms.width  - 2.0)
-				if(y > 1 && y < uniforms.height - 2.0)
-				if(depth > 0.0f)
-				{
-					uint32_t color = point.color;
-					if(uniforms.colorByNode){
-						color = (node->getID() % 127) * 123456789;
-					}else if(uniforms.colorByLOD){
-						color = getLodColor(node->level);
-					}
-					// if(RIGHTSIDE_NODECOLORS && x > uniforms.width / 2){
-					// 	color = (node->getID() % 127) * 123456789;
-					// }
-
-					if(RIGHTSIDE_NODECOLORS && inDebugZone(x, y)){
-						color = (node->getID() % 127) * 123456789;
-					}
-
-					// color = chunkIndex * 1234567;
-					
-					// (ground band removed by apply_navigate.ps1)
-					bool isTargetH = isSurveyTarget(color);
-					if(isTargetH) countUp(&_numTargets);
-					if(uniforms.findIsolate != 0 && uniforms.findTargets != 0 && !isTargetH) continue;
+					if(isTarget) countUp(&_numTargets);
 					if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
-					if(isTargetH) color = 0x00ff00ffu;
+					if(isTarget) color = 0x00ff00ffu;
 					uint8_t* rgba = (uint8_t*)&color;
 
 					// HQS colour pass (apply_test_source.ps1): the same splat as
@@ -1158,7 +1093,6 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 					if(emitting) countUp(&_numEmitting);
 					countUp(&_numDrawn);   // colour pass only, once per point
 
-					int   R    = splatRadiusPx(depth);   // world-sized, HQS (apply_look.ps1)
 					float half = float(R - 1) * 0.5f;
 					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
 					for(int ox = 0; ox < R; ox++)
@@ -1215,11 +1149,11 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 			Chunk* chunk = node->voxelChunks;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank(); pointIndex < node->numVoxels; pointIndex += block.num_threads()){
+			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numVoxels; pointIndex += block.num_threads() * hqsStep){
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
-				if(chunkIndex < targetChunkIndex){
+				while(chunkIndex < targetChunkIndex && chunk->next != nullptr){
 					chunk = chunk->next;
 					chunkIndex++;
 				}
@@ -1228,29 +1162,6 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
 				Point point = chunk->points[pointInChunkIndex];
-
-				// Point density (apply_density_hqs.ps1). This was missing: density
-				// lived only in drawPoint, which the HQS path never calls, so with
-				// High-Quality-Shading ticked the slider did nothing whatsoever.
-				// Same hash and the same place in all four loops, so the depth pass
-				// and the colour pass always drop exactly the same points.
-				if(uniforms.pointDensity < 0.999f){
-					uint32_t dhx = *((uint32_t*)&point.x);
-					uint32_t dhy = *((uint32_t*)&point.y);
-					uint32_t dhz = *((uint32_t*)&point.z);
-					uint32_t dh  = insectHash(dhx ^ (dhy * 0x9e3779b9u) ^ (dhz * 0x85ebca6bu));
-					if(insectUnit(dh) > uniforms.pointDensity) continue;   // NOT return: plain for loop, not a lambda
-				}
-
-				// stray-point culling (apply_stray_cull.ps1). Same test in all four HQS
-				// loops so the depth pass and the colour pass agree about which points
-				// exist. Anchored on the two lines above, which are identical whether
-				// apply_sweep_fixes.ps1 inserted this block or repaired an earlier one.
-				{
-					bool hqStray = isStrayPoint(point.x, point.y, point.z);
-					if(uniforms.showCulledOnly && uniforms.minNeighbours > 0){ if(!hqStray) continue; }
-					else if(hqStray) continue;
-				}
 
 				// cull voxels in areas where child nodes are visible
 				float3 posuv = (float3{point.x, point.y, point.z} - nodeMin) / nodeSize;
@@ -1268,37 +1179,13 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 					if(childIsVisible) continue;
 				}
 
-				int x, y; float depth;
-				if(!projectPoint(point.x, point.y, point.z, x, y, depth)) continue;   // apply_fisheye.ps1, HQS
-				if(depth < uniforms.nearClip) continue;
-
-				if(x > 1 && x < uniforms.width  - 2.0)
-				if(y > 1 && y < uniforms.height - 2.0)
-				if(depth > 0.0f)
+				int x, y, R; float depth; uint32_t color; bool isTarget;
+				if(!hqsAcceptPoint(point, node, x, y, depth, R, color, isTarget)) continue;
 				{
 
-					uint32_t color = point.color;
-					if(uniforms.colorByNode){
-						color = (node->getID() % 127) * 123456789;
-					}else if(uniforms.colorByLOD){
-						color = getLodColor(node->level);
-					}
-					// if(RIGHTSIDE_NODECOLORS && x > uniforms.width / 2){
-					// 	color = (node->getID() % 127) * 123456789;
-					// }
-
-					if(RIGHTSIDE_NODECOLORS && inDebugZone(x, y)){
-						color = (node->getID() % 127) * 123456789;
-					}
-
-					// color = chunkIndex * 1234567;
-
-					// (ground band removed by apply_navigate.ps1)
-					bool isTargetH = isSurveyTarget(color);
-					if(isTargetH) countUp(&_numTargets);
-					if(uniforms.findIsolate != 0 && uniforms.findTargets != 0 && !isTargetH) continue;
+					if(isTarget) countUp(&_numTargets);
 					if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
-					if(isTargetH) color = 0x00ff00ffu;
+					if(isTarget) color = 0x00ff00ffu;
 					uint8_t* rgba = (uint8_t*)&color;
 
 					// HQS colour pass (apply_test_source.ps1): the same splat as
@@ -1314,7 +1201,6 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 					if(emitting) countUp(&_numEmitting);
 					countUp(&_numDrawn);   // colour pass only, once per point
 
-					int   R    = splatRadiusPx(depth);   // world-sized, HQS (apply_look.ps1)
 					float half = float(R - 1) * 0.5f;
 					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
 					for(int ox = 0; ox < R; ox++)
@@ -1906,7 +1792,11 @@ void kernel_render(
 		*frameStartTimestamp = nanotime();
 	}
 
-	uniforms = _uniforms;
+	// One thread copies the ~2 KB uniforms into the device global. Every thread
+	// used to do it, which on an 80k-thread launch meant ~150 MB of redundant
+	// global stores per frame.
+	if(grid.thread_rank() == 0) uniforms = _uniforms;
+	grid.sync();
 	Allocator _allocator(buffer, 0);
 	allocator = &_allocator;
 
@@ -1948,6 +1838,11 @@ void kernel_render(
 	float* volBuf = allocator->alloc<float*>(volW * volH * 3 * sizeof(float));
 	if(grid.thread_rank() == 0){ _numEmitting = 0; _numDrawn = 0; _numTargets = 0; }
 
+	// Recount the occupancy grid first: the light grid below is derived from
+	// these counts, and the host requests both together after a reallocation.
+	grid.sync();
+	refillVoxelGrid(nodes);   // apply_grid_refill.ps1: only when the host says stale
+
 	// ---- build the light transmittance grid (apply_keylight.ps1) ----------
 	// Only when the host says it is stale: after a load, or when a light
 	// control moves. Otherwise this is skipped entirely and the light costs
@@ -1962,9 +1857,11 @@ void kernel_render(
 
 			float trans = 1.0f;
 			for(int s = 1; s <= uniforms.lightSteps; s++){
-				int sx = cx + int(uniforms.lightDirX * float(s) + 0.5f);
-				int sy = cy + int(uniforms.lightDirY * float(s) + 0.5f);
-				int sz = cz + int(uniforms.lightDirZ * float(s) + 0.5f);
+				// round to nearest; int(x + 0.5f) truncates toward zero, which
+				// shortened shadows for negative light-direction components
+				int sx = cx + __float2int_rn(uniforms.lightDirX * float(s));
+				int sy = cy + __float2int_rn(uniforms.lightDirY * float(s));
+				int sz = cz + __float2int_rn(uniforms.lightDirZ * float(s));
 				// left the grid: open sky from here on, stop accumulating
 				if(sx < 0 || sy < 0 || sz < 0) break;
 				if(sx >= uniforms.gridX || sy >= uniforms.gridY || sz >= uniforms.gridZ) break;
@@ -1979,7 +1876,6 @@ void kernel_render(
 		grid.sync();
 	}
 	grid.sync();
-	refillVoxelGrid(nodes);   // apply_grid_refill.ps1: only when the host says stale
 
 	// clear framebuffer
 	processRange(0, uniforms.width * uniforms.height, [&](int pixelIndex){
@@ -2132,6 +2028,44 @@ void kernel_render(
 
 	// if(false)
 	if(grid.thread_rank() == 0) stats->stageNs[1] = nanotime() - tStart;   // apply_stage_timers.ps1
+
+	// ---- pick (apply_navigate.ps1) ----------------------------------------
+	// After the scan is drawn but before debug geometry (voxel-grid view,
+	// event markers), so a pick always lands on the scan: read the depth
+	// under the requested pixel, turn it back into a world position, hand it
+	// to the host via Stats. Each request id is answered exactly once and the
+	// answer is left in place, so the host cannot miss it however far its
+	// asynchronous Stats copy lags behind.
+	grid.sync();
+	if(grid.thread_rank() == 0 && uniforms.pickSeq != stats->pickSeqDone){
+		int valid = 0;
+		// Reject the background explicitly. The clear writes 0x7f800000, which
+		// is +infinity; comparing a float against 1.0e30 relies on that bit
+		// pattern decoding cleanly, and a NaN would pass every comparison.
+		// Test the bits.
+		if(uniforms.pickX >= 0 && uniforms.pickY >= 0
+		   && uniforms.pickX < int(uniforms.width) && uniforms.pickY < int(uniforms.height)){
+			uint64_t fbv = framebuffer[uniforms.pickX + int(uniforms.width) * uniforms.pickY];
+			uint32_t dbits = uint32_t(fbv >> 32);
+			float depth = *((float*)&dbits);
+			float3 rd;
+			bool hitGeometry = (dbits != 0x7f800000u)          // not the cleared background
+							&& ((dbits & 0x7f800000u) != 0x7f800000u)   // not inf or NaN
+							&& depth > 0.0f && depth < 1.0e6f;
+			if(hitGeometry && pixelRayDir(float(uniforms.pickX) + 0.5f, float(uniforms.pickY) + 0.5f, rd)){
+				float dist = depthToDistance(depth, rd);
+				stats->pickWX = uniforms.camPos.x + rd.x * dist;
+				stats->pickWY = uniforms.camPos.y + rd.y * dist;
+				stats->pickWZ = uniforms.camPos.z + rd.z * dist;
+				valid = 1;
+			}
+		}
+		stats->pickValid = valid;
+		__threadfence();
+		stats->pickSeqDone = uniforms.pickSeq;   // written last
+	}
+	grid.sync();   // nothing may draw over the pixel while thread 0 reads it
+
 	// ---- voxel grid debug view (apply_voxel_grid.ps1) ------------------
 	// Draws the centre of every occupied cell, coloured by count: blue for
 	// sparse, through green, to red for dense. A verification view, like the
@@ -2184,36 +2118,6 @@ void kernel_render(
 		grid.sync();
 	}
 
-	// ---- pick (apply_navigate.ps1) ----------------------------------------
-	// After everything solid is drawn: read the depth under the requested
-	// pixel, turn it back into a world position, hand it to the host via
-	// Stats. One thread, once per frame, only when asked.
-	if(grid.thread_rank() == 0){
-		stats->pickValid = 0;
-		// Reject the background explicitly. The clear writes 0x7f800000, which
-		// is +infinity; comparing a float against 1.0e30 relies on that bit
-		// pattern decoding cleanly, and a NaN would pass every comparison.
-		// Test the bits.
-		if(uniforms.pickX >= 0 && uniforms.pickY >= 0
-		   && uniforms.pickX < int(uniforms.width) && uniforms.pickY < int(uniforms.height)){
-			uint64_t fbv = framebuffer[uniforms.pickX + int(uniforms.width) * uniforms.pickY];
-			uint32_t dbits = uint32_t(fbv >> 32);
-			float depth = *((float*)&dbits);
-			float3 rd;
-			bool hitGeometry = (dbits != 0x7f800000u)          // not the cleared background
-							&& ((dbits & 0x7f800000u) != 0x7f800000u)   // not inf or NaN
-							&& depth > 0.0f && depth < 1.0e6f;
-			if(hitGeometry && pixelRayDir(float(uniforms.pickX) + 0.5f, float(uniforms.pickY) + 0.5f, rd)){
-				float dist = depthToDistance(depth, rd);
-				stats->pickWX = uniforms.camPos.x + rd.x * dist;
-				stats->pickWY = uniforms.camPos.y + rd.y * dist;
-				stats->pickWZ = uniforms.camPos.z + rd.z * dist;
-				stats->pickValid = 1;
-			}
-		}
-	}
-	grid.sync();
-
 	// ---- placed markers (apply_navigate.ps1) ----------------------------
 	// The checkerboard centres the user has picked. Drawn as a white cluster
 	// with a small vertical spike so they read at any distance.
@@ -2258,7 +2162,7 @@ void kernel_render(
 				uint32_t hh = h3;
 				for(int attempt = 0; attempt < 6 && !ok; attempt++){
 					float c  = uniforms.cellSize;
-					int cx = int(hx / c), cy = int(hy / c), cz = int(hz / c);
+					int cx = int(floorf(hx / c)), cy = int(floorf(hy / c)), cz = int(floorf(hz / c));
 					ok = gridIsAirNearFoliage(cx, cy, cz, 3);
 					if(!ok){
 						hh = insectHash(hh ^ 0x27d4eb2fu); hx = insectUnit(hh) * bx.x;
@@ -2340,7 +2244,7 @@ void kernel_render(
 
 				int index = pixelID + dx + width * dy;
 				index = max(index, 0);
-				index = min(index, width * height);
+				index = min(index, width * height - 1);   // was one past the end
 
 				Pixel neighbour = framebuffer_p[index];
 				
@@ -2619,8 +2523,10 @@ void kernel_render(
 					int y0 = int(fy); y0 = y0 < 0 ? 0 : (y0 >= mipH[L+1] ? mipH[L+1]-1 : y0);
 					int x1 = min(x0 + 1, mipW[L+1] - 1);
 					int y1 = min(y0 + 1, mipH[L+1] - 1);
-					float tx = fx - float(x0);
-					float ty = fy - float(y0);
+					// clamped: at the left/top edge fx is -0.25, which made one
+					// weight negative and drew a dark fringe
+					float tx = fminf(fmaxf(fx - float(x0), 0.0f), 1.0f);
+					float ty = fminf(fmaxf(fy - float(y0), 0.0f), 1.0f);
 
 					int i00 = mipOff[L+1] + 3 * (x0 + mipW[L+1]*y0);
 					int i10 = mipOff[L+1] + 3 * (x1 + mipW[L+1]*y0);
@@ -2730,8 +2636,8 @@ void kernel_render(
 				int y0 = int(fy); y0 = y0 < 0 ? 0 : (y0 >= bloomH ? bloomH - 1 : y0);
 				int x1 = (x0 + 1 >= bloomW) ? bloomW - 1 : x0 + 1;
 				int y1 = (y0 + 1 >= bloomH) ? bloomH - 1 : y0 + 1;
-				float tx = fx - float(x0);
-				float ty = fy - float(y0);
+				float tx = fminf(fmaxf(fx - float(x0), 0.0f), 1.0f);   // see the mip upsample
+				float ty = fminf(fmaxf(fy - float(y0), 0.0f), 1.0f);
 
 				int i00 = mipOff[0] + 3*(x0 + bloomW*y0), i10 = mipOff[0] + 3*(x1 + bloomW*y0);
 				int i01 = mipOff[0] + 3*(x0 + bloomW*y1), i11 = mipOff[0] + 3*(x1 + bloomW*y1);

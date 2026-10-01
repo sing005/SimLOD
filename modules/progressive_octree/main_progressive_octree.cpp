@@ -28,6 +28,11 @@ using namespace fmt;
 #include "laszip_api.h"
 
 #include "HostDeviceInterface.h"
+#include "CrashHandler.h"
+
+// Uniforms is passed to the kernels by value, and CUDA caps kernel parameters
+// at 4 KB. Growing past that fails at launch, not at compile time, without this.
+static_assert(sizeof(Uniforms) <= 4096, "Uniforms exceeds the 4 KB kernel-parameter limit");
 #include "SimlodLoader.h"
 #include "LasLoader.h"
 
@@ -135,6 +140,9 @@ struct {
 	bool benchmarkRendering          = false;
 	float LOD                        = 0.2f;
 	float minNodeSize                = 64.0f;
+	bool  adaptiveDetail             = true;    // coarsen LOD when frames exceed the budget
+	float frameBudgetMs              = 33.0f;   // render-kernel time to aim for (30 fps)
+	bool  vsync                      = true;    // cap at display refresh: saves power and heat
 	int pointSize                    = 1;
 	float fovy                       = 60.0f;
 	bool enableEDL                   = false;   // reference has no outlines (apply_look.ps1)
@@ -362,9 +370,32 @@ PinnedMemPool pinnedMemPool;
 // The directory is created on first use, next to the working directory.
 #include <cstdarg>
 #include <ctime>
+#include <cstring>
+#include <algorithm>
+#include <unordered_map>
 
 static std::ofstream g_logFile;
+static std::string   g_logPath;   // the crash handler appends here too
 static bool          g_logOpened = false;
+static size_t        g_logBytes  = 0;
+static constexpr size_t LOG_MAX_BYTES = 20'000'000;   // one run; a 42 MB log was seen
+static constexpr int    LOG_KEEP_RUNS = 10;           // older log files are deleted
+
+// Delete all but the newest LOG_KEEP_RUNS - 1 logs, making room for this run's.
+// Names carry a sortable timestamp, so name order is age order.
+static void pruneOldLogs(){
+	std::error_code ec;
+	std::vector<std::filesystem::path> logs;
+	for(auto& e : std::filesystem::directory_iterator("log", ec)){
+		auto name = e.path().filename().string();
+		if(e.is_regular_file() && name.rfind("simlod_", 0) == 0 && e.path().extension() == ".log"){
+			logs.push_back(e.path());
+		}
+	}
+	std::sort(logs.begin(), logs.end());
+	int excess = int(logs.size()) - (LOG_KEEP_RUNS - 1);
+	for(int i = 0; i < excess; i++) std::filesystem::remove(logs[i], ec);
+}
 
 static void logLine(const char* fmt, ...){
 	char buf[2048];
@@ -379,6 +410,7 @@ static void logLine(const char* fmt, ...){
 		g_logOpened = true;
 		std::error_code ec;
 		std::filesystem::create_directories("log", ec);
+		pruneOldLogs();
 		std::time_t tt = std::time(nullptr);
 		std::tm tmv{};
 	#ifdef _WIN32
@@ -388,15 +420,41 @@ static void logLine(const char* fmt, ...){
 	#endif
 		char name[256];
 		std::strftime(name, sizeof(name), "log/simlod_%Y-%m-%d_%H%M%S.log", &tmv);
+		g_logPath = name;
 		g_logFile.open(name);
 		if(g_logFile.is_open()){
 			printf("[log ] writing to %s\n", name);
 		}
 	}
 	if(g_logFile.is_open()){
+		size_t len = strlen(buf);
+		if(g_logBytes + len > LOG_MAX_BYTES){
+			g_logFile << "[log ] size cap reached; further lines go to the console only\n";
+			g_logFile.close();
+			return;
+		}
+		g_logBytes += len;
 		g_logFile << buf;
 		g_logFile.flush();   // flushed every line: a crash must not lose the log
 	}
+}
+
+// Periodic status lines: written only when the text differs from the last
+// copy written under the same key, and no more often than minInterval. The
+// old once-a-second dump repeated identical lines and filled 42 MB in a run.
+static void logIfChanged(const char* key, double minInterval, const char* fmt, ...){
+	static std::unordered_map<std::string, std::pair<std::string, double>> last;
+	char buf[2048];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	auto& entry = last[key];
+	double t = now();
+	if(entry.first == buf || t - entry.second < minInterval) return;
+	entry.first = buf;
+	entry.second = t;
+	logLine("%s", buf);
 }
 
 // ---- settings tooltips (apply_tooltips.ps1) ------------------------------
@@ -811,9 +869,11 @@ static void loadMarkersCsv(){
 	if(skipped > 0) notice("Loaded %d markers; skipped %d malformed rows (see log)", int(g_markers.size()), skipped);
 	else            notice("Loaded %d markers from markers.csv", int(g_markers.size()));
 }
-static int    g_pickReqX = -1, g_pickReqY = -1;   // pixel requested this frame
-static bool   g_pickWaiting = false;              // result expected in Stats next frame
-static bool   g_altWasDown = false;
+static int    g_pickReqX = -1, g_pickReqY = -1;   // pixel of the outstanding request
+static bool   g_pickWaiting = false;              // a request has not been answered yet
+static int    g_pickSeq = 0;                      // id of the latest request
+static int    g_pickSeenDone = 0;                 // consecutive Stats reads showing it answered
+static bool   g_pKeyWasDown = false;          // P key state last frame (pick shortcut)
 static bool   g_leftWasDown = false;
 // g_nextMic moved up to the marker block (fix_nextmic.ps1)
 static float  g_walkSpeed = 3.0f;                 // metres per second, W/A/S/D
@@ -846,12 +906,19 @@ static void ensureLightGrid(bool wanted){
 	}
 	if(g_lightGrid != 0) return;
 	if(g_gridX <= 0 || g_gridY <= 0 || g_gridZ <= 0) return;
+	// a failed size is not retried (and re-logged) every frame, only once the
+	// occupancy grid changes dimensions
+	static int failedX = -1, failedY = -1, failedZ = -1;
+	if(g_gridX == failedX && g_gridY == failedY && g_gridZ == failedZ) return;
 	size_t lbytes = size_t(g_gridX) * size_t(g_gridY) * size_t(g_gridZ) * sizeof(float);
 	if(cuMemAlloc(&g_lightGrid, lbytes) != CUDA_SUCCESS){
 		g_lightGrid = 0;
+		failedX = g_gridX; failedY = g_gridY; failedZ = g_gridZ;
 		logLine("[grid] light grid (%.0f MB) would not fit; key light disabled\n", double(lbytes) / 1e6);
+		notice("Key light needs %.0f MB of GPU memory that is not free - lower the grid resolution", double(lbytes) / 1e6);
 		return;
 	}
+	failedX = failedY = failedZ = -1;
 	cuMemsetD8(g_lightGrid, 0, lbytes);
 	g_lightDirty = true;
 	logLine("[grid] light grid allocated, %.0f MB\n", double(lbytes) / 1e6);
@@ -866,6 +933,13 @@ static void ensureVoxelGrid(){
 	// Memory is 4 bytes a cell and grows with the cube of this, so 512 is the
 	// practical ceiling on an 8 GB card - see the readout beside the slider.
 	int R = g_gridResolution < 64 ? 64 : (g_gridResolution > 512 ? 512 : g_gridResolution);
+
+	// After a failure at the minimum resolution, do not retry (and re-log)
+	// every frame; wait until the cloud or the requested resolution changes.
+	static int    failedRes = -1;
+	static float3 failedBox = float3{0.0f, 0.0f, 0.0f};
+	if(R == failedRes && boxSize.x == failedBox.x && boxSize.y == failedBox.y && boxSize.z == failedBox.z) return;
+
 	float cell = longest / float(R);
 	int gx = std::min(R, int(boxSize.x / cell) + 1);
 	int gy = std::min(R, int(boxSize.y / cell) + 1);
@@ -908,6 +982,8 @@ static void ensureVoxelGrid(){
 			g_gridX = g_gridY = g_gridZ = 0;
 			g_gridBytes = 0;
 			g_gridBuiltAtRes = 0;
+			failedRes = R;
+			failedBox = boxSize;
 			return;
 		}
 
@@ -923,6 +999,7 @@ static void ensureVoxelGrid(){
 	}
 
 	g_gridBytes = bytes;
+	failedRes = -1;
 
 	// The light grid must match these dimensions, so drop it here; it is
 	// allocated again on demand, and only while the key light is on. It used
@@ -941,6 +1018,61 @@ static void ensureVoxelGrid(){
 	g_gridRefill = true;
 	logLine("[grid] %d x %d x %d cells, %.3f m each, %.1f MB\n",
 		gx, gy, gz, cell, double(bytes) / 1e6);
+}
+
+// ---- per-frame state --------------------------------------------------------
+// getUniforms() is called by every kernel launch, several times a frame, so it
+// must not allocate or consume one-shot flags: the first caller would take a
+// flag the render kernel never sees. Grid allocation and the refill/light
+// requests are settled here, once, at the start of each frame.
+static bool g_frameGridRefill = false;   // render kernel recounts the occupancy grid
+static bool g_frameLightDirty = false;   // render kernel rebuilds light transmittance
+static float g_adaptReduce    = 0.0f;    // adaptive detail: 0 = as configured, 1 = cheapest
+
+// Adaptive detail keeps the render kernel near the frame budget by lowering
+// one reduction level that drives two costs:
+//  - the LOD threshold (minNodeSize, up to 4x): fewer, coarser nodes far away
+//  - the splat-size cap (down to a quarter): near the camera every point of
+//    the nearest leaves is drawn regardless of LOD, as a splat of up to
+//    maxSplatPx squared pixels, so on a dense scan seen up close this is the
+//    cost that dominates (measured: LOD alone at 16x left a 54 M point scan
+//    at 140 ms per frame).
+// Reduces faster than it restores, which damps oscillation from the one- to
+// two-frame lag of the asynchronous Stats copy.
+static void updateAdaptiveDetail(){
+	if(!settings.adaptiveDetail || settings.frameBudgetMs <= 0.0f){
+		g_adaptReduce = 0.0f;
+		return;
+	}
+	if(stats.stageNs[6] == 0) return;   // no measurement yet
+	double ms = double(stats.stageNs[6]) / 1e6;
+	if(ms > settings.frameBudgetMs * 1.10)      g_adaptReduce += 0.03f;
+	else if(ms < settings.frameBudgetMs * 0.70) g_adaptReduce -= 0.015f;
+	g_adaptReduce = std::clamp(g_adaptReduce, 0.0f, 1.0f);
+}
+static float effectiveMinNodeSize(){ return settings.minNodeSize * (1.0f + 3.0f * g_adaptReduce); }
+static int   effectiveMaxSplatPx(){
+	int px = int(float(settings.maxSplatPx) * (1.0f - 0.75f * g_adaptReduce) + 0.5f);
+	return std::max(2, std::min(px, settings.maxSplatPx));
+}
+
+static void beginFrameState(){
+	updateAdaptiveDetail();
+
+	ensureVoxelGrid();
+	ensureLightGrid(settings.lightOn);
+
+	// Recount only once the device has processed every point. During a load
+	// the construct kernel counts points as it inserts them, and a recount
+	// part-way through would count the not-yet-inserted ones twice.
+	g_frameGridRefill = g_gridRefill && lastBatchFinishedDevice && stats.numNodes > 0 && g_voxelGrid != 0;
+	if(g_frameGridRefill){
+		g_gridRefill = false;
+		g_lightDirty = true;   // transmittance is derived from the counts
+	}
+
+	g_frameLightDirty = g_lightDirty && g_lightGrid != 0;
+	if(g_frameLightDirty) g_lightDirty = false;
 }
 
 uint64_t frameCounter = 0;
@@ -1008,6 +1140,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.horizonSoftness = settings.horizonSoftness;
 		uniforms.pickX = g_pickReqX;
 		uniforms.pickY = g_pickReqY;
+		uniforms.pickSeq = g_pickSeq;
 		uniforms.numMarkers = int(std::min<size_t>(g_markers.size(), 32));   // apply_markers2.ps1
 		uniforms.showMarkers = settings.showMarkers ? 1 : 0;
 		for(int i = 0; i < uniforms.numMarkers; i++){
@@ -1039,7 +1172,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.colorByLOD               = settings.colorByLOD;
 	uniforms.colorWhite               = settings.colorWhite;
 	uniforms.LOD                      = settings.LOD;
-	uniforms.minNodeSize              = settings.minNodeSize;
+	uniforms.minNodeSize              = effectiveMinNodeSize();
 	uniforms.pointSize                = settings.pointSize;
 	uniforms.useHighQualityShading    = settings.useHighQualityShading;
 	uniforms.persistentBufferCapacity = persistentBufferCapacity;
@@ -1105,7 +1238,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.insectGlow   = settings.insectGlow;
 		uniforms.insectSpeed  = settings.insectSpeed;
 
-	ensureVoxelGrid();
 	checkMomentaryBudget(stats.allocatedBytes_momentary, momentaryBufferCapacity);
 
 	// ---- fit settings to the cloud (apply_features.ps1) --------------------
@@ -1165,12 +1297,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.showVoxelGrid   = settings.showVoxelGrid;
 	uniforms.insectPlacement = settings.insectPlacement;
 	uniforms.numNodesTotal   = int(stats.numNodes);
-	// Refill only once the octree actually holds the points: during a load
-	// stats.numNodes climbs, and rebuilding every frame would be wasteful and
-	// still wrong. The loader's own counting covers the load itself.
-	bool loadDone = (numPointsTotal > 0) && (numPointsUploaded >= numPointsTotal);
-	uniforms.gridRefill = (g_gridRefill && loadDone && stats.numNodes > 0) ? 1 : 0;
-	if(uniforms.gridRefill){ g_gridRefill = false; }
+	uniforms.gridRefill = g_frameGridRefill ? 1 : 0;   // decided once per frame in beginFrameState
 	uniforms.showEventMarkers = settings.showEventMarkers;
 	uniforms.useVoxelGrid     = settings.useVoxelGrid;
 	uniforms.pointDensity     = settings.pointDensity;
@@ -1198,7 +1325,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.skyB             = settings.skyColour[2];
 	uniforms.pointWorldSize   = settings.pointWorldSize;
 	uniforms.pointShading     = settings.pointShading;
-	uniforms.maxSplatPx       = settings.maxSplatPx;
+	uniforms.maxSplatPx       = effectiveMaxSplatPx();
 	uniforms.grain            = settings.grain;
 	uniforms.vignette         = settings.vignette;
 	{
@@ -1207,7 +1334,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.lightDirX = float(cos(el) * sin(az));
 		uniforms.lightDirY = float(cos(el) * cos(az));
 		uniforms.lightDirZ = float(sin(el));
-		ensureLightGrid(settings.lightOn);
 		uniforms.lightGridPtr   = (uint64_t)g_lightGrid;
 		uniforms.lightR         = settings.lightColour[0];
 		uniforms.lightG         = settings.lightColour[1];
@@ -1216,14 +1342,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.ambient        = settings.ambient;
 		uniforms.lightAbsorb    = settings.lightAbsorb;
 		uniforms.lightSteps     = settings.lightSteps;
-		// getUniforms runs several times a frame. Clearing the flag on the first
-		// call meant the render kernel - a later call - never saw it, so the
-		// transmittance grid was built once at allocation and never again when
-		// a slider moved. Latch the request to the frame it was made in, so
-		// every call that frame reports it, and let the next frame clear it.
-		static int64_t lightDirtyFrame = -1;
-		if(g_lightDirty){ lightDirtyFrame = renderer->frameCount; g_lightDirty = false; }
-		uniforms.lightDirty     = (lightDirtyFrame == renderer->frameCount) ? 1 : 0;
+		uniforms.lightDirty     = g_frameLightDirty ? 1 : 0;   // decided once per frame in beginFrameState
 	}
 	uniforms.lightOn        = settings.lightOn ? 1 : 0;
 	uniforms.nearClip       = settings.nearClip;
@@ -1290,45 +1409,35 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 			}
 			g_activeEvents = uniforms.numEvents;
 			if(g_calls.size() > 0){
-				double last = g_calls.back().tStart + g_calls.back().duration + 2.0;
-				if(g_showClock > last) g_showClock = 0.0;   // loop
+				// the latest end, not the last row: calls.csv need not be sorted
+				double last = 0.0;
+				for(const ScheduledCall& c : g_calls) last = std::max(last, c.tStart + c.duration);
+				if(g_showClock > last + 2.0) g_showClock = 0.0;   // loop
 			}
 		}
 	}
 
 	// ---- DEBUG LOG (apply_debug_log.ps1) --------------------------------
-	// Printed once a second. Compare every field against the [dev ] lines. A
-	// difference in sizeof(Uniforms), or matching sizes but wrong values,
-	// means the host and device disagree about the struct layout.
+	// Each line is written only when its text changes, and the fast-moving
+	// ones (timings, camera, events) at most every 5 seconds.
 	{
-		static double lastLog = -10.0;
-		if(now() - lastLog > 1.0){
-			lastLog = now();
-			logLine("[host] stage ms: setup %.1f  points %.1f  extras %.1f  edl %.1f  volumetric %.1f  bloom %.1f  composite %.1f  total %.1f\n",
-				double(stats.stageNs[0])/1e6, double(stats.stageNs[1]-stats.stageNs[0])/1e6, double(stats.stageNs[2]-stats.stageNs[1])/1e6,
-				double(stats.stageNs[3]-stats.stageNs[2])/1e6, double(stats.stageNs[4]-stats.stageNs[3])/1e6, double(stats.stageNs[5]-stats.stageNs[4])/1e6,
-				double(stats.stageNs[6]-stats.stageNs[5])/1e6, double(stats.stageNs[6])/1e6);
-			logLine("[host] lens=%d fov=%.0f cam=(%.1f %.1f %.1f) pitch=%.0f radius=%.3f detail=%.0f splatCap=%d\n",
-				settings.lensMode, settings.lensMode ? settings.fisheyeFov : settings.fovy,
-				uniforms.camPos.x, uniforms.camPos.y, uniforms.camPos.z,
-				renderer->controls->pitch * 57.2958, renderer->controls->radius, settings.minNodeSize, settings.maxSplatPx);
-			logLine("[host] numEvents=%d  gain=%.3f  clock=%.2f  calls=%d  emittingPts=%u  drawn=%u  density=%.3f\n",
-				uniforms.numEvents, uniforms.emissionGain, g_showClock,
-				(int)g_calls.size(), stats.numEmitting, stats.numDrawn, settings.pointDensity);
-			logLine("[host] box min=(%.2f %.2f %.2f) max=(%.2f %.2f %.2f)\n",
-				uniforms.boxMin.x, uniforms.boxMin.y, uniforms.boxMin.z,
-				uniforms.boxMax.x, uniforms.boxMax.y, uniforms.boxMax.z);
-			logLine("[host] load offset (subtracted from every point) = (%.2f %.2f %.2f)\n",
-				boxMin.x, boxMin.y, boxMin.z);
-			logLine("[host] voxel grid %d x %d x %d @ %.3f m, insects=%d placement=%d\n",
-				g_gridX, g_gridY, g_gridZ, g_cellSize, settings.numInsects, settings.insectPlacement);
-			if(uniforms.numEvents > 0){
-				logLine("[host] ev0 pos=(%.2f %.2f %.2f) r=%.2f i=%.4f rgb=(%.2f %.2f %.2f)\n",
-					uniforms.eventX[0], uniforms.eventY[0], uniforms.eventZ[0],
-					uniforms.eventR[0], uniforms.eventI[0],
-					uniforms.eventCR[0], uniforms.eventCG[0], uniforms.eventCB[0]);
-			}
-		}
+		logIfChanged("stage", 5.0, "[host] stage ms: setup %.1f  points %.1f  extras %.1f  edl %.1f  volumetric %.1f  bloom %.1f  composite %.1f  total %.1f  | visible %.1f M pts %.1f M voxels, drawn %.1f M\n",
+			double(stats.stageNs[0])/1e6, double(stats.stageNs[1]-stats.stageNs[0])/1e6, double(stats.stageNs[2]-stats.stageNs[1])/1e6,
+			double(stats.stageNs[3]-stats.stageNs[2])/1e6, double(stats.stageNs[4]-stats.stageNs[3])/1e6, double(stats.stageNs[5]-stats.stageNs[4])/1e6,
+			double(stats.stageNs[6]-stats.stageNs[5])/1e6, double(stats.stageNs[6])/1e6,
+			stats.numVisiblePoints / 1e6, stats.numVisibleVoxels / 1e6, stats.numDrawn / 1e6);
+		logIfChanged("camera", 5.0, "[host] lens=%d fov=%.0f cam=(%.1f %.1f %.1f) pitch=%.0f radius=%.3f detail=%.0f splatCap=%d\n",
+			settings.lensMode, settings.lensMode ? settings.fisheyeFov : settings.fovy,
+			uniforms.camPos.x, uniforms.camPos.y, uniforms.camPos.z,
+			renderer->controls->pitch * 57.2958, renderer->controls->radius, effectiveMinNodeSize(), effectiveMaxSplatPx());
+		logIfChanged("events", 5.0, "[host] numEvents=%d  gain=%.3f  calls=%d  density=%.3f\n",
+			uniforms.numEvents, uniforms.emissionGain, (int)g_calls.size(), settings.pointDensity);
+		logIfChanged("box", 0.0, "[host] box min=(%.2f %.2f %.2f) max=(%.2f %.2f %.2f), load offset (subtracted from every point) = (%.2f %.2f %.2f)\n",
+			uniforms.boxMin.x, uniforms.boxMin.y, uniforms.boxMin.z,
+			uniforms.boxMax.x, uniforms.boxMax.y, uniforms.boxMax.z,
+			boxMin.x, boxMin.y, boxMin.z);
+		logIfChanged("grid", 0.0, "[host] voxel grid %d x %d x %d @ %.3f m, insects=%d placement=%d\n",
+			g_gridX, g_gridY, g_gridZ, g_cellSize, settings.numInsects, settings.insectPlacement);
 	}
 
 	if(settings.markersOnly){   // apply_markers2.ps1: the array on its own
@@ -1341,6 +1450,13 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 void resetCUDA(shared_ptr<GLRenderer> renderer){
 
 	ensureVoxelGrid();   // apply_voxel_grid.ps1: size and zero before the first batch
+
+	// ensureVoxelGrid returns early when the dimensions are unchanged, which
+	// they are when the same cloud is reloaded. The construct kernel adds to
+	// the counts as points arrive, so without this every reset doubled them.
+	if(g_voxelGrid != 0) cuMemsetD8(g_voxelGrid, 0, g_gridBytes);
+	g_gridRefill = false;
+	g_lightDirty = true;
 
 	Uniforms uniforms = getUniforms(renderer);
 
@@ -1577,20 +1693,22 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 
 	momentaryBufferCapacity = cptr_buffer_bytes;
 
-	cuMemAlloc(&cptr_buffer                , cptr_buffer_bytes);
-	cuMemAlloc(&cptr_nodes                 , cptr_nodes_bytes);
-	cuMemAlloc(&cptr_renderbuffer          , cptr_renderbuffer_bytes);
-	cuMemAlloc(&cptr_stats                 , sizeof(Stats));
-	cuMemAlloc(&cptr_numBatchesUploaded    , 4);
-	cuMemAlloc(&cptr_batchSizes            , 4 * BATCH_STREAM_SIZE);
-	cuMemAlloc(&cptr_frameStart            , 8);
-	cuMemAllocHost((void**)&h_stats_pinned , sizeof(Stats));
+	// Unchecked, a failed allocation left a null pointer that the kernels then
+	// wrote through. Fail at startup with the reason in the log instead.
+	cuCheck(cuMemAlloc(&cptr_buffer                , cptr_buffer_bytes), "cuMemAlloc momentary buffer");
+	cuCheck(cuMemAlloc(&cptr_nodes                 , cptr_nodes_bytes), "cuMemAlloc nodes");
+	cuCheck(cuMemAlloc(&cptr_renderbuffer          , cptr_renderbuffer_bytes), "cuMemAlloc renderbuffer");
+	cuCheck(cuMemAlloc(&cptr_stats                 , sizeof(Stats)), "cuMemAlloc stats");
+	cuCheck(cuMemAlloc(&cptr_numBatchesUploaded    , 4), "cuMemAlloc numBatchesUploaded");
+	cuCheck(cuMemAlloc(&cptr_batchSizes            , 4 * BATCH_STREAM_SIZE), "cuMemAlloc batchSizes");
+	cuCheck(cuMemAlloc(&cptr_frameStart            , 8), "cuMemAlloc frameStart");
+	cuCheck(cuMemAllocHost((void**)&h_stats_pinned , sizeof(Stats)), "cuMemAllocHost stats");
 
 	// allocate ring buffer for point upload
 	uint64_t cptr_points_bytes = MAX_BATCH_SIZE * sizeof(Point);
 	CUdeviceptr devicemem = 0;
 
-	cuMemAlloc(&devicemem, BATCH_STREAM_SIZE * cptr_points_bytes);
+	cuCheck(cuMemAlloc(&devicemem, BATCH_STREAM_SIZE * cptr_points_bytes), "cuMemAlloc point ring buffer");
 
 	for(uint64_t i = 0; i < BATCH_STREAM_SIZE; i++){
 		cptr_points_ring[i] = devicemem + i * cptr_points_bytes;
@@ -1603,7 +1721,7 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 
 	size_t cptr_buffer_persistent_bytes = static_cast<size_t>(static_cast<double>(availableMem) * 0.80);
 	persistentBufferCapacity = cptr_buffer_persistent_bytes;
-	cuMemAlloc(&cptr_buffer_persistent, cptr_buffer_persistent_bytes);
+	cuCheck(cuMemAlloc(&cptr_buffer_persistent, cptr_buffer_persistent_bytes), "cuMemAlloc persistent buffer");
 
 	uint64_t total = cptr_buffer_bytes 
 		+ cptr_nodes_bytes
@@ -1810,9 +1928,10 @@ void reset(shared_ptr<GLRenderer> renderer){
 	cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
 
 	// read stats just to make sure device and host are on the same page
+	// (sync before the memcpy, or this copies the previous, stale contents)
 	cuMemcpyDtoHAsync(h_stats_pinned, cptr_stats, sizeof(Stats), ((CUstream)CU_STREAM_DEFAULT));
-	memcpy(&stats, h_stats_pinned, sizeof(Stats));
 	cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
+	memcpy(&stats, h_stats_pinned, sizeof(Stats));
 
 	// finally, reset host state to start reloading current data set from disk
 	reload();
@@ -2082,24 +2201,16 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 	setThreadPriorityHigh(t);
 }
 
-int main(){
+int main(int argc, char** argv){
 
-	// ---- last-words handler (fix_crash_instrument.ps1) -------------------
-	// A hard crash on Windows kills the process silently. MSVC delivers an
-	// access violation as SIGSEGV, so a signal handler gets one chance to
-	// write to the run log before the process dies. Uses <csignal> rather
-	// than <windows.h>, which defines 'near' and 'far' as macros and would
-	// break the Camera struct that uses both names.
-	std::signal(SIGSEGV, [](int){
-		logLine("[CRASH] SIGSEGV - access violation. Last [host] block above is the state at the time.\n");
-		fflush(stdout);
-		std::_Exit(139);
-	});
-	std::signal(SIGILL, [](int){
-		logLine("[CRASH] SIGILL - illegal instruction\n");
-		fflush(stdout);
-		std::_Exit(132);
-	});
+	// ---- last-words handlers ---------------------------------------------
+	// A hard crash on Windows kills the process silently. The structured-
+	// exception filter (CrashHandler.cpp) catches access violations, divide
+	// by zero and the like on every thread and writes a symbolised stack
+	// trace to the run log. The old SIGSEGV handler only covered the main
+	// thread and could not say where the fault was.
+	logLine("[host] SimLOD starting\n");   // opens the run log, so its path is known
+	installCrashHandler(g_logPath.c_str());
 	std::signal(SIGABRT, [](int){
 		logLine("[CRASH] SIGABRT - abort() called, usually an assertion or a failed allocation\n");
 		fflush(stdout);
@@ -2156,8 +2267,70 @@ int main(){
 	cudaprint.init();
 	
 	spawnUploader(renderer);
-	
+
+	// Command line: SimLOD.exe [cloud.las|.laz|.simlod ...] [--view yaw pitch radius tx ty tz]
+	// Files load as if dropped on the window; --view sets the camera afterwards
+	// (target in the renderer frame, i.e. relative to the cloud's minimum corner),
+	// which makes timings and screenshots reproducible.
+	bool haveView = false;
+	double view[6] = {0, 0, 0, 0, 0, 0};
+	vector<string> argFiles;
+	for(int i = 1; i < argc; i++){
+		string arg = argv[i];
+		if(arg == "--view" && i + 6 < argc){
+			for(int k = 0; k < 6; k++) view[k] = std::atof(argv[i + 1 + k]);
+			haveView = true;
+			i += 6;
+		}else if(arg == "--set" && i + 1 < argc){
+			// --set name=value, for the settings that matter most on a small GPU
+			string kv = argv[++i];
+			size_t eq = kv.find('=');
+			string key = kv.substr(0, eq);
+			double v = (eq == string::npos) ? 1.0 : std::atof(kv.c_str() + eq + 1);
+			if     (key == "hqs")      settings.useHighQualityShading = v != 0.0;
+			else if(key == "splat")    settings.maxSplatPx            = int(v);
+			else if(key == "detail")   settings.minNodeSize           = float(v);
+			else if(key == "adaptive") settings.adaptiveDetail        = v != 0.0;
+			else if(key == "budget")   settings.frameBudgetMs         = float(v);
+			else if(key == "vsync")    settings.vsync                 = v != 0.0;
+			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync)\n", key);
+		}else if(iEndsWith(arg, "las") || iEndsWith(arg, "laz") || iEndsWith(arg, "simlod")){
+			std::error_code ec;
+			auto absolute = std::filesystem::absolute(arg, ec);   // dropped files are absolute too
+			argFiles.push_back(ec ? arg : absolute.string());
+		}else{
+			printfmt("ignoring command-line argument: {}\n", arg);
+		}
+	}
+	if(argc > 1){
+		logLine("[host] command line: %d file(s)%s\n", int(argFiles.size()), haveView ? ", --view" : "");
+		for(auto& f : argFiles) logLine("[host]   %s\n", f.c_str());
+	}
+
 	reload();
+
+	// Load command-line files the way a drop does: through reset() on the
+	// first frame, which locks the loader threads out first. Calling reload()
+	// here with real files deadlocked against the already-running loaders.
+	bool startCameraPending = false;
+	if(!argFiles.empty()){
+		paths = argFiles;   // replaces the "NONE" placeholder
+		requestReset = true;
+		startCameraPending = true;
+	}
+	auto applyStartCamera = [&](){
+		renderer->controls->yaw    = -1.15;
+		renderer->controls->pitch  = -0.57;
+		renderer->controls->radius = sqrt(boxSize.x * boxSize.x + boxSize.y * boxSize.y + boxSize.z * boxSize.z);
+		renderer->controls->target = { boxSize.x * 0.5f, boxSize.y * 0.5f, boxSize.z * 0.1f };
+		if(haveView){
+			renderer->controls->yaw    = view[0];
+			renderer->controls->pitch  = view[1];
+			renderer->controls->radius = view[2];
+			renderer->controls->target = { view[3], view[4], view[5] };
+		}
+	};
+	if(argFiles.empty() && haveView) applyStartCamera();
 
 	renderer->onFileDrop([&](vector<string> files){
 		vector<string> pointCloudFiles;
@@ -2232,19 +2405,42 @@ int main(){
 		// Alt already suppresses orbiting in OrbitControls, so the click does
 		// not also drag the view.
 		{
-			g_pickReqX = -1; g_pickReqY = -1;
 			bool altDown  = glfwGetKey(renderer->window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS || glfwGetKey(renderer->window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS;   // fix_pick_input
 			bool leftDown = glfwGetMouseButton(renderer->window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;   // fix_pick_input
 			ImGuiIO& io = ImGui::GetIO();
-			bool pKey = glfwGetKey(renderer->window, GLFW_KEY_P) == GLFW_PRESS && !io.WantCaptureKeyboard; if(((altDown && leftDown && !g_leftWasDown) || (pKey && !g_altWasDown)) && !io.WantCaptureMouse){
-				double mx=0.0, my=0.0; glfwGetCursorPos(renderer->window,&mx,&my); g_pickReqX = int(mx);
-				g_pickReqY = renderer->height - 1 - int(my); logLine("[pick] requested at %d %d  alt=%d left=%d p=%d\n", g_pickReqX, g_pickReqY, int(altDown), int(leftDown), int(pKey));
+			bool pKey = glfwGetKey(renderer->window, GLFW_KEY_P) == GLFW_PRESS && !io.WantCaptureKeyboard;
+			if(((altDown && leftDown && !g_leftWasDown) || (pKey && !g_pKeyWasDown)) && !io.WantCaptureMouse){
+				double mx=0.0, my=0.0; glfwGetCursorPos(renderer->window,&mx,&my);
+				g_pickReqX = int(mx);
+				g_pickReqY = renderer->height - 1 - int(my);
+				g_pickSeq++;
+				g_pickSeenDone = 0;
 				g_pickWaiting = true;
+				logLine("[pick] requested at %d %d  alt=%d left=%d p=%d\n", g_pickReqX, g_pickReqY, int(altDown), int(leftDown), int(pKey));
 			}
 			g_leftWasDown = leftDown;
-			g_altWasDown  = pKey; { static int pw=0; if(g_pickWaiting && !stats.pickValid){ if(++pw > 60){ g_pickWaiting=false; pw=0; logLine("[pick] nothing under that pixel - sky, or beyond the drawn points\n"); } } else { pw=0; } }
+			g_pKeyWasDown = pKey;
 
-			if(g_pickWaiting && stats.pickValid){
+			// Stats arrives by an unsynchronised async copy, so one read can be
+			// stale or half-written. The kernel leaves an answered request in
+			// place, so requiring the answer on two consecutive reads means the
+			// second read is a complete copy of settled values.
+			bool answered = false;
+			if(g_pickWaiting && stats.pickSeqDone == g_pickSeq){
+				answered = (++g_pickSeenDone >= 2);
+			}else{
+				g_pickSeenDone = 0;
+			}
+			if(answered){
+				g_pickReqX = -1; g_pickReqY = -1;
+			}
+			if(answered && !stats.pickValid){
+				g_pickWaiting = false;
+				logLine("[pick] nothing under that pixel - sky, or beyond the drawn points\n");
+				notice("Nothing under that pixel to place a marker on");
+			}
+
+			if(answered && stats.pickValid){
 				if(g_markers.size() < 32){   // apply_markers2.ps1
 					g_markers.push_back(makeMarker(g_nextMic++, stats.pickWX, stats.pickWY, stats.pickWZ));
 					glm::dvec3 cpos = renderer->camera->position;
@@ -2274,8 +2470,16 @@ int main(){
 
 		if(requestReset){
 			reset(renderer);
+			if(startCameraPending){ applyStartCamera(); startCameraPending = false; }   // boxSize is known now
 		}
 
+		{   // GLRenderer starts with vsync off (glfwSwapInterval(0)); follow the setting
+			static int appliedSwapInterval = -1;
+			int wanted = settings.vsync ? 1 : 0;
+			if(wanted != appliedSwapInterval){ glfwSwapInterval(wanted); appliedSwapInterval = wanted; }
+		}
+
+		beginFrameState();
 		renderCUDA(renderer);
 
 		if(!lastBatchFinishedDevice){
@@ -2322,6 +2526,8 @@ int main(){
 			}
 			if(newLastBatchFinishedDevice != lastBatchFinishedDevice){
 				lastBatchFinishedDevice = newLastBatchFinishedDevice;
+				// the light was built (if at all) from partial counts during the load
+				if(lastBatchFinishedDevice) g_lightDirty = true;
 				printfmt("stats.numPointsProcessed = {} \n", stats.numPointsProcessed);
 				printfmt("numPointsTotal = {} \n", uint64_t(numPointsTotal));
 				printfmt("setting lastBatchFinishedDevice = {} \n", lastBatchFinishedDevice ? "true" : "false");
@@ -2572,6 +2778,17 @@ int main(){
 				ImGui::Text("   %.2f M actually drawn this frame", stats.numDrawn / 1e6);
 				ImGui::SliderFloat("Detail",           &settings.minNodeSize,    8.0f, 256.0f);
 				tipFor("Level-of-detail threshold in pixels. Higher draws coarser summaries sooner and costs less.");
+				ImGui::Checkbox("Adaptive detail", &settings.adaptiveDetail);
+				tipFor("Coarsens the level of detail automatically while a frame takes longer than the budget, and refines it again when there is headroom. Keeps the view responsive on smaller GPUs and over Remote Desktop.");
+				if(settings.adaptiveDetail){
+					ImGui::SameLine(0.0f);
+					ImGui::SetNextItemWidth(110.0f);
+					ImGui::SliderFloat("Budget ms", &settings.frameBudgetMs, 10.0f, 100.0f, "%.0f");
+					tipFor("Render time to aim for. 33 ms is 30 frames a second; raise it for more detail, lower it for smoother motion.");
+					ImGui::Text("   reduced %.0f%%: detail %.0f px, splat cap %d px", 100.0f * g_adaptReduce, effectiveMinNodeSize(), effectiveMaxSplatPx());
+				}
+				ImGui::Checkbox("VSync", &settings.vsync);
+				tipFor("Caps the frame rate at the display refresh. Saves GPU power and heat, which matters on a laptop GPU; turn it off only to measure raw speed.");
 				ImGui::SliderInt  ("Max splat px",     &settings.maxSplatPx,     2, 64);
 				tipFor("Cap on how large a near point may be drawn. Lower if the frame rate drops when the camera is close to foliage.");
 			}
@@ -2585,12 +2802,18 @@ int main(){
 				ImGui::Checkbox   ("Show culled only", &settings.showCulledOnly);
 				tipFor("Shows ONLY what would be removed. Raise Min neighbours until this is noise and nothing you want.");
 				ImGui::Separator();
-				ImGui::SliderInt  ("Grid resolution",  &g_gridResolution, 64, 512);
-				tipFor("Cells along the cloud's longest side. Memory grows with the cube: 256 is ~20 MB, 512 ~156 MB.");
+				// Edit a copy and apply it on release: every applied value frees and
+				// reallocates the grid (an implicit device sync) and zeroes the counts,
+				// which happened on every frame of a drag.
+				static int pendingGridRes = g_gridResolution;
+				if(!ImGui::IsAnyItemActive()) pendingGridRes = g_gridResolution;   // follow fallbacks
+				ImGui::SliderInt  ("Grid resolution",  &pendingGridRes, 64, 512);
+				if(ImGui::IsItemDeactivatedAfterEdit()) g_gridResolution = pendingGridRes;
+				tipFor("Cells along the cloud's longest side. Applied when you release the slider. Memory grows with the cube: 256 is ~20 MB, 512 ~156 MB.");
 				{
 					float longest = std::max(boxSize.x, std::max(boxSize.y, boxSize.z));
 					if(longest > 0.0f){
-						int R = g_gridResolution;
+						int R = pendingGridRes;
 						float cell = longest / float(R);
 						int px = std::min(R, int(boxSize.x / cell) + 1);
 						int py = std::min(R, int(boxSize.y / cell) + 1);
@@ -2971,26 +3194,31 @@ int main(){
 			ImGui::End();
 		}
 
+		// On-screen notice (markers, survey fit, file errors). It used to sit
+		// inside the warning block below, so it only showed while a LAZ file
+		// was loading or memory was full.
+		if(now() < g_noticeUntil){
+			ImGuiIO& io = ImGui::GetIO();
+			ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 40.0f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+			ImGui::SetNextWindowBgAlpha(0.80f);
+			ImGui::Begin("##pickNotice", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs
+				| ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+			ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 60, 255, 255));
+			ImGui::TextUnformatted(g_noticeText);
+			ImGui::PopStyleColor();
+			ImGui::End();
+		}
+
 		if(stats.memCapacityReached || (lazInBatches && !lastBatchFinishedDevice))
 		{
 			ImGuiIO& io = ImGui::GetIO();
 			ImGui::SetNextWindowSize(ImVec2(700, 100));
 			// ImGui::SetNextWindowPos(ImVec2(300, 200));
 			ImGui::SetNextWindowPos(
-				ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 100), 
+				ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 100),
 				ImGuiCond_Always, ImVec2(0.5f,0.5f)
 			);
 
-			if(now() < g_noticeUntil){   // apply_markers2.ps1: pick / fit notice
-				ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 40.0f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-				ImGui::SetNextWindowBgAlpha(0.80f);
-				ImGui::Begin("##pickNotice", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs
-					| ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
-				ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 60, 255, 255));
-				ImGui::TextUnformatted(g_noticeText);
-				ImGui::PopStyleColor();
-				ImGui::End();
-			}
 			ImGui::Begin("Message");
 
 			ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 0, 0, 255));

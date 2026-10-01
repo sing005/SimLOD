@@ -329,7 +329,15 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 			ImGui::Begin("Performance");
 			{
 				bool nc = ImGui::IsWindowCollapsed();
-				if(!nc){ ImVec2 s = ImGui::GetWindowSize(); if(s.x > 0.0f) perfSaved = s; }
+				if(!nc && perfCollapsed && perfSaved.x > 0.0f){
+					// just expanded: the narrow collapsed width was applied above
+					// for this frame, so restore the saved size now and do not
+					// record the narrow one over it
+					ImGui::SetWindowSize(perfSaved, ImGuiCond_Always);
+				}else if(!nc){
+					ImVec2 s = ImGui::GetWindowSize();
+					if(s.x > 0.0f) perfSaved = s;
+				}
 				perfCollapsed = nc;
 			}
 			string fpsStr = rightPad("FPS:", 30) + strFps;
