@@ -10,6 +10,29 @@ struct mat4{
 
 #define MAX_EVENTS 16
 
+// ---- buffer sizes shared by the host and the kernels ---------------------
+
+// Upload ring: device slots of one batch (MAX_BATCH_SIZE points, 16 MB) each,
+// filled by the uploader and drained by kernel_construct. The kernel adds
+// about one batch per frame, so a few slots keep it fed; the loaders decode
+// further ahead into pinned host memory (MAX_DECODED_AHEAD on the host).
+// Was 50 slots, 800 MB of VRAM.
+constexpr uint64_t BATCH_STREAM_SIZE = 8;
+
+// kernel_construct's scratch (momentary) buffer. The capacities live here so
+// the host allocates exactly what the kernel lays out; it was a fixed 1.2 GB
+// of which 409 MB was used.
+constexpr uint64_t CONSTRUCT_VOXEL_BACKLOG  = 10'000'000;   // voxel samples: a 16 B point and an 8 B node pointer each
+constexpr uint64_t CONSTRUCT_SPILLING_NODES = 100'000;      // node pointers, 8 B
+constexpr uint64_t CONSTRUCT_SPILLED_POINTS = 10'000'000;   // 16 B points; written unchecked, re-inserted only up to 3 M
+constexpr uint64_t CONSTRUCT_CHUNK_QUEUE    = 1'000'000;    // chunk pointers, 8 B
+constexpr uint64_t CONSTRUCT_SCRATCH_BYTES  =
+	  CONSTRUCT_VOXEL_BACKLOG  * (16 + 8)
+	+ CONSTRUCT_SPILLING_NODES * 8
+	+ CONSTRUCT_SPILLED_POINTS * 16
+	+ CONSTRUCT_CHUNK_QUEUE    * 8
+	+ 4096;                                                  // counters and 16-byte alignment
+
 struct Uniforms{
 	float width;
 	float height;

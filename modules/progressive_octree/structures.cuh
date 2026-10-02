@@ -25,7 +25,7 @@ constexpr uint32_t GRID_NUM_CELLS    = GRID_SIZE * GRID_SIZE * GRID_SIZE;
 constexpr int MAX_DEPTH              = 20;
 constexpr float MAX_DEPTH_GRIDSIZE   = 268'435'456.0f;
 
-constexpr uint64_t BATCH_STREAM_SIZE = 50;
+// BATCH_STREAM_SIZE is in HostDeviceInterface.h, shared with the host
 
 struct Point{
 	float x;
