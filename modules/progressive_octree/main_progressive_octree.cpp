@@ -342,7 +342,7 @@ atomic_bool requestStepthrough     = false;
 atomic_bool requestStep            = false;
 bool requestColorFiltering         = false;
 float renderingDuration            = 0.0f;
-uint32_t numPointsUploaded         = 0;
+atomic_uint64_t numPointsUploaded  = 0;   // written by the uploader, read by the main thread's progress log
 float loadStart                    = 0.0f;
 
 float kernelUpdateDuration         = 0.0f;
@@ -1965,20 +1965,27 @@ void stopLoadingAtCapacity(){
 		batchesToProcess.clear();
 	}
 
-	// same lock order as the uploader: mtx_uploader, then the pinned queue
-	lock_guard<mutex> lock_upload(mtx_uploader);
-	lock_guard<mutex> lock_batchesInPinnedMemory(mtx_batchesInPinnedMemory);
+	// The uploader holds mtx_uploader for all but ~100 ns of each ~100 us pass
+	// and std::mutex is not fair, so ask it to back off outside the lock first,
+	// as reset() does. Without this the main thread could wait indefinitely.
+	resetInProgress = true;
+	{
+		// same lock order as the uploader: mtx_uploader, then the pinned queue
+		lock_guard<mutex> lock_upload(mtx_uploader);
+		lock_guard<mutex> lock_batchesInPinnedMemory(mtx_batchesInPinnedMemory);
 
-	for(PointBatch& batch : batchesInPinnedMemory){
-		pinnedMemPool.release(batch.pinnedMem);
+		for(PointBatch& batch : batchesInPinnedMemory){
+			pinnedMemPool.release(batch.pinnedMem);
+		}
+		batchesInPinnedMemory.clear();
+
+		// Uploader and loaders idle once every batch counts as uploaded. Batches a
+		// loader is still decoding land in batchesInPinnedMemory and stay there
+		// until the next reload refills the pool.
+		numBatchesTotal = batchStreamUploadIndex.load();
+		loadStoppedAtCapacity = true;
 	}
-	batchesInPinnedMemory.clear();
-
-	// Uploader and loaders idle once every batch counts as uploaded. Batches a
-	// loader is still decoding land in batchesInPinnedMemory and stay there
-	// until the next reload refills the pool.
-	numBatchesTotal = batchStreamUploadIndex.load();
-	loadStoppedAtCapacity = true;
+	resetInProgress = false;
 }
 
 // One-off, after the last batch: everything the octree build produced, so
