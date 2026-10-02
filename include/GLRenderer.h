@@ -191,6 +191,12 @@ struct GLRenderer{
 	int windowHeight = 0;
 	int renderWidth = 0;
 	int renderHeight = 0;
+	// where the frame lands in the window, in GL window coordinates (origin
+	// bottom left): all of it, or letterboxed when the shapes differ
+	int presentX = 0;
+	int presentY = 0;
+	int presentWidth = 0;
+	int presentHeight = 0;
 	string selectedMethod = "";
 
 	GLRenderer();

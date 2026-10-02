@@ -844,7 +844,12 @@ void drawNodes(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 		};
 
 		drawNode(node->points, node, node->numPoints, framebuffer, 0.0f);
-		drawNode(node->voxelChunks, node, node->numVoxels, framebuffer, voxelSplatMetres(nodeSize));
+		// A leaf's voxels duplicate its own points. Only a root that never
+		// spilled (a cloud of 50 k points or fewer) is a leaf with voxels, and
+		// at cell size they would cover its points. Same test in both HQS passes.
+		if(!node->isLeafFn()){
+			drawNode(node->voxelChunks, node, node->numVoxels, framebuffer, voxelSplatMetres(nodeSize));
+		}
 
 		block.sync();
 	}
@@ -976,7 +981,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 			childVisibleMask = childVisibleMask | (childIsVisible << i);
 		}
 
-		if(node->numVoxels > 0)
+		if(node->numVoxels > 0 && !node->isLeafFn())   // a leaf's voxels duplicate its points; as in drawNodes
 		{// draw voxels
 			Chunk* chunk = node->voxelChunks;
 			int chunkIndex = 0;
@@ -1164,7 +1169,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 			childVisibleMask = childVisibleMask | (childIsVisible << i);
 		}
 
-		if(node->numVoxels > 0)
+		if(node->numVoxels > 0 && !node->isLeafFn())   // a leaf's voxels duplicate its points; as in drawNodes
 		{// draw voxels
 			Chunk* chunk = node->voxelChunks;
 			int chunkIndex = 0;
