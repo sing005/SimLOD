@@ -251,6 +251,13 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 		// WINDOW
 		int width, height;
 		glfwGetWindowSize(window, &width, &height);
+		this->windowWidth = width;
+		this->windowHeight = height;
+		// a fixed render size, if one is set, independent of the window
+		if(renderWidth > 0 && renderHeight > 0 && width > 0 && height > 0){
+			width = renderWidth;
+			height = renderHeight;
+		}
 		camera->setSize(width, height);
 		this->width = width;
 		this->height = height;
@@ -373,18 +380,22 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 			ImGui::End();
 		}
 
-		ImGui::Render();
-		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
+		// Present: scale the rendered frame to the window, then draw the UI on
+		// top at window size. The UI used to be drawn into the frame itself,
+		// which only works while frame and window are the same size; this
+		// also leaves the frame free of UI for screenshots.
 		auto source = view.framebuffer;
 		glBlitNamedFramebuffer(
 			source->handle, 0,
 			0, 0, source->width, source->height,
-			0, 0, 0 + source->width, 0 + source->height,
+			0, 0, this->windowWidth, this->windowHeight,
 			GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
-		glViewport(0, 0, this->width, this->height);
+		glViewport(0, 0, this->windowWidth, this->windowHeight);
+
+		ImGui::Render();
+		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
 
 		glfwSwapBuffers(window);

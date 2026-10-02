@@ -1811,7 +1811,7 @@ void kernel_render(
 
 	Lines* lines = allocator->alloc<Lines*>(sizeof(Lines));
 	lines->count = 0;
-	lines->vertices = allocator->alloc<Point*>(1'000'000 * sizeof(Point));
+	lines->vertices = allocator->alloc<Point*>(int64_t(MAX_LINE_VERTICES) * sizeof(Point));
 	_lines = lines;
 
 	int framebufferSize = int(uniforms.width) * int(uniforms.height) * sizeof(uint64_t);

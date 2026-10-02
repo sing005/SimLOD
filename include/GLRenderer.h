@@ -180,8 +180,17 @@ struct GLRenderer{
 
 	vector<function<void(vector<string>)>> fileDropListeners;
 
+	// width x height is the size frames are rendered at: the window's, unless
+	// renderWidth x renderHeight is set (e.g. 3840 x 2160 for a 4K frame on a
+	// smaller screen, or a smaller frame scaled up). Frames are scaled to the
+	// window, windowWidth x windowHeight, when presented; the UI is drawn at
+	// window size on top.
 	int width = 0;
 	int height = 0;
+	int windowWidth = 0;
+	int windowHeight = 0;
+	int renderWidth = 0;
+	int renderHeight = 0;
 	string selectedMethod = "";
 
 	GLRenderer();

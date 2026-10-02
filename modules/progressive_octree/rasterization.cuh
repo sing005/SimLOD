@@ -2,6 +2,11 @@
 
 #include "structures.cuh"
 
+// Capacity of the line list kernel_render allocates. Bounding boxes take 96
+// vertices a visible node, so a view with more than about 10 k nodes fills it;
+// lines past the end are dropped instead of written over the framebuffer.
+constexpr uint32_t MAX_LINE_VERTICES = 1'000'000;
+
 void drawLine(Lines* lines, float3 start, float3 end, uint32_t color){
 
 	Point pStart;
@@ -16,7 +21,8 @@ void drawLine(Lines* lines, float3 start, float3 end, uint32_t color){
 	pEnd.z = end.z;
 	pEnd.color = color;
 
-	int index = atomicAdd(&lines->count, 2);
+	uint32_t index = atomicAdd(&lines->count, 2);
+	if(index + 2 > MAX_LINE_VERTICES) return;   // count keeps rising; nothing is written past the list
 	lines->vertices[index + 0] = pStart;
 	lines->vertices[index + 1] = pEnd;
 
@@ -94,7 +100,7 @@ void rasterizeLines(Lines* lines, uint64_t* target, int width, int height, mat4 
  
 	Frustum frustum = Frustum::fromWorldViewProj(transform);
 	
-	int numLines = lines->count / 2;
+	int numLines = min(lines->count, MAX_LINE_VERTICES) / 2;
 	processRange(0, numLines, [&](int lineIndex){
 
 		Point start = lines->vertices[2 * lineIndex + 0];
