@@ -868,7 +868,7 @@ void kernel_construct(
 
 	// memory for "backlog"
 	// capacities shared with the host, which sizes the buffer from them
-	// (CONSTRUCT_SCRATCH_BYTES in HostDeviceInterface.h)
+	// (CONSTRUCT_* and CHUNK_BYTES in HostDeviceInterface.h)
 	backlog_voxels     = allocator->alloc<Point*>(CONSTRUCT_VOXEL_BACKLOG * sizeof(Point));
 	backlog_targets    = allocator->alloc<Node**>(CONSTRUCT_VOXEL_BACKLOG * sizeof(Node*));
 	numBacklogVoxels   = allocator->alloc<uint32_t*>(4);
@@ -883,7 +883,11 @@ void kernel_construct(
 	Point* spilledPoints = allocator->alloc<Point*>(CONSTRUCT_SPILLED_POINTS * sizeof(Point));
 	uint32_t* numSpilledPoints = allocator->alloc<uint32_t*>(4);
 
-	chunkQueue = allocator->alloc<Chunk**>(sizeof(Chunk*) * CONSTRUCT_CHUNK_QUEUE);
+	// One entry for every point chunk the octree pool can hold: chunks freed by
+	// a split wait here for reuse, and there are never more of them than were
+	// carved from the pool. Was a fixed 1 M entries, too few for a pool >16 GB.
+	uint64_t chunkQueueEntries = uniforms.persistentBufferCapacity / sizeof(Chunk) + 1;
+	chunkQueue = allocator->alloc<Chunk**>(sizeof(Chunk*) * chunkQueueEntries);
 
 	// The buffer is now allocated to fit this layout rather than with 800 MB to
 	// spare. Should the two ever disagree, do nothing instead of writing past

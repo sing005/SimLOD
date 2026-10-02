@@ -72,7 +72,7 @@ struct Point{
 	};
 };
 // the device Point (structures.cuh) is 16 bytes too; the upload ring and
-// CONSTRUCT_SCRATCH_BYTES are sized on that
+// CONSTRUCT_SCRATCH_FIXED_BYTES are sized on that
 static_assert(sizeof(Point) == 16, "Point must stay 16 bytes, as on the device");
 
 struct PointBatch{
@@ -381,6 +381,7 @@ atomic_uint32_t batchesProcessedHost = 0;
 atomic_uint64_t pointsProcessedHost  = 0;
 uint64_t momentaryBufferCapacity   = 0;
 uint64_t persistentBufferCapacity  = 0;
+uint64_t renderBufferCapacity      = 0;
 vector<double> processFrameTimes; 
 
 PinnedMemPool pinnedMemPool;
@@ -904,15 +905,15 @@ static float       g_cellSize   = 1.0f;
 static size_t      g_gridBytes  = 0;
 
 // Construct scratch (momentary buffer) check. The buffer is sized from the
-// kernel's own capacities (CONSTRUCT_SCRATCH_BYTES); kernel_construct refuses
-// to run, and reports its layout size here, if it would not fit with 1 KB to
-// spare. Loading then stalls, so say why, once per session.
+// kernel's own capacities (CONSTRUCT_* in HostDeviceInterface.h); kernel_construct
+// refuses to run, and reports its layout size here, if it would not fit with
+// 1 KB to spare. Loading then stalls, so say why, once per session.
 static void checkMomentaryBudget(uint64_t used, uint64_t capacity){
 	static bool warned = false;
 	if(!warned && used + 1024 > capacity){
 		warned = true;
 		logLine("[WARN] construct scratch overrun: the kernel lays out %.1f MB in a %.1f MB buffer and will not run. "
-			"Keep CONSTRUCT_SCRATCH_BYTES in HostDeviceInterface.h in step with kernel_construct's allocations.\n",
+			"Keep CONSTRUCT_SCRATCH_FIXED_BYTES in HostDeviceInterface.h in step with kernel_construct's allocations.\n",
 			double(used) / 1'000'000.0, double(capacity) / 1'000'000.0);
 	}
 }
@@ -932,10 +933,17 @@ static void ensureLightGrid(bool wanted){
 	static int failedX = -1, failedY = -1, failedZ = -1;
 	if(g_gridX == failedX && g_gridY == failedY && g_gridZ == failedZ) return;
 	size_t lbytes = size_t(g_gridX) * size_t(g_gridY) * size_t(g_gridZ) * sizeof(float);
-	if(cuMemAlloc(&g_lightGrid, lbytes) != CUDA_SUCCESS){
+	// Checked against free memory first, as ensureVoxelGrid does: with the
+	// driver's sysmem fallback on (the default), cuMemAlloc does not fail when
+	// VRAM is short but quietly places the grid in system memory, which the
+	// render kernel would then read over PCIe every frame.
+	size_t freeMem = 0, totalMem = 0;
+	cuMemGetInfo(&freeMem, &totalMem);
+	if(lbytes + 64'000'000 >= freeMem || cuMemAlloc(&g_lightGrid, lbytes) != CUDA_SUCCESS){
 		g_lightGrid = 0;
 		failedX = g_gridX; failedY = g_gridY; failedZ = g_gridZ;
-		logLine("[grid] light grid (%.0f MB) would not fit; key light disabled\n", double(lbytes) / 1e6);
+		logLine("[grid] light grid (%.0f MB) would not fit (%.0f MB free); key light disabled\n",
+			double(lbytes) / 1e6, double(freeMem) / 1e6);
 		notice("Key light needs %.0f MB of GPU memory that is not free - lower the grid resolution", double(lbytes) / 1e6);
 		return;
 	}
@@ -943,6 +951,61 @@ static void ensureLightGrid(bool wanted){
 	cuMemsetD8(g_lightGrid, 0, lbytes);
 	g_lightDirty = true;
 	logLine("[grid] light grid allocated, %.0f MB\n", double(lbytes) / 1e6);
+}
+
+// kernel_render's scratch, per frame: 31.2 MB of visible-node and line lists,
+// then per pixel 44.75 B: framebuffer 8, emission 12, bloom chain 4, quarter-
+// resolution volumetrics 0.75, and the high-quality pass's depth 4 and colour
+// 16. The fixed 200 MB it used to get was overrun with no check by any window
+// above 3.8 Mpx: a 4K frame needs 403 MB, a 1080p one 124 MB. Sized to the
+// window instead, growing but never shrinking; growth after startup comes out
+// of the VRAM reserve beside the octree pool.
+static uint64_t renderBufferBytesFor(int width, int height){
+	uint64_t pixels = uint64_t(std::max(width, 1)) * uint64_t(std::max(height, 1));
+	return 31'300'000 + 45 * pixels + 1'000'000;   // + alignment and the bloom chain's padding
+}
+
+// Returns whether the buffer holds a frame of this size. On failure the old
+// buffer is kept and renderCUDA skips its launch until the window shrinks.
+static bool ensureRenderBuffer(int width, int height){
+	uint64_t need = renderBufferBytesFor(width, height);
+	if(need <= renderBufferCapacity) return true;
+
+	static uint64_t failedNeed = 0;
+	if(need == failedNeed) return false;
+
+	// the previous frame's render may still be reading the old buffer
+	cuCtxSynchronize();
+
+	// Free first, then allocate, so only the growth needs to be free. If the
+	// allocation fails anyway, put the old size back: it was free a moment ago.
+	size_t freeMem = 0, totalMem = 0;
+	cuMemGetInfo(&freeMem, &totalMem);
+	bool grown = need - renderBufferCapacity + 64'000'000 < freeMem;
+	if(grown){
+		if(cptr_renderbuffer != 0){ cuMemFree(cptr_renderbuffer); cptr_renderbuffer = 0; }
+		grown = cuMemAlloc(&cptr_renderbuffer, need) == CUDA_SUCCESS;
+		if(!grown){
+			cptr_renderbuffer = 0;
+			if(renderBufferCapacity > 0 && cuMemAlloc(&cptr_renderbuffer, renderBufferCapacity) != CUDA_SUCCESS){
+				cptr_renderbuffer = 0;
+				renderBufferCapacity = 0;
+			}
+		}
+	}
+	if(!grown){
+		failedNeed = need;
+		logLine("[vram] a %d x %d frame needs a %.0f MB render buffer, which does not fit (%.0f MB free); not drawing at this size\n",
+			width, height, need / 1e6, freeMem / 1e6);
+		notice("Window too large for free GPU memory (needs %.0f MB) - make it smaller", need / 1e6);
+		return false;
+	}
+
+	logLine("[vram] render buffer %.0f -> %.0f MB for a %d x %d frame\n",
+		renderBufferCapacity / 1e6, need / 1e6, width, height);
+	renderBufferCapacity = need;
+	failedNeed = 0;
+	return true;
 }
 
 static void ensureVoxelGrid(){
@@ -1077,9 +1140,12 @@ static int   effectiveMaxSplatPx(){
 	return std::max(2, std::min(px, settings.maxSplatPx));
 }
 
-static void beginFrameState(){
+static bool g_frameRenderable = false;   // the render buffer holds this frame's size
+
+static void beginFrameState(int width, int height){
 	updateAdaptiveDetail();
 
+	g_frameRenderable = ensureRenderBuffer(width, height);
 	ensureVoxelGrid();
 	ensureLightGrid(settings.lightOn);
 
@@ -1198,6 +1264,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.useHighQualityShading    = settings.useHighQualityShading;
 	uniforms.persistentBufferCapacity = persistentBufferCapacity;
 	uniforms.momentaryBufferCapacity  = momentaryBufferCapacity;
+	uniforms.renderBufferCapacity     = renderBufferCapacity;
 	uniforms.enableEDL                = settings.enableEDL;
 	uniforms.edlStrength              = settings.edlStrength;
 
@@ -1612,6 +1679,9 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 // draw the octree with a CUDA kernel
 void renderCUDA(shared_ptr<GLRenderer> renderer){
 
+	// the window outgrew free memory (ensureRenderBuffer said why, once)
+	if(!g_frameRenderable) return;
+
 	Uniforms uniforms = getUniforms(renderer);
 
 	static bool registered = false;
@@ -1699,28 +1769,32 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	// allocate most gpu buffers
 	uint64_t nodesCapacity           = 200'000;
 	uint64_t estimatedNodeSize       = 200;           // see struct Node in progressive_octree.cu, but some more just in case
-	// kernel_construct's scratch, and nothing else's: the render kernel's
-	// emission, bloom and volumetric buffers live in cptr_renderbuffer. Sized
-	// from the kernel's own capacities (408.8 MB); it was a fixed 1.2 GB, and
-	// before that 300 MB, which the kernel overran by 109 MB with no check.
-	// The kernel now refuses to run if its layout outgrows this.
-	uint64_t cptr_buffer_bytes       = CONSTRUCT_SCRATCH_BYTES;
-	uint64_t cptr_nodes_bytes        = nodesCapacity * estimatedNodeSize;
-	uint64_t cptr_renderbuffer_bytes = 200'000'000;
-
-	momentaryBufferCapacity = cptr_buffer_bytes;
-
 	// What the device had free before any of this. Everything else that is
 	// already on the GPU (another SimLOD, a browser) shrinks the octree pool.
 	size_t freeAtStart = 0;
 	size_t totalMem = 0;
 	cuMemGetInfo(&freeAtStart, &totalMem);
 
+	// kernel_construct's scratch, and nothing else's: the render kernel's
+	// emission, bloom and volumetric buffers live in cptr_renderbuffer. Sized
+	// from the kernel's own capacities, 405 MB plus a chunk queue entry per
+	// point chunk the pool could hold (total VRAM bounds the pool: 4 MB on an
+	// 8 GB card). It was a fixed 1.2 GB, and before that 300 MB, which the
+	// kernel overran by 109 MB with no check. The kernel now refuses to run if
+	// its layout outgrows this.
+	uint64_t cptr_buffer_bytes       = CONSTRUCT_SCRATCH_FIXED_BYTES + 8 * (totalMem / CHUNK_BYTES + 1);
+	uint64_t cptr_nodes_bytes        = nodesCapacity * estimatedNodeSize;
+
+	momentaryBufferCapacity = cptr_buffer_bytes;
+
 	// Unchecked, a failed allocation left a null pointer that the kernels then
 	// wrote through. Fail at startup with the reason in the log instead.
 	cuCheck(cuMemAlloc(&cptr_buffer                , cptr_buffer_bytes), "cuMemAlloc momentary buffer");
 	cuCheck(cuMemAlloc(&cptr_nodes                 , cptr_nodes_bytes), "cuMemAlloc nodes");
-	cuCheck(cuMemAlloc(&cptr_renderbuffer          , cptr_renderbuffer_bytes), "cuMemAlloc renderbuffer");
+	// sized for the window, and at least for 1080p so the usual sizes never
+	// need a reallocation; it grows later if the window does
+	ensureRenderBuffer(std::max(renderer->width, 1920), std::max(renderer->height, 1080));
+	uint64_t cptr_renderbuffer_bytes = renderBufferCapacity;
 	cuCheck(cuMemAlloc(&cptr_stats                 , sizeof(Stats)), "cuMemAlloc stats");
 	cuCheck(cuMemAlloc(&cptr_numBatchesUploaded    , 4), "cuMemAlloc numBatchesUploaded");
 	cuCheck(cuMemAlloc(&cptr_batchSizes            , 4 * BATCH_STREAM_SIZE), "cuMemAlloc batchSizes");
@@ -1795,19 +1869,31 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	uint64_t localMemBytes = (uint64_t(maxLocalBytes) + stackLimit) * uint64_t(maxThreadsPerSM) * uint64_t(numSMs);
 
 	// Everything but a fixed reserve, instead of 80% of what was free, which
-	// left about 1 GB idle on an 8 GB card. The reserve covers the occupancy
-	// and light grids (about 21 MB each at the default resolution, up to
-	// 166 MB each at 512; both step down or switch off if memory is short),
-	// GL framebuffers when the window grows, and the kernels' local memory.
+	// left about 1 GB idle on an 8 GB card. The reserve is only what is left
+	// over, not set aside for anything in particular, and it is shared by:
+	// - the occupancy and light grids: about 21 MB each at the default
+	//   resolution of 256; at 512, 156-166 MB each for the Rotokare scans but
+	//   up to 537 MB for a cubic cloud. Both step down or switch off when
+	//   memory is short.
+	// - the render buffer growing with the window after startup (1080p to 4K
+	//   adds 280 MB; a window that starts at 4K is sized before the pool)
+	// - GL framebuffers, and the kernels' local memory.
 	size_t availableMem = 0;
 	cuMemGetInfo(&availableMem, &totalMem);
 
+	// Keep back the reserve, but never more than half of what is free, so the
+	// pool grows steadily with free memory (another GPU program may hold some).
 	uint64_t reserveBytes = VRAM_RESERVE_BYTES + localMemBytes;
-	size_t cptr_buffer_persistent_bytes = availableMem > reserveBytes + 256'000'000
-		? availableMem - reserveBytes
-		: availableMem / 2;   // little free (another GPU program?): keep half back
+	size_t keepBack = size_t(std::min<uint64_t>(reserveBytes, availableMem / 2));
+	size_t cptr_buffer_persistent_bytes = availableMem - keepBack;
 	persistentBufferCapacity = cptr_buffer_persistent_bytes;
 	cuCheck(cuMemAlloc(&cptr_buffer_persistent, cptr_buffer_persistent_bytes), "cuMemAlloc persistent buffer");
+	if(cptr_buffer_persistent_bytes < 300'000'000){
+		// kernel_construct stops 200 MB short of the end
+		logLine("[WARN] only %.0f MB of VRAM for the octree: room for at most %.1f M points. Close other programs using the GPU.\n",
+			cptr_buffer_persistent_bytes / 1e6,
+			cptr_buffer_persistent_bytes > 200'000'000 ? (cptr_buffer_persistent_bytes - 200'000'000) / 30.0 / 1e6 : 0.0);
+	}
 
 	uint64_t total = cptr_buffer_bytes
 		+ cptr_nodes_bytes
@@ -2650,7 +2736,7 @@ int main(int argc, char** argv){
 			if(wanted != appliedSwapInterval){ glfwSwapInterval(wanted); appliedSwapInterval = wanted; }
 		}
 
-		beginFrameState();
+		beginFrameState(renderer->width, renderer->height);
 		renderCUDA(renderer);
 
 		if(!lastBatchFinishedDevice){
