@@ -20,10 +20,20 @@ constexpr bool ENABLE_TRACE = false;
 
 constexpr int MAX_POINTS_PER_NODE    = 50'000;
 constexpr uint32_t POINTS_PER_CHUNK  = 1000;
-constexpr uint32_t GRID_SIZE         = 128;
+// Inner nodes sample their points onto a GRID_SIZE^3 grid, one voxel per
+// occupied cell, with a 1-bit occupancy grid per node. 64 rather than
+// upstream's 128: on 8 GB the voxels and grids were 40% of the octree (12 of
+// 29 bytes per point); 64 cuts the grids 8x and the voxels about 4x on
+// surfaces. Leaf points, which hold the full-resolution scan, are unaffected;
+// render.cu widens voxel splats to the coarser spacing (voxelSplatMetres).
+constexpr int GRID_SIZE_LOG2         = 6;
+constexpr uint32_t GRID_SIZE         = 1u << GRID_SIZE_LOG2;
 constexpr uint32_t GRID_NUM_CELLS    = GRID_SIZE * GRID_SIZE * GRID_SIZE;
 constexpr int MAX_DEPTH              = 20;
-constexpr float MAX_DEPTH_GRIDSIZE   = 268'435'456.0f;
+constexpr int MAX_DEPTH_GRIDSIZE_LOG2 = 28;
+constexpr float MAX_DEPTH_GRIDSIZE   = 268'435'456.0f;   // 2^MAX_DEPTH_GRIDSIZE_LOG2
+static_assert(MAX_DEPTH_GRIDSIZE == float(1u << MAX_DEPTH_GRIDSIZE_LOG2), "MAX_DEPTH_GRIDSIZE must be 2^MAX_DEPTH_GRIDSIZE_LOG2");
+static_assert(MAX_DEPTH_GRIDSIZE_LOG2 - GRID_SIZE_LOG2 >= MAX_DEPTH, "voxel cells must not be finer than the full-depth grid");
 
 // BATCH_STREAM_SIZE is in HostDeviceInterface.h, shared with the host
 

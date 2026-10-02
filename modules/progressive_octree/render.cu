@@ -455,13 +455,28 @@ inline void drawMarkerBall(float px, float py, float pz, uint64_t* framebuffer){
 // pixel size flattens the forest into uniform noise. This projects a diameter
 // in metres to pixels using the view depth, capped so a point at the lens
 // cannot cost thousands of atomics.
-inline int splatRadiusPx(float depth){
-	if(uniforms.pointWorldSize <= 0.0f) return uniforms.pointSize;
-	float px = uniforms.pointWorldSize * pxPerMetreAt(depth);
-	int R = int(px + 0.5f);
+//
+// minWorldSize is the smallest splat, in metres, the sample may get: 0 for
+// scanned points, and for a voxel its node's cell spacing (voxelSplatMetres),
+// so that the voxels of an inner node close up into a surface. They used to
+// get the point size, which leaves holes wherever cells are further apart on
+// screen than a point splat is wide.
+inline int splatRadiusPx(float depth, float minWorldSize){
+	if(uniforms.pointWorldSize <= 0.0f && minWorldSize <= 0.0f) return uniforms.pointSize;
+	float pxPerMetre = pxPerMetreAt(depth);
+	int R = uniforms.pointWorldSize > 0.0f ? int(uniforms.pointWorldSize * pxPerMetre + 0.5f) : uniforms.pointSize;
+	int Rmin = int(ceilf(minWorldSize * pxPerMetre));
+	if(R < Rmin) R = Rmin;
 	if(R < 1) R = 1;
 	if(R > uniforms.maxSplatPx) R = uniforms.maxSplatPx;
 	return R;
+}
+
+// Smallest splat for the voxels of a node of this size: the cell spacing
+// times sqrt(2), so a round splat reaches its cell's corners.
+constexpr float VOXEL_SPLAT_COVER = 1.42f;
+inline float voxelSplatMetres(float nodeSize){
+	return VOXEL_SPLAT_COVER * nodeSize / float(GRID_SIZE);
 }
 
 // Shade a splat pixel as a point on a sphere lit from the upper left front.
@@ -491,7 +506,8 @@ inline uint32_t shadeColour(uint32_t c, float s){
 	return (c & 0xff000000u) | (b << 16) | (g << 8) | r;
 }
 
-void drawPoint(Point point, Node* node, uint64_t* framebuffer){
+// minWorldSize: see splatRadiusPx; 0 for scanned points
+void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSize){
 	// Density is applied as a loop stride in drawNode now, so dropped points are
 	// never read. The per-point hash that used to sit here ran for every one of
 	// 90.7 M samples and rejected them AFTER the load, which is why turning
@@ -555,7 +571,7 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer){
 		// Centred, optionally circular splat. The original loop offset only
 		// in +x/+y, so the splat sat below-right of the point. Clamp to
 		// width-1/height-1 also closes a latent one-past-the-end write.
-		int   R    = splatRadiusPx(depth);   // world-sized (apply_look.ps1)
+		int   R    = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
 		if(isTarget) R += uniforms.findBoost;   // fix_find_targets.ps1: a 15 cm board is sub-pixel from 30 m
 		float half = float(R - 1) * 0.5f;
 		float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
@@ -609,7 +625,9 @@ inline int densityStep(){
 // colour pass then cannot draw. The four loops used to repeat this inline and
 // had drifted: find/isolate and the target size boost were in the colour pass
 // only, so isolated targets behind foliage stayed hidden.
-inline bool hqsAcceptPoint(const Point& point, Node* node,
+// minWorldSize: see splatRadiusPx; 0 for scanned points. Both passes must pass
+// the same value for the same sample.
+inline bool hqsAcceptPoint(const Point& point, Node* node, float minWorldSize,
                            int& x, int& y, float& depth, int& R, uint32_t& color, bool& isTarget){
 	if(!projectPoint(point.x, point.y, point.z, x, y, depth)) return false;   // apply_fisheye.ps1
 	if(!(depth > 0.0f) || depth < uniforms.nearClip) return false;
@@ -634,12 +652,14 @@ inline bool hqsAcceptPoint(const Point& point, Node* node,
 	isTarget = isSurveyTarget(color);
 	if(uniforms.findIsolate != 0 && uniforms.findTargets != 0 && !isTarget) return false;
 
-	R = splatRadiusPx(depth);   // world-sized (apply_look.ps1)
+	R = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
 	if(isTarget) R += uniforms.findBoost;   // fix_find_targets.ps1
 	return true;
 }
 
-void drawNode(Chunk* chunk, Node* node, uint32_t numElements, uint64_t* framebuffer){
+// minWorldSize: see splatRadiusPx; 0 for a node's points, voxelSplatMetres
+// for its voxels
+void drawNode(Chunk* chunk, Node* node, uint32_t numElements, uint64_t* framebuffer, float minWorldSize){
 	auto block = cg::this_thread_block();
 
 	int chunkIndex = 0;
@@ -675,7 +695,7 @@ void drawNode(Chunk* chunk, Node* node, uint32_t numElements, uint64_t* framebuf
 		int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
 		Point point = chunk->points[pointInChunkIndex];
 
-		drawPoint(point, node, framebuffer);
+		drawPoint(point, node, framebuffer, minWorldSize);
 
 		// debug pseudo-voxel
 		// if(node->numPoints == 0)
@@ -823,8 +843,8 @@ void drawNodes(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 			cubeMin.z + float(node->Z + 0.0f) * scale,
 		};
 
-		drawNode(node->points, node, node->numPoints, framebuffer);
-		drawNode(node->voxelChunks, node, node->numVoxels, framebuffer);
+		drawNode(node->points, node, node->numPoints, framebuffer, 0.0f);
+		drawNode(node->voxelChunks, node, node->numVoxels, framebuffer, voxelSplatMetres(nodeSize));
 
 		block.sync();
 	}
@@ -911,7 +931,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				Point point = chunk->points[pointInChunkIndex];
 
 				int x, y, R; float depth; uint32_t color; bool isTarget;
-				if(!hqsAcceptPoint(point, node, x, y, depth, R, color, isTarget)) continue;
+				if(!hqsAcceptPoint(point, node, 0.0f, x, y, depth, R, color, isTarget)) continue;
 				{
 					// HQS depth pass, brought into line with drawPoint by
 					// apply_test_source.ps1: centred, optionally round, and
@@ -990,7 +1010,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				// }
 
 				int x, y, R; float depth; uint32_t color; bool isTarget;
-				if(!hqsAcceptPoint(point, node, x, y, depth, R, color, isTarget)) continue;
+				if(!hqsAcceptPoint(point, node, voxelSplatMetres(nodeSize), x, y, depth, R, color, isTarget)) continue;
 				{
 
 					// HQS depth pass, brought into line with drawPoint by
@@ -1073,7 +1093,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				Point point = chunk->points[pointInChunkIndex];
 
 				int x, y, R; float depth; uint32_t color; bool isTarget;
-				if(!hqsAcceptPoint(point, node, x, y, depth, R, color, isTarget)) continue;
+				if(!hqsAcceptPoint(point, node, 0.0f, x, y, depth, R, color, isTarget)) continue;
 				{
 					if(isTarget) countUp(&_numTargets);
 					if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
@@ -1180,7 +1200,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				}
 
 				int x, y, R; float depth; uint32_t color; bool isTarget;
-				if(!hqsAcceptPoint(point, node, x, y, depth, R, color, isTarget)) continue;
+				if(!hqsAcceptPoint(point, node, voxelSplatMetres(nodeSize), x, y, depth, R, color, isTarget)) continue;
 				{
 
 					if(isTarget) countUp(&_numTargets);

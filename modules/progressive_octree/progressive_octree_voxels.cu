@@ -77,11 +77,14 @@ void sampleVoxel(Node* node,
 	// uint32_t pY_leveled = pY_full / (1 << (17 - node->level));
 	// uint32_t pZ_leveled = pZ_full / (1 << (17 - node->level));
 
-	// reduce voxel coordinates from octree's max_depth to current node's depth,
-	// by halving for each level in between
-	uint32_t pX_leveled = pX_full / (1 << ((MAX_DEPTH + 1) - node->level));
-	uint32_t pY_leveled = pY_full / (1 << ((MAX_DEPTH + 1) - node->level));
-	uint32_t pZ_leveled = pZ_full / (1 << ((MAX_DEPTH + 1) - node->level));
+	// reduce voxel coordinates from the full-depth grid (2^MAX_DEPTH_GRIDSIZE_LOG2
+	// cells across the octree) to GRID_SIZE cells across a node at this level.
+	// The shift was written out as (MAX_DEPTH + 1), which holds only for a
+	// 128 grid.
+	int shift = (MAX_DEPTH_GRIDSIZE_LOG2 - GRID_SIZE_LOG2) - int(node->level);
+	uint32_t pX_leveled = pX_full >> shift;
+	uint32_t pY_leveled = pY_full >> shift;
+	uint32_t pZ_leveled = pZ_full >> shift;
 
 	// now make voxel coordinates relative to current node instead of octree
 	uint32_t pX = pX_leveled % GRID_SIZE;
