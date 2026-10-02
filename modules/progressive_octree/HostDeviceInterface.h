@@ -217,6 +217,8 @@ struct Stats{
 	uint64_t numAllocatedChunks         = 0;
 	uint64_t chunkPoolSize              = 0;
 	uint32_t dbg                        = 0;
+	uint32_t numDroppedPoints           = 0;   // points whose leaf had no chunk for them; not stored
+	uint32_t numRingMismatches          = 0;   // upload-ring slots refilled before the kernel had finished their batch
 
 	bool memCapacityReached             = false;
 };
