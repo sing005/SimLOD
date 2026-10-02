@@ -601,17 +601,22 @@ void insertPoints(
 
 		Chunk* chunk = leaf->points;
 
-		if(chunk == nullptr){
-			// printf("chunk is NULL: %s \n", leaf->name);
-			cudaprint->print("chunk is NULL: {} \n", (const char*)leaf->name);
-
-			return;
+		for(int i = 0; i < chunkIndex && chunk != nullptr; i++){
+			chunk = chunk->next;
 		}
 
-		for(int i = 0; i < chunkIndex; i++){
-			if(chunk == 0) break;
+		// The counting pass allocates the chunks a leaf needs, so a missing one
+		// means the counts and the inserted points disagree. The walk used to
+		// stop at the end of the list and then write through the null pointer.
+		// Count it (Stats::numDroppedPoints, in the load summary) and print the
+		// first one only: a print per point floods the print buffer.
+		if(chunk == nullptr){
+			uint32_t numDroppedBefore = atomicAdd(&stats->numDroppedPoints, 1);
+			if(numDroppedBefore == 0){
+				cudaprint->print("chunk is NULL: {} \n", (const char*)leaf->name);
+			}
 
-			chunk = chunk->next;
+			return;
 		}
 
 		chunk->points[pointInChunkIndex] = point;
@@ -829,7 +834,8 @@ void kernel_construct(
 	uint64_t* frameStartTimestamp,
 	CudaPrint* _cudaprint,
 	uint32_t* _numBatchesUploaded_volatile, // could change at any moment by the parallel upload stream
-	uint32_t* batchSizes
+	uint32_t* batchSizes,
+	uint32_t* batchTags                     // batch index held by each ring slot, ~0u while one is in transit
 ){
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
@@ -934,18 +940,34 @@ void kernel_construct(
 
 		if(memCapacityReached) break;
 
+		// Ring tripwire. The uploader clears a slot's tag before refilling it and
+		// writes the batch index once the data is in, so a tag other than this
+		// batch, before or after adding it, means a refill overlapped the batch:
+		// it was waiting or being read. A refill that lands during the later,
+		// voxel-only phase is harmless, but there is no telling which, so any
+		// overlap counts. Counted, not fatal.
+		uint32_t tagBefore = 0;
+		if(grid.thread_rank() == 0){
+			tagBefore = ((volatile uint32_t*)batchTags)[ringSlotIndex];
+		}
+
 		addBatch(
 			sub_points, batchSize,
 			stats->batchletIndex,
 			octreeMin, octreeMax, octreeSize,
-			nodes, 
+			nodes,
 			spillingNodes, numSpillingNodes,
 			spilledPoints, numSpilledPoints
 		);
-		
+
 		grid.sync();
 
 		if(grid.thread_rank() == 0){
+			uint32_t tagAfter = ((volatile uint32_t*)batchTags)[ringSlotIndex];
+			if(tagBefore != uint32_t(batchIndex) || tagAfter != uint32_t(batchIndex)){
+				atomicAdd(&stats->numRingMismatches, 1);
+			}
+
 			atomicAdd(&stats->batchletIndex, 1);
 			atomicAdd(&stats->numPointsProcessed, batchSize);
 		}

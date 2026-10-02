@@ -93,7 +93,7 @@ mutex mtx_batchesInPinnedMemory;
 mutex mtx_batchesInPageableMemory;
 mutex mtx_pinnedMemoryInUpload;
 
-int batchStreamUploadIndex = 0;
+atomic_int batchStreamUploadIndex = 0;   // written by the uploader, read by the loaders and main thread
 CUdeviceptr cptr_points_ring[BATCH_STREAM_SIZE];
 
 CUdevice device;
@@ -107,6 +107,7 @@ CUdeviceptr cptr_renderbuffer;
 CUdeviceptr cptr_stats;
 CUdeviceptr cptr_numBatchesUploaded;
 CUdeviceptr cptr_batchSizes;
+CUdeviceptr cptr_batchTags;
 CUdeviceptr cptr_frameStart;
 CUgraphicsResource cugl_colorbuffer;
 CUevent ce_render_start, ce_render_end;
@@ -363,9 +364,16 @@ atomic_uint64_t numPointsLoaded    = 0;
 atomic_uint64_t numBytesTotal      = 0;
 atomic_uint64_t numBytesLoaded     = 0;
 atomic_uint64_t numThreadsLoading  = 0;
-int numBatchesTotal                = 0;
+atomic_int numBatchesTotal         = 0;
 int numBatchesProcessed            = 0;
 bool lastBatchFinishedDevice       = false;
+bool loadStoppedAtCapacity         = false;
+
+// How far the construct kernel has got, for the loader and uploader threads to
+// gate on. Copied from stats after each readback: the main thread overwrites
+// the stats struct itself every frame while those threads would be reading it.
+atomic_uint32_t batchesProcessedHost = 0;
+atomic_uint64_t pointsProcessedHost  = 0;
 uint64_t momentaryBufferCapacity   = 0;
 uint64_t persistentBufferCapacity  = 0;
 vector<double> processFrameTimes; 
@@ -1512,6 +1520,7 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 		&cudaprint.cptr,
 		&cptr_numBatchesUploaded,
 		&cptr_batchSizes,
+		&cptr_batchTags,
 	};
 
 	// printfmt("launching update!\n");
@@ -1700,6 +1709,12 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 
 	momentaryBufferCapacity = cptr_buffer_bytes;
 
+	// What the device had free before any of this. Everything else that is
+	// already on the GPU (another SimLOD, a browser) shrinks the octree pool.
+	size_t freeAtStart = 0;
+	size_t totalMem = 0;
+	cuMemGetInfo(&freeAtStart, &totalMem);
+
 	// Unchecked, a failed allocation left a null pointer that the kernels then
 	// wrote through. Fail at startup with the reason in the log instead.
 	cuCheck(cuMemAlloc(&cptr_buffer                , cptr_buffer_bytes), "cuMemAlloc momentary buffer");
@@ -1708,6 +1723,8 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	cuCheck(cuMemAlloc(&cptr_stats                 , sizeof(Stats)), "cuMemAlloc stats");
 	cuCheck(cuMemAlloc(&cptr_numBatchesUploaded    , 4), "cuMemAlloc numBatchesUploaded");
 	cuCheck(cuMemAlloc(&cptr_batchSizes            , 4 * BATCH_STREAM_SIZE), "cuMemAlloc batchSizes");
+	cuCheck(cuMemAlloc(&cptr_batchTags             , 4 * BATCH_STREAM_SIZE), "cuMemAlloc batchTags");
+	cuCheck(cuMemsetD32(cptr_batchTags, 0xFFFFFFFFu, BATCH_STREAM_SIZE), "cuMemsetD32 batchTags");
 	cuCheck(cuMemAlloc(&cptr_frameStart            , 8), "cuMemAlloc frameStart");
 	cuCheck(cuMemAllocHost((void**)&h_stats_pinned , sizeof(Stats)), "cuMemAllocHost stats");
 
@@ -1723,7 +1740,6 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 
 	// allocate persistent (over multiple frames) buffer with remaining GPU memory
 	size_t availableMem = 0;
-	size_t totalMem = 0;
 	cuMemGetInfo(&availableMem, &totalMem);
 
 	size_t cptr_buffer_persistent_bytes = static_cast<size_t>(static_cast<double>(availableMem) * 0.80);
@@ -1744,6 +1760,15 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	printfmt("==============================================\n");
 	printfmt("                                    {:8L} MB  \n", total / 1'000'000llu);
 	printfmt("\n");
+
+	// The same plan in the run log: stdout is lost when the process is killed,
+	// and the octree pool decides how many points fit.
+	logLine("[vram] %.0f of %.0f MB free at start. Fixed: construct scratch %.0f, nodes %.0f, render %.0f, upload ring %.0f MB."
+		" Octree pool %.0f MB (80%% of the %.0f MB then free)\n",
+		freeAtStart / 1e6, totalMem / 1e6,
+		cptr_buffer_bytes / 1e6, cptr_nodes_bytes / 1e6, cptr_renderbuffer_bytes / 1e6,
+		(BATCH_STREAM_SIZE * cptr_points_bytes) / 1e6,
+		cptr_buffer_persistent_bytes / 1e6, availableMem / 1e6);
 
 	cuda_program_update = new CudaModularProgram({
 		.modules = {
@@ -1784,6 +1809,10 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	cuEventCreate(&ce_update_end, 0);
 	
 	cuGraphicsGLRegisterImage(&cugl_colorbuffer, renderer->view.framebuffer->colorAttachments[0]->handle, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
+
+	size_t freeAfterInit = 0;
+	cuMemGetInfo(&freeAfterInit, &totalMem);
+	logLine("[vram] %.0f MB free after allocating and compiling the kernels\n", freeAfterInit / 1e6);
 }
 
 void reload(){
@@ -1910,11 +1939,72 @@ void reload(){
 	boxSize.z = boxMax.z - boxMin.z;
 
 	stats                   = Stats();
+	batchesProcessedHost    = 0;
+	pointsProcessedHost     = 0;
 	numPointsUploaded       = 0;
 	numBatchesProcessed     = 0;
 	lastBatchFinishedDevice = false;
+	loadStoppedAtCapacity   = false;
 	batchStreamUploadIndex  = 0;
 	processFrameTimes.clear();
+
+	if(numPointsTotal > 0){
+		logLine("[load] start: %.2f M points in %d batches, %.2f GB on disk%s\n",
+			numPointsTotal / 1e6, numBatchesTotal.load(), numBytesTotal / 1e9,
+			lazInBatches ? " (LAZ)" : "");
+	}
+}
+
+// The construct kernel stops inserting once the octree pool is nearly full.
+// The loaders went on decoding up to BATCH_STREAM_SIZE more batches that would
+// never be used, each holding a 16 MB pinned slot: about 50 M points, minutes
+// of LAZ decoding. Drop the queued work instead and mark the load complete.
+void stopLoadingAtCapacity(){
+	{
+		lock_guard<mutex> lock_batchesToProcess(mtx_batchesToProcess);
+		batchesToProcess.clear();
+	}
+
+	// same lock order as the uploader: mtx_uploader, then the pinned queue
+	lock_guard<mutex> lock_upload(mtx_uploader);
+	lock_guard<mutex> lock_batchesInPinnedMemory(mtx_batchesInPinnedMemory);
+
+	for(PointBatch& batch : batchesInPinnedMemory){
+		pinnedMemPool.release(batch.pinnedMem);
+	}
+	batchesInPinnedMemory.clear();
+
+	// Uploader and loaders idle once every batch counts as uploaded. Batches a
+	// loader is still decoding land in batchesInPinnedMemory and stay there
+	// until the next reload refills the pool.
+	numBatchesTotal = batchStreamUploadIndex.load();
+	loadStoppedAtCapacity = true;
+}
+
+// One-off, after the last batch: everything the octree build produced, so
+// capacity can be planned from measurements rather than estimates.
+void logLoadSummary(){
+	// synchronous on the default stream, so the counters are the final ones
+	Stats s;
+	if(cuMemcpyDtoH(&s, cptr_stats, sizeof(Stats)) != CUDA_SUCCESS) return;
+
+	double seconds = now() - double(loadStart);
+	double inserted = double(s.numPointsProcessed);
+
+	logLine("[load] done in %.1f s: %.2f M of %.2f M points inserted (%.1f M/s), %.2f M decoded%s\n",
+		seconds, inserted / 1e6, numPointsTotal / 1e6, inserted / 1e6 / std::max(seconds, 1e-3),
+		numPointsLoaded / 1e6,
+		loadStoppedAtCapacity ? ". Stopped: the octree pool is full, the remaining points are not shown" : "");
+	logLine("[load] octree: %u nodes (%u inner, %u leaves, %u non-empty), %.2f M points in leaves, %.2f M voxels (%.2f per point), %u point chunks, %u voxel chunks\n",
+		s.numNodes, s.numInner, s.numLeaves, s.numNonemptyLeaves,
+		s.numPoints / 1e6, s.numVoxels / 1e6, double(s.numVoxels) / std::max(double(s.numPoints), 1.0),
+		s.numChunksPoints, s.numChunksVoxels);
+	logLine("[load] memory: octree pool %.0f of %.0f MB used, %.1f bytes per point; construct scratch %.0f of %.0f MB\n",
+		s.allocatedBytes_persistent / 1e6, persistentBufferCapacity / 1e6,
+		double(s.allocatedBytes_persistent) / std::max(double(s.numPoints), 1.0),
+		s.allocatedBytes_momentary / 1e6, momentaryBufferCapacity / 1e6);
+	logLine("[load] integrity: %u points dropped (no chunk), %u upload-ring slots refilled while still in use\n",
+		s.numDroppedPoints, s.numRingMismatches);
 }
 
 void reset(shared_ptr<GLRenderer> renderer){
@@ -1954,17 +2044,18 @@ void reset(shared_ptr<GLRenderer> renderer){
 	}
 }
 
-void spawnLoader(size_t i) {
+void spawnLoader(size_t i, int maxLazThreads) {
 
-	auto cpu = getCpuData();
-
-	thread t([&, i]() {
+	// Captures by value: the thread is detached and outlives this call. It used
+	// to capture a local CpuData by reference, so the LAZ thread cap was read
+	// from a dead stack slot and could be anything.
+	thread t([i, maxLazThreads]() {
 		installThreadTerminateHandler();
 		cuCtxSetCurrent(context);
 
 		while (true) {
 			bool everythingIsDone = batchStreamUploadIndex == numBatchesTotal;
-			bool processingLagsBehind = numPointsLoaded > stats.numPointsProcessed + BATCH_STREAM_SIZE * MAX_BATCH_SIZE;
+			bool processingLagsBehind = numPointsLoaded > pointsProcessedHost + BATCH_STREAM_SIZE * MAX_BATCH_SIZE;
 
 			// if (processingLagsBehind) {
 			// 	printfmt("processing lags behind\n");
@@ -1983,32 +2074,38 @@ void spawnLoader(size_t i) {
 			mtx_batchesToProcess.lock();
 			// get batch to load, if load queue isn't full
 			if (batchesToProcess.size() > 0) {
-				batch = batchesToProcess.front();
+				const PointBatch& next = batchesToProcess.front();
 
-				// if it's a laz file, limit loading to fewer thrads.
-				int maxThreads = std::max(double(cpu.numProcessors) / 2.0, 1.0);
-				if(batch.count > 0 && iEndsWith(batch.file, "laz"))
-				if(numThreadsLoading >= maxThreads)
-				{
+				// LAZ decoding is CPU-bound, so cap the threads loading at once.
+				// Tested and counted under this lock, so the cap is exact. Capped
+				// threads used to retry without sleeping and kept this mutex busy
+				// for the threads that were decoding.
+				if(next.count > 0 && iEndsWith(next.file, "laz") && numThreadsLoading >= uint64_t(maxLazThreads)){
 					mtx_batchesToProcess.unlock();
+					std::this_thread::sleep_for(1ms);
 					continue;
 				}
 
+				batch = next;
 				batchesToProcess.pop_front();
+
+				if(batch.count > 0) numThreadsLoading++;
 			}
 			mtx_batchesToProcess.unlock();
 
-			PinnedMemorySlot pinnedMemSlot = pinnedMemPool.acquire();
-			Point* pinnedPoints = (Point*)pinnedMemSlot.memLocation;
-			
 			if (batch.count > 0) {
 				// load points in batch
+
+				// Taken only with work in hand. Idle loaders took and returned a
+				// slot every millisecond, and allocated a new one whenever the
+				// pool happened to be empty.
+				PinnedMemorySlot pinnedMemSlot = pinnedMemPool.acquire();
+				Point* pinnedPoints = (Point*)pinnedMemSlot.memLocation;
 
 				int batchID = batch.first / MAX_BATCH_SIZE;
 				double t_start = now();
 				// printfmt("start loading batch {} at {:.3f} \n", batchID, t_start);
 
-				numThreadsLoading++;
 				if(iEndsWith(batch.file, "las")){
 					void* target = (void*)pinnedPoints;
 
@@ -2108,9 +2205,6 @@ void spawnLoader(size_t i) {
 				// printfmt("finished loading batch {} at {:.3f}. duration: {:.3f} ms \n", batchID, t_end, millies);
 
 				numThreadsLoading--;
-			}else {
-				// give back pinned memory slot if we didn't use it
-				pinnedMemPool.release(pinnedMemSlot);
 			}
 
 			std::this_thread::sleep_for(1ms);
@@ -2173,10 +2267,18 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 			availableSlots.clear();
 
 			bool everythingIsDone = batchStreamUploadIndex == numBatchesTotal;
-			bool processingLagsBehind = numPointsUploaded > stats.numPointsProcessed + BATCH_STREAM_SIZE * MAX_BATCH_SIZE;
+
+			// Batch k goes to ring slot k % BATCH_STREAM_SIZE, which last held
+			// batch k - BATCH_STREAM_SIZE. That slot may be refilled only once the
+			// kernel has finished its batch. batchletIndex counts finished batches
+			// and the host copy lags, so it can only under-report; the margin of
+			// two covers a copy read while it was being written. The old test
+			// compared point counts with '>', which with full batches let batch
+			// k + BATCH_STREAM_SIZE overwrite batch k before the kernel read it.
+			bool ringFull = int64_t(batchStreamUploadIndex) >= int64_t(batchesProcessedHost) + int64_t(BATCH_STREAM_SIZE) - 2;
 
 			if (everythingIsDone) continue;
-			if (processingLagsBehind) continue;
+			if (ringFull) continue;
 
 			auto t_00 = now();
 
@@ -2201,14 +2303,20 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 			auto target     = cptr_points_ring[uploadRingIndex];
 			size_t byteSize = batch.count * sizeof(Point);
 
+			// Tag the slot as in transit, then with its batch index once the data
+			// is in. kernel_construct counts a slot whose tag is not the batch it
+			// expects (Stats::numRingMismatches): the tripwire for the gate above.
+			cuMemsetD32Async(cptr_batchTags + 4 * uploadRingIndex, 0xFFFFFFFFu, 1, stream_upload);
+
 			cuMemcpyHtoDAsync(target, source, byteSize, stream_upload);
 
 			// record upload event
 			cuEventRecord(batch.pinnedMem.uploadEnd, stream_upload);
 
-			// since we process N batches per frame and batches may have varying amounts of points, 
+			// since we process N batches per frame and batches may have varying amounts of points,
 			// we need to let the kernel know the size of each individual batch
 			cuMemsetD32Async(cptr_batchSizes + 4 * uploadRingIndex, batch.count, 1, stream_upload);
+			cuMemsetD32Async(cptr_batchTags + 4 * uploadRingIndex, targetSlot, 1, stream_upload);
 
 			// also let the kernel know how many batches we uploaded
 			cuMemsetD32Async(cptr_numBatchesUploaded, batchStreamUploadIndex + 1, 1, stream_upload);
@@ -2240,12 +2348,12 @@ int main(int argc, char** argv){
 
 	auto renderer = make_shared<GLRenderer>();
 	auto cpu = getCpuData();
-	// int numThreads = 2 * static_cast<int>(cpu.numProcessors);
-	int numThreads = 2 * static_cast<int>(cpu.numProcessors);
-	// numThreads = 16;
-	// int numThreads = max(2 * cpu.numProcessors - 10, 2ull);
-	printfmt("cpu.numProcessors: {} \n", cpu.numProcessors);
-	printfmt("launching {} loader threads \n", numThreads);
+	// One loader per hardware thread (was two). LAZ decoding is capped lower,
+	// leaving cores for the render loop, the uploader and the OS.
+	int numThreads    = std::max(4, static_cast<int>(cpu.numProcessors));
+	int maxLazThreads = std::max(1, static_cast<int>(cpu.numProcessors) - 4);
+	logLine("[load] %d loader threads, at most %d decoding LAZ at once (%d hardware threads)\n",
+		numThreads, maxLazThreads, static_cast<int>(cpu.numProcessors));
 
 
 	renderer->controls->yaw    = -1.15;
@@ -2282,7 +2390,7 @@ int main(int argc, char** argv){
 	mtx_loader.reserve(numThreads);
 	for(int i = 0; i < numThreads; i++){
 		mtx_loader.push_back(make_unique<mutex>());
-		spawnLoader(i);
+		spawnLoader(i, maxLazThreads);
 	}
 
 	cudaprint.init();
@@ -2528,8 +2636,21 @@ int main(int argc, char** argv){
 			// seems to be fine to add the async copy to the main stream?
 			cuMemcpyDtoHAsync(h_stats_pinned, cptr_stats, sizeof(Stats), ((CUstream)CU_STREAM_DEFAULT));
 			memcpy(&stats, h_stats_pinned, sizeof(Stats));
+			batchesProcessedHost = stats.batchletIndex;
+			pointsProcessedHost  = stats.numPointsProcessed;
 
 			statsAge = static_cast<int>(renderer->frameCount) - stats.frameID;
+
+			if(!lastBatchFinishedDevice && numPointsTotal > 0){
+				logIfChanged("load", 2.0, "[load] %.1f s: %.1f M decoded, %.1f M uploaded, %.1f M of %.1f M inserted; octree pool %.0f of %.0f MB\n",
+					now() - double(loadStart), numPointsLoaded / 1e6, numPointsUploaded / 1e6,
+					stats.numPointsProcessed / 1e6, numPointsTotal / 1e6,
+					stats.allocatedBytes_persistent / 1e6, persistentBufferCapacity / 1e6);
+			}
+
+			if(stats.memCapacityReached && !loadStoppedAtCapacity && !lastBatchFinishedDevice){
+				stopLoadingAtCapacity();
+			}
 
 			static uint64_t previousNumPointsProcessed = 0;
 			uint64_t numPointsProcessed = stats.numPointsProcessed;
@@ -2552,6 +2673,8 @@ int main(int argc, char** argv){
 				printfmt("stats.numPointsProcessed = {} \n", stats.numPointsProcessed);
 				printfmt("numPointsTotal = {} \n", uint64_t(numPointsTotal));
 				printfmt("setting lastBatchFinishedDevice = {} \n", lastBatchFinishedDevice ? "true" : "false");
+
+				if(lastBatchFinishedDevice && numPointsTotal > 0) logLoadSummary();
 			}
 		}
 
