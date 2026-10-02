@@ -17,6 +17,18 @@ import time
 import laspy
 
 CHUNK = 5_000_000
+FAT32_MAX_FILE = 4 * 1024**3 - 1
+
+
+def is_fat32(path):
+    """True if path lies on a FAT32 volume (Windows only; False elsewhere)."""
+    if os.name != "nt":
+        return False
+    import ctypes
+    root = os.path.splitdrive(os.path.abspath(path))[0] + "\\"
+    fs_name = ctypes.create_unicode_buffer(32)
+    ok = ctypes.windll.kernel32.GetVolumeInformationW(root, None, 0, None, None, None, fs_name, 32)
+    return bool(ok) and fs_name.value.upper() == "FAT32"
 
 
 def convert(src, out_dir):
@@ -30,6 +42,10 @@ def convert(src, out_dir):
               f"needs {need / 1e9:.2f} GB, {free / 1e9:.2f} GB free")
         if need > free * 0.95:
             print("  skipped: not enough disk space")
+            return False
+        if need >= FAT32_MAX_FILE and is_fat32(dst):
+            print("  skipped: the destination drive is FAT32, which cannot hold files of 4 GB or more."
+                  " Use an NTFS or exFAT drive for this one.")
             return False
         start = time.time()
         with laspy.open(dst, mode="w", header=header, do_compress=False) as writer:
