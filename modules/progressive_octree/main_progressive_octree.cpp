@@ -156,8 +156,10 @@ struct {
 
 	// tier 1 shading (inserted by apply_tier1_shading.ps1)
 	bool  roundSplats                = true;
-	bool  enableFog                  = true;    // distance goes LIGHTER (apply_look.ps1)
-	float fogDensity                 = 0.018f;
+	// Depth haze: distance goes LIGHTER (apply_look.ps1). Off by default: at
+	// 0.018 it washed everything beyond ~30 m out to the haze colour.
+	bool  enableFog                  = false;
+	float fogDensity                 = 0.0f;
 	float fogR                       = 0.72f;   // pale green haze
 	float fogG                       = 0.82f;
 	float fogB                       = 0.70f;
@@ -968,11 +970,18 @@ static uint64_t renderBufferBytesFor(int width, int height){
 // Returns whether the buffer holds a frame of this size. On failure the old
 // buffer is kept and renderCUDA skips its launch until the window shrinks.
 static bool ensureRenderBuffer(int width, int height){
+	static uint64_t failedNeed = 0;   // a size that would not fit, and how much was free then
+	static size_t   failedFree = 0;
 	uint64_t need = renderBufferBytesFor(width, height);
-	if(need <= renderBufferCapacity) return true;
+	if(need <= renderBufferCapacity){ failedNeed = 0; return true; }
 
-	static uint64_t failedNeed = 0;
-	if(need == failedNeed) return false;
+	// do not retry (and re-log) a size that failed every frame, but do once
+	// memory has been freed: a grid made smaller, the key light off
+	if(need == failedNeed){
+		size_t freeNow = 0, totalNow = 0;
+		cuMemGetInfo(&freeNow, &totalNow);
+		if(freeNow < failedFree + 32'000'000) return false;
+	}
 
 	// the previous frame's render may still be reading the old buffer
 	cuCtxSynchronize();
@@ -995,6 +1004,7 @@ static bool ensureRenderBuffer(int width, int height){
 	}
 	if(!grown){
 		failedNeed = need;
+		cuMemGetInfo(&failedFree, &totalMem);   // after the restore
 		logLine("[vram] a %d x %d frame needs a %.0f MB render buffer, which does not fit (%.0f MB free); not drawing at this size\n",
 			width, height, need / 1e6, freeMem / 1e6);
 		notice("Window too large for free GPU memory (needs %.0f MB) - make it smaller", need / 1e6);
@@ -1145,9 +1155,20 @@ static bool g_frameRenderable = false;   // the render buffer holds this frame's
 static void beginFrameState(int width, int height){
 	updateAdaptiveDetail();
 
-	g_frameRenderable = ensureRenderBuffer(width, height);
+	// A minimised window reports 0 x 0: nothing to draw (loading goes on).
+	// Drawing anyway registered a zero-size GL texture with CUDA, and mapping
+	// it crashed in the driver.
+	g_frameRenderable = width > 0 && height > 0 && ensureRenderBuffer(width, height);
 	ensureVoxelGrid();
 	ensureLightGrid(settings.lightOn);
+
+	// kernel_render is the only one to act on the requests below; on a frame
+	// renderCUDA skips, leave them pending for the next frame that is drawn
+	if(!g_frameRenderable){
+		g_frameGridRefill = false;
+		g_frameLightDirty = false;
+		return;
+	}
 
 	// Recount only once the device has processed every point. During a load
 	// the construct kernel counts points as it inserts them, and a recount
@@ -1687,11 +1708,17 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	static bool registered = false;
 	static GLuint registeredHandle = -1;
 
-	cuGraphicsGLRegisterImage(
-		&cugl_colorbuffer, 
-		renderer->view.framebuffer->colorAttachments[0]->handle, 
-		GL_TEXTURE_2D, 
+	CUresult registered_res = cuGraphicsGLRegisterImage(
+		&cugl_colorbuffer,
+		renderer->view.framebuffer->colorAttachments[0]->handle,
+		GL_TEXTURE_2D,
 		CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
+	if(registered_res != CUDA_SUCCESS){
+		// mapping a resource that did not register crashes in the driver
+		static bool warned = false;
+		if(!warned){ warned = true; logLine("[host] cannot register the frame texture with CUDA (%d); frame skipped\n", int(registered_res)); }
+		return;
+	}
 
 	// map OpenGL resources to CUDA
 	vector<CUgraphicsResource> dynamic_resources = {cugl_colorbuffer};
@@ -1791,9 +1818,26 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	// wrote through. Fail at startup with the reason in the log instead.
 	cuCheck(cuMemAlloc(&cptr_buffer                , cptr_buffer_bytes), "cuMemAlloc momentary buffer");
 	cuCheck(cuMemAlloc(&cptr_nodes                 , cptr_nodes_bytes), "cuMemAlloc nodes");
-	// sized for the window, and at least for 1080p so the usual sizes never
-	// need a reallocation; it grows later if the window does
-	ensureRenderBuffer(std::max(renderer->width, 1920), std::max(renderer->height, 1080));
+	// Sized before the octree pool takes the rest, for the largest frame
+	// likely: a fixed --render size, or else the window (renderer->width is
+	// not set until the render loop starts), the largest monitor it could be
+	// maximised on, and at least 1080p. A 4K display gets its 405 MB here
+	// rather than from the reserve on the first frame.
+	int frameW = renderer->renderWidth, frameH = renderer->renderHeight;
+	if(frameW <= 0 || frameH <= 0){
+		glfwGetWindowSize(renderer->window, &frameW, &frameH);
+		if(uint64_t(frameW) * uint64_t(frameH) < 1920ull * 1080ull){ frameW = 1920; frameH = 1080; }
+		int numMonitors = 0;
+		GLFWmonitor** monitors = glfwGetMonitors(&numMonitors);
+		for(int i = 0; i < numMonitors; i++){
+			const GLFWvidmode* mode = glfwGetVideoMode(monitors[i]);
+			if(mode && uint64_t(mode->width) * uint64_t(mode->height) > uint64_t(frameW) * uint64_t(frameH)){
+				frameW = mode->width;
+				frameH = mode->height;
+			}
+		}
+	}
+	if(!ensureRenderBuffer(frameW, frameH)) ensureRenderBuffer(1920, 1080);
 	uint64_t cptr_renderbuffer_bytes = renderBufferCapacity;
 	cuCheck(cuMemAlloc(&cptr_stats                 , sizeof(Stats)), "cuMemAlloc stats");
 	cuCheck(cuMemAlloc(&cptr_numBatchesUploaded    , 4), "cuMemAlloc numBatchesUploaded");
@@ -2462,6 +2506,58 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 	setThreadPriorityHigh(t);
 }
 
+// ---- screenshots from the command line ------------------------------------
+// --shots <list>: once the cloud has loaded, visit each camera in the list,
+// let the frame settle, and save it. --screenshot <file.bmp> saves the start
+// camera's frame. With --exit the app quits after the last one. For comparing
+// the look before and after a change, at a fixed size (--render).
+struct ShotRequest{
+	string path;                             // .bmp to write
+	bool   hasView = false;
+	double view[6] = {0, 0, 0, 0, 0, 0};     // yaw pitch radius tx ty tz, as --view
+};
+
+// The rendered frame, without the UI, as a 24-bit .bmp. GL rows run bottom to
+// top, as .bmp rows do, so they are written in order.
+static bool saveFrameBmp(GLRenderer& renderer, const string& path){
+	auto& texture = renderer.view.framebuffer->colorAttachments[0];
+	int w = texture->width;
+	int h = texture->height;
+	if(w <= 0 || h <= 0) return false;
+
+	vector<uint8_t> rgba(size_t(w) * size_t(h) * 4);
+	glGetTextureImage(texture->handle, 0, GL_RGBA, GL_UNSIGNED_BYTE, GLsizei(rgba.size()), rgba.data());
+
+	int rowBytes = (w * 3 + 3) & ~3;
+	uint32_t dataBytes = uint32_t(rowBytes) * uint32_t(h);
+	uint8_t header[54] = {'B', 'M'};
+	auto put32 = [&](int at, uint32_t v){ memcpy(header + at, &v, 4); };
+	auto put16 = [&](int at, uint16_t v){ memcpy(header + at, &v, 2); };
+	put32( 2, 54 + dataBytes);   // file size
+	put32(10, 54);               // pixel data offset
+	put32(14, 40);               // BITMAPINFOHEADER
+	put32(18, uint32_t(w));
+	put32(22, uint32_t(h));      // positive: rows bottom to top
+	put16(26, 1);
+	put16(28, 24);
+	put32(34, dataBytes);
+
+	std::ofstream out(path, std::ios::binary);
+	if(!out) return false;
+	out.write((const char*)header, 54);
+	vector<uint8_t> row(rowBytes, 0);
+	for(int y = 0; y < h; y++){
+		const uint8_t* src = &rgba[size_t(y) * size_t(w) * 4];
+		for(int x = 0; x < w; x++){
+			row[3 * x + 0] = src[4 * x + 2];
+			row[3 * x + 1] = src[4 * x + 1];
+			row[3 * x + 2] = src[4 * x + 0];
+		}
+		out.write((const char*)row.data(), rowBytes);
+	}
+	return bool(out);
+}
+
 int main(int argc, char** argv){
 
 	// ---- last-words handlers ---------------------------------------------
@@ -2510,6 +2606,16 @@ int main(int argc, char** argv){
 	// renderer->controls->target = { 354.609, 764.038, 25.101, };
 
 
+	// --render W H is read before the GPU buffers are sized, so that the render
+	// buffer for that frame size is in place before the octree pool
+	for(int i = 1; i + 2 < argc; i++){
+		if(string(argv[i]) == "--render"){
+			renderer->renderWidth  = std::max(0, std::atoi(argv[i + 1]));
+			renderer->renderHeight = std::max(0, std::atoi(argv[i + 2]));
+			logLine("[host] rendering at %d x %d, scaled to the window\n", renderer->renderWidth, renderer->renderHeight);
+		}
+	}
+
 	initCuda();
 	initCudaProgram(renderer);
 
@@ -2532,25 +2638,67 @@ int main(int argc, char** argv){
 	bool haveView = false;
 	double view[6] = {0, 0, 0, 0, 0, 0};
 	vector<string> argFiles;
+	string argCalls;
+	vector<ShotRequest> shots;
+	double shotDelay = 3.0;        // seconds at each shot's camera before saving
+	bool exitAfterShots = false;
 	for(int i = 1; i < argc; i++){
 		string arg = argv[i];
 		if(arg == "--view" && i + 6 < argc){
 			for(int k = 0; k < 6; k++) view[k] = std::atof(argv[i + 1 + k]);
 			haveView = true;
 			i += 6;
+		}else if(arg == "--render" && i + 2 < argc){
+			i += 2;   // applied before the GPU buffers were sized
+		}else if(arg == "--calls" && i + 1 < argc){
+			argCalls = argv[++i];
+		}else if(arg == "--screenshot" && i + 1 < argc){
+			ShotRequest shot;
+			shot.path = argv[++i];
+			shots.push_back(shot);
+		}else if(arg == "--shots" && i + 1 < argc){
+			// one shot per line: name yaw pitch radius tx ty tz, written to
+			// <name>.bmp beside the list; '#' starts a comment
+			std::filesystem::path list = argv[++i];
+			std::ifstream in(list);
+			if(!in) logLine("[shot] cannot open %s\n", list.string().c_str());
+			string line;
+			while(std::getline(in, line)){
+				std::stringstream ss(line);
+				ShotRequest shot;
+				string name;
+				if(!(ss >> name) || name[0] == '#') continue;
+				for(int k = 0; k < 6; k++) ss >> shot.view[k];
+				if(!ss){ logLine("[shot] %s: malformed line skipped: %s\n", list.string().c_str(), line.c_str()); continue; }
+				shot.hasView = true;
+				shot.path = (list.parent_path() / (name + ".bmp")).string();
+				shots.push_back(shot);
+			}
+		}else if(arg == "--shot-delay" && i + 1 < argc){
+			shotDelay = std::max(0.0, std::atof(argv[++i]));
+		}else if(arg == "--exit"){
+			exitAfterShots = true;
 		}else if(arg == "--set" && i + 1 < argc){
-			// --set name=value, for the settings that matter most on a small GPU
+			// --set name=value, for the settings that matter most on a small GPU,
+			// and for repeatable screenshots
 			string kv = argv[++i];
 			size_t eq = kv.find('=');
 			string key = kv.substr(0, eq);
 			double v = (eq == string::npos) ? 1.0 : std::atof(kv.c_str() + eq + 1);
-			if     (key == "hqs")      settings.useHighQualityShading = v != 0.0;
-			else if(key == "splat")    settings.maxSplatPx            = int(v);
-			else if(key == "detail")   settings.minNodeSize           = float(v);
-			else if(key == "adaptive") settings.adaptiveDetail        = v != 0.0;
-			else if(key == "budget")   settings.frameBudgetMs         = float(v);
-			else if(key == "vsync")    settings.vsync                 = v != 0.0;
-			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync)\n", key);
+			if     (key == "hqs")       settings.useHighQualityShading = v != 0.0;
+			else if(key == "splat")     settings.maxSplatPx            = int(v);
+			else if(key == "detail")    settings.minNodeSize           = float(v);
+			else if(key == "adaptive")  settings.adaptiveDetail        = v != 0.0;
+			else if(key == "budget")    settings.frameBudgetMs         = float(v);
+			else if(key == "vsync")     settings.vsync                 = v != 0.0;
+			else if(key == "insects")   settings.numInsects            = int(v);
+			else if(key == "grain")     settings.grain                 = float(v);
+			else if(key == "bloom")   { settings.bloomStrength         = float(v); settings.enableBloom = v > 0.0; }
+			else if(key == "markers") { settings.showEventMarkers      = v != 0.0; settings.showMarkers = v != 0.0; }
+			else if(key == "pointsize") settings.pointWorldSize        = float(v);
+			else if(key == "gain")      settings.emissionGain          = float(v);
+			else if(key == "haze")    { settings.fogDensity            = float(v); settings.enableFog = v > 0.0; }
+			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze)\n", key);
 		}else if(iEndsWith(arg, "las") || iEndsWith(arg, "laz") || iEndsWith(arg, "simlod")){
 			std::error_code ec;
 			auto absolute = std::filesystem::absolute(arg, ec);   // dropped files are absolute too
@@ -2562,6 +2710,19 @@ int main(int argc, char** argv){
 	if(argc > 1){
 		logLine("[host] command line: %d file(s)%s\n", int(argFiles.size()), haveView ? ", --view" : "");
 		for(auto& f : argFiles) logLine("[host]   %s\n", f.c_str());
+	}
+
+	// --calls: load and play the schedule, as the Calls panel's Load and Play
+	// buttons do, with bloom on as opening that panel turns it on
+	if(!argCalls.empty()){
+		loadCallSchedule(argCalls);
+		g_showClock   = 0.0;
+		g_showPlaying = g_callsLoaded;
+		settings.enableBloom = settings.bloomStrength > 0.0f;
+		logLine("[calls] %s: %d calls, %s\n", argCalls.c_str(), int(g_calls.size()), g_callsLoaded ? "playing" : "none loaded");
+	}
+	if(!shots.empty()){
+		logLine("[shot] %d screenshot(s) after loading, %.1f s each%s\n", int(shots.size()), shotDelay, exitAfterShots ? ", then exit" : "");
 	}
 
 	reload();
@@ -2668,6 +2829,10 @@ int main(int argc, char** argv){
 			bool pKey = glfwGetKey(renderer->window, GLFW_KEY_P) == GLFW_PRESS && !io.WantCaptureKeyboard;
 			if(((altDown && leftDown && !g_leftWasDown) || (pKey && !g_pKeyWasDown)) && !io.WantCaptureMouse){
 				double mx=0.0, my=0.0; glfwGetCursorPos(renderer->window,&mx,&my);
+				// window pixels to frame pixels: they differ when the frame is
+				// rendered at a fixed size (--render)
+				mx *= double(renderer->width)  / double(std::max(renderer->windowWidth, 1));
+				my *= double(renderer->height) / double(std::max(renderer->windowHeight, 1));
 				g_pickReqX = int(mx);
 				g_pickReqY = renderer->height - 1 - int(my);
 				g_pickSeq++;
@@ -2717,7 +2882,9 @@ int main(int argc, char** argv){
 		}
 		lastFrameTime = static_cast<float>(now());
 
-		renderer->view.framebuffer->setSize(renderer->width, renderer->height);
+		if(renderer->width > 0 && renderer->height > 0){   // 0 x 0 while minimised
+			renderer->view.framebuffer->setSize(renderer->width, renderer->height);
+		}
 
 		glBindFramebuffer(GL_FRAMEBUFFER, renderer->view.framebuffer->handle);
 
@@ -2738,6 +2905,54 @@ int main(int argc, char** argv){
 
 		beginFrameState(renderer->width, renderer->height);
 		renderCUDA(renderer);
+
+		// ---- command-line screenshots (--shots, --screenshot) -------------
+		// After the load: move to each shot's camera, wait shotDelay for the
+		// occupancy grid, light and glow to settle, then save the frame just
+		// rendered. A camera set here takes effect from the next frame. The
+		// window still takes mouse and keys, so if the camera moves while a
+		// shot waits (anything but the controls' own adjustment on the first
+		// frame, such as pinning the radius in walk mode), the shot's camera
+		// is set again and the wait starts over.
+		if(!shots.empty() && lastBatchFinishedDevice){
+			static size_t shotIndex = 0;
+			static int    shotPhase = 0;   // 0 set the camera, 1 note where it settled, 2 wait
+			static double shotStart = 0.0;
+			static double settled[6] = {0, 0, 0, 0, 0, 0};
+			auto& controls = renderer->controls;
+			double current[6] = {controls->yaw, controls->pitch, controls->radius,
+			                     controls->target.x, controls->target.y, controls->target.z};
+			if(shotIndex < shots.size()){
+				const ShotRequest& shot = shots[shotIndex];
+				if(shotPhase == 2 && shot.hasView && !std::equal(current, current + 6, settled)){
+					logLine("[shot] camera moved while waiting for %s; setting it again\n", shot.path.c_str());
+					shotPhase = 0;
+				}
+				if(shotPhase == 0){
+					if(shot.hasView){
+						controls->yaw    = shot.view[0];
+						controls->pitch  = shot.view[1];
+						controls->radius = shot.view[2];
+						controls->target = { shot.view[3], shot.view[4], shot.view[5] };
+					}
+					shotStart = now();
+					shotPhase = 1;
+				}else if(shotPhase == 1){
+					std::copy(current, current + 6, settled);
+					shotPhase = 2;
+				}else if(now() - shotStart >= shotDelay){
+					bool ok = saveFrameBmp(*renderer, shot.path);
+					logLine("[shot] %s %s (%d x %d) camera %.3f %.3f %.3f  %.2f %.2f %.2f\n", ok ? "wrote" : "FAILED to write",
+						shot.path.c_str(), renderer->width, renderer->height,
+						current[0], current[1], current[2], current[3], current[4], current[5]);
+					shotIndex++;
+					shotPhase = 0;
+					if(shotIndex == shots.size() && exitAfterShots){
+						glfwSetWindowShouldClose(renderer->window, 1);
+					}
+				}
+			}
+		}
 
 		if(!lastBatchFinishedDevice){
 			updateOctree(renderer);
