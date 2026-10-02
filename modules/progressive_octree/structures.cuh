@@ -65,6 +65,8 @@ struct Chunk{
 	int padding_0;
 	Chunk* next;
 };
+// the host sizes kernel_construct's chunk queue from this
+static_assert(sizeof(Chunk) == CHUNK_BYTES, "CHUNK_BYTES in HostDeviceInterface.h must match struct Chunk");
 
 struct OccupancyGrid{
 	// gridsize^3 occupancy grid; 1 bit per voxel

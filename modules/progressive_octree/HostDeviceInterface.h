@@ -25,13 +25,16 @@ constexpr uint64_t BATCH_STREAM_SIZE = 8;
 constexpr uint64_t CONSTRUCT_VOXEL_BACKLOG  = 10'000'000;   // voxel samples: a 16 B point and an 8 B node pointer each
 constexpr uint64_t CONSTRUCT_SPILLING_NODES = 100'000;      // node pointers, 8 B
 constexpr uint64_t CONSTRUCT_SPILLED_POINTS = 10'000'000;   // 16 B points; written unchecked, re-inserted only up to 3 M
-constexpr uint64_t CONSTRUCT_CHUNK_QUEUE    = 1'000'000;    // chunk pointers, 8 B
-constexpr uint64_t CONSTRUCT_SCRATCH_BYTES  =
+constexpr uint64_t CONSTRUCT_SCRATCH_FIXED_BYTES =
 	  CONSTRUCT_VOXEL_BACKLOG  * (16 + 8)
 	+ CONSTRUCT_SPILLING_NODES * 8
 	+ CONSTRUCT_SPILLED_POINTS * 16
-	+ CONSTRUCT_CHUNK_QUEUE    * 8
 	+ 4096;                                                  // counters and 16-byte alignment
+// After the fixed part comes the chunk queue: one 8 B entry for every point
+// chunk the octree pool can hold (pool / CHUNK_BYTES + 1), because chunks
+// freed by a split are queued there for reuse. It was a fixed 1 M entries,
+// which a pool over 16 GB could overflow. The host sizes it from total VRAM.
+constexpr uint64_t CHUNK_BYTES = 16'016;                     // sizeof(Chunk), checked in structures.cuh
 
 struct Uniforms{
 	float width;
@@ -47,6 +50,7 @@ struct Uniforms{
 
 	uint64_t persistentBufferCapacity;
 	uint64_t momentaryBufferCapacity;
+	uint64_t renderBufferCapacity;      // kernel_render draws nothing if its layout would not fit
 
 	uint64_t frameCounter;
 	

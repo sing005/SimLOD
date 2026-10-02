@@ -1836,6 +1836,19 @@ void kernel_render(
 	int volW = int(uniforms.width)  / 4; if(volW < 1) volW = 1;
 	int volH = int(uniforms.height) / 4; if(volH < 1) volH = 1;
 	float* volBuf = allocator->alloc<float*>(volW * volH * 3 * sizeof(float));
+
+	// The host sizes the buffer for the window (renderBufferBytesFor) and
+	// skips the launch when it cannot. Should the frame's layout ever outgrow
+	// it, draw nothing rather than write past its end: a fixed 200 MB used to
+	// be overrun by any window above 3.8 Mpx. drawNodesHQS allocates its depth
+	// and colour buffers (20 B a pixel) later in the frame, where returning is
+	// no longer safe, so they are counted here. Every thread computes the
+	// same offset, so the return is uniform across the grid.
+	int64_t laterBytes = 1024 + 20 * int64_t(uniforms.width) * int64_t(uniforms.height);
+	if(allocator->offset + laterBytes > int64_t(uniforms.renderBufferCapacity)){
+		return;
+	}
+
 	if(grid.thread_rank() == 0){ _numEmitting = 0; _numDrawn = 0; _numTargets = 0; }
 
 	// Recount the occupancy grid first: the light grid below is derived from
