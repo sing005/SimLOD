@@ -18,7 +18,6 @@
 
 namespace cg = cooperative_groups; 
 
-constexpr uint64_t VOXEL_BACKLOG_CAPACITY = 10'000'000;
 constexpr float MAX_PROCESSING_TIME = 10.0f;
 
 Allocator* allocator;
@@ -868,21 +867,35 @@ void kernel_construct(
 	uint64_t& ellapsed_nanos     = *allocator->alloc<uint64_t*>(8);
 
 	// memory for "backlog"
-	backlog_voxels     = allocator->alloc<Point*>(VOXEL_BACKLOG_CAPACITY * sizeof(Point));
-	backlog_targets    = allocator->alloc<Node**>(VOXEL_BACKLOG_CAPACITY * sizeof(Node*));
+	// capacities shared with the host, which sizes the buffer from them
+	// (CONSTRUCT_SCRATCH_BYTES in HostDeviceInterface.h)
+	backlog_voxels     = allocator->alloc<Point*>(CONSTRUCT_VOXEL_BACKLOG * sizeof(Point));
+	backlog_targets    = allocator->alloc<Node**>(CONSTRUCT_VOXEL_BACKLOG * sizeof(Node*));
 	numBacklogVoxels   = allocator->alloc<uint32_t*>(4);
 
 	// List of nodes that received too many points and ned to be split
-	Node** spillingNodes         =  allocator->alloc<Node**>(100'000 * sizeof(Node*));
+	Node** spillingNodes         =  allocator->alloc<Node**>(CONSTRUCT_SPILLING_NODES * sizeof(Node*));
 	uint32_t* numSpillingNodes   =  allocator->alloc<uint32_t*>(4);
 
 	// Points from spilled&split nodes that need to be redistributed to the new leaves
-	// It's quite large because in the worst case, a single point can trigger 
+	// It's quite large because in the worst case, a single point can trigger
 	// <MAX_POINTS_PER_NODE> points to be spilled
-	Point* spilledPoints = allocator->alloc<Point*>(10'000'000 * sizeof(Point));
+	Point* spilledPoints = allocator->alloc<Point*>(CONSTRUCT_SPILLED_POINTS * sizeof(Point));
 	uint32_t* numSpilledPoints = allocator->alloc<uint32_t*>(4);
 
-	chunkQueue = allocator->alloc<Chunk**>(sizeof(Chunk*) * 1'000'000);
+	chunkQueue = allocator->alloc<Chunk**>(sizeof(Chunk*) * CONSTRUCT_CHUNK_QUEUE);
+
+	// The buffer is now allocated to fit this layout rather than with 800 MB to
+	// spare. Should the two ever disagree, do nothing instead of writing past
+	// its end; the host logs the overrun. Every thread computes the same
+	// offset, so the return is uniform across the grid.
+	if(allocator->offset + 1024 > int64_t(uniforms.momentaryBufferCapacity)){
+		if(grid.thread_rank() == 0){
+			stats->allocatedBytes_momentary = allocator->offset;
+		}
+
+		return;
+	}
 
 	grid.sync();
 

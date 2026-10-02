@@ -39,8 +39,10 @@ static_assert(sizeof(Uniforms) <= 4096, "Uniforms exceeds the 4 KB kernel-parame
 using namespace std;
 
 constexpr uint64_t PINNED_MEM_POOL_SIZE = 200;         // pool of pointers to batches of pinned memory
-constexpr uint64_t BATCH_STREAM_SIZE    = 50;          // ring buffer of batches that are async streamed to GPU
+// BATCH_STREAM_SIZE, the device upload ring, is in HostDeviceInterface.h
+constexpr uint64_t MAX_DECODED_AHEAD    = 50;          // batches the loaders may decode ahead of the kernel, in pinned host memory
 constexpr uint64_t MAX_BATCH_SIZE       = 1'000'000;   // each loaded batch comprises <size> points
+constexpr uint64_t VRAM_RESERVE_BYTES   = 512'000'000; // left free beside the octree pool: grids, GL framebuffers, headroom
 constexpr int MAX_LOADQUEUE_SIZE        = 300;         // stop loading from disk if processing lags behind
 
 CudaPrint cudaprint;
@@ -69,6 +71,9 @@ struct Point{
 		uint8_t rgba[4];
 	};
 };
+// the device Point (structures.cuh) is 16 bytes too; the upload ring and
+// CONSTRUCT_SCRATCH_BYTES are sized on that
+static_assert(sizeof(Point) == 16, "Point must stay 16 bytes, as on the device");
 
 struct PointBatch{
 	string file = "";
@@ -898,16 +903,17 @@ static int         g_gridX = 0, g_gridY = 0, g_gridZ = 0;
 static float       g_cellSize   = 1.0f;
 static size_t      g_gridBytes  = 0;
 
-// Momentary buffer overrun check (apply_buffer_fix.ps1). The allocator does
-// an atomicAdd and returns buffer + offset with no bounds test, so an overrun
-// is silent until it corrupts something. Warn once per session.
+// Construct scratch (momentary buffer) check. The buffer is sized from the
+// kernel's own capacities (CONSTRUCT_SCRATCH_BYTES); kernel_construct refuses
+// to run, and reports its layout size here, if it would not fit with 1 KB to
+// spare. Loading then stalls, so say why, once per session.
 static void checkMomentaryBudget(uint64_t used, uint64_t capacity){
 	static bool warned = false;
-	if(!warned && used > capacity){
+	if(!warned && used + 1024 > capacity){
 		warned = true;
-		printf("[WARN] momentary buffer overrun: %.1f MB used of %.1f MB. "
-			   "Raise cptr_buffer_bytes. Expect crashes until you do.\n",
-			   double(used) / 1'000'000.0, double(capacity) / 1'000'000.0);
+		logLine("[WARN] construct scratch overrun: the kernel lays out %.1f MB in a %.1f MB buffer and will not run. "
+			"Keep CONSTRUCT_SCRATCH_BYTES in HostDeviceInterface.h in step with kernel_construct's allocations.\n",
+			double(used) / 1'000'000.0, double(capacity) / 1'000'000.0);
 	}
 }
 
@@ -1693,17 +1699,12 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	// allocate most gpu buffers
 	uint64_t nodesCapacity           = 200'000;
 	uint64_t estimatedNodeSize       = 200;           // see struct Node in progressive_octree.cu, but some more just in case
-	// Raised from 300 MB by apply_buffer_fix.ps1. The Stats panel reported
-	// "momentary buffer 408.8 MB" against a 300 MB allocation while displaying
-	// a 54.5 M point scan - writing 109 MB past the end of a CUDA allocation,
-	// which is exactly the sort of fault that shows up as an intermittent
-	// crash when something shifts the allocation pattern, such as moving a
-	// slider. The allocator has no bounds check at all.
-	//
-	// 1.2 GB leaves room for the emission, bloom chain and volumetric buffers
-	// at up to two abutted 1440p screens. See the overrun warning below, which
-	// now reports the condition instead of letting it corrupt silently.
-	uint64_t cptr_buffer_bytes       = 1'200'000'000;
+	// kernel_construct's scratch, and nothing else's: the render kernel's
+	// emission, bloom and volumetric buffers live in cptr_renderbuffer. Sized
+	// from the kernel's own capacities (408.8 MB); it was a fixed 1.2 GB, and
+	// before that 300 MB, which the kernel overran by 109 MB with no check.
+	// The kernel now refuses to run if its layout outgrows this.
+	uint64_t cptr_buffer_bytes       = CONSTRUCT_SCRATCH_BYTES;
 	uint64_t cptr_nodes_bytes        = nodesCapacity * estimatedNodeSize;
 	uint64_t cptr_renderbuffer_bytes = 200'000'000;
 
@@ -1738,38 +1739,6 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 		cptr_points_ring[i] = devicemem + i * cptr_points_bytes;
 	}
 
-	// allocate persistent (over multiple frames) buffer with remaining GPU memory
-	size_t availableMem = 0;
-	cuMemGetInfo(&availableMem, &totalMem);
-
-	size_t cptr_buffer_persistent_bytes = static_cast<size_t>(static_cast<double>(availableMem) * 0.80);
-	persistentBufferCapacity = cptr_buffer_persistent_bytes;
-	cuCheck(cuMemAlloc(&cptr_buffer_persistent, cptr_buffer_persistent_bytes), "cuMemAlloc persistent buffer");
-
-	uint64_t total = cptr_buffer_bytes 
-		+ cptr_nodes_bytes
-		+ cptr_renderbuffer_bytes
-		+ sizeof(Stats)
-		+ cptr_buffer_persistent_bytes;
-
-	printfmt("cuMemAlloc(&cptr_buffer,            {:8L} MB);\n", cptr_buffer_bytes / 1'000'000llu);
-	printfmt("cuMemAlloc(&cptr_nodes,             {:8L} MB);\n", cptr_nodes_bytes / 1'000'000llu);
-	printfmt("cuMemAlloc(&cptr_renderbuffer,      {:8L} MB);\n", cptr_renderbuffer_bytes / 1'000'000llu);
-	printfmt("cuMemAlloc(&cptr_stats,             {:8L}   );\n", sizeof(Stats));
-	printfmt("cuMemAlloc(&cptr_buffer_persistent, {:8L} MB);\n", cptr_buffer_persistent_bytes / 1'000'000llu);
-	printfmt("==============================================\n");
-	printfmt("                                    {:8L} MB  \n", total / 1'000'000llu);
-	printfmt("\n");
-
-	// The same plan in the run log: stdout is lost when the process is killed,
-	// and the octree pool decides how many points fit.
-	logLine("[vram] %.0f of %.0f MB free at start. Fixed: construct scratch %.0f, nodes %.0f, render %.0f, upload ring %.0f MB."
-		" Octree pool %.0f MB (80%% of the %.0f MB then free)\n",
-		freeAtStart / 1e6, totalMem / 1e6,
-		cptr_buffer_bytes / 1e6, cptr_nodes_bytes / 1e6, cptr_renderbuffer_bytes / 1e6,
-		(BATCH_STREAM_SIZE * cptr_points_bytes) / 1e6,
-		cptr_buffer_persistent_bytes / 1e6, availableMem / 1e6);
-
 	cuda_program_update = new CudaModularProgram({
 		.modules = {
 			"./modules/progressive_octree/progressive_octree_voxels.cu",
@@ -1803,6 +1772,68 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	// 	.kernels = {"kernel"}
 	// });
 
+	// The octree pool gets the VRAM that is left, so it is sized only now that
+	// the kernels are compiled. Their local memory (register spills, stack) is
+	// claimed from the same VRAM when they are first launched, for every
+	// thread the GPU can hold at once, and a launch fails if it is not there.
+	size_t stackLimit = 0;
+	int maxThreadsPerSM = 0;
+	cuCtxGetLimit(&stackLimit, CU_LIMIT_STACK_SIZE);
+	cuDeviceGetAttribute(&maxThreadsPerSM, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, device);
+	int maxLocalBytes = 0;
+	for(CudaModularProgram* program : {cuda_program_update, cuda_program_reset, cuda_program_render}){
+		for(auto& [kernelName, kernel] : program->kernels){
+			int localBytes = 0;
+			int numRegisters = 0;
+			cuFuncGetAttribute(&localBytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+			cuFuncGetAttribute(&numRegisters, CU_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+			logLine("[kernel] %s: %d registers, %d bytes local memory per thread\n",
+				kernelName.c_str(), numRegisters, localBytes);
+			maxLocalBytes = std::max(maxLocalBytes, localBytes);
+		}
+	}
+	uint64_t localMemBytes = (uint64_t(maxLocalBytes) + stackLimit) * uint64_t(maxThreadsPerSM) * uint64_t(numSMs);
+
+	// Everything but a fixed reserve, instead of 80% of what was free, which
+	// left about 1 GB idle on an 8 GB card. The reserve covers the occupancy
+	// and light grids (about 21 MB each at the default resolution, up to
+	// 166 MB each at 512; both step down or switch off if memory is short),
+	// GL framebuffers when the window grows, and the kernels' local memory.
+	size_t availableMem = 0;
+	cuMemGetInfo(&availableMem, &totalMem);
+
+	uint64_t reserveBytes = VRAM_RESERVE_BYTES + localMemBytes;
+	size_t cptr_buffer_persistent_bytes = availableMem > reserveBytes + 256'000'000
+		? availableMem - reserveBytes
+		: availableMem / 2;   // little free (another GPU program?): keep half back
+	persistentBufferCapacity = cptr_buffer_persistent_bytes;
+	cuCheck(cuMemAlloc(&cptr_buffer_persistent, cptr_buffer_persistent_bytes), "cuMemAlloc persistent buffer");
+
+	uint64_t total = cptr_buffer_bytes
+		+ cptr_nodes_bytes
+		+ cptr_renderbuffer_bytes
+		+ sizeof(Stats)
+		+ cptr_buffer_persistent_bytes;
+
+	printfmt("cuMemAlloc(&cptr_buffer,            {:8L} MB);\n", cptr_buffer_bytes / 1'000'000llu);
+	printfmt("cuMemAlloc(&cptr_nodes,             {:8L} MB);\n", cptr_nodes_bytes / 1'000'000llu);
+	printfmt("cuMemAlloc(&cptr_renderbuffer,      {:8L} MB);\n", cptr_renderbuffer_bytes / 1'000'000llu);
+	printfmt("cuMemAlloc(&cptr_stats,             {:8L}   );\n", sizeof(Stats));
+	printfmt("cuMemAlloc(&cptr_buffer_persistent, {:8L} MB);\n", cptr_buffer_persistent_bytes / 1'000'000llu);
+	printfmt("==============================================\n");
+	printfmt("                                    {:8L} MB  \n", total / 1'000'000llu);
+	printfmt("\n");
+
+	// The same plan in the run log: stdout is lost when the process is killed,
+	// and the octree pool decides how many points fit.
+	logLine("[vram] %.0f of %.0f MB free at start. Fixed: construct scratch %.0f, nodes %.0f, render %.0f, upload ring %.0f MB."
+		" Octree pool %.0f MB: the %.0f MB then free, less %.0f MB reserve (%.0f MB of it kernel local memory)\n",
+		freeAtStart / 1e6, totalMem / 1e6,
+		cptr_buffer_bytes / 1e6, cptr_nodes_bytes / 1e6, cptr_renderbuffer_bytes / 1e6,
+		(BATCH_STREAM_SIZE * cptr_points_bytes) / 1e6,
+		cptr_buffer_persistent_bytes / 1e6, availableMem / 1e6,
+		double(availableMem - cptr_buffer_persistent_bytes) / 1e6, localMemBytes / 1e6);
+
 	cuEventCreate(&ce_render_start, 0);
 	cuEventCreate(&ce_render_end, 0);
 	cuEventCreate(&ce_update_start, 0);
@@ -1812,7 +1843,7 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 
 	size_t freeAfterInit = 0;
 	cuMemGetInfo(&freeAfterInit, &totalMem);
-	logLine("[vram] %.0f MB free after allocating and compiling the kernels\n", freeAfterInit / 1e6);
+	logLine("[vram] %.0f MB free after allocating the octree pool\n", freeAfterInit / 1e6);
 }
 
 void reload(){
@@ -1956,7 +1987,7 @@ void reload(){
 }
 
 // The construct kernel stops inserting once the octree pool is nearly full.
-// The loaders went on decoding up to BATCH_STREAM_SIZE more batches that would
+// The loaders went on decoding up to MAX_DECODED_AHEAD more batches that would
 // never be used, each holding a 16 MB pinned slot: about 50 M points, minutes
 // of LAZ decoding. Drop the queued work instead and mark the load complete.
 void stopLoadingAtCapacity(){
@@ -2006,10 +2037,14 @@ void logLoadSummary(){
 		s.numNodes, s.numInner, s.numLeaves, s.numNonemptyLeaves,
 		s.numPoints / 1e6, s.numVoxels / 1e6, double(s.numVoxels) / std::max(double(s.numPoints), 1.0),
 		s.numChunksPoints, s.numChunksVoxels);
-	logLine("[load] memory: octree pool %.0f of %.0f MB used, %.1f bytes per point; construct scratch %.0f of %.0f MB\n",
+	size_t freeNow = 0;
+	size_t totalNow = 0;
+	cuMemGetInfo(&freeNow, &totalNow);
+	logLine("[load] memory: octree pool %.0f of %.0f MB used, %.1f bytes per point; construct scratch %.0f of %.0f MB; %.0f MB of VRAM free\n",
 		s.allocatedBytes_persistent / 1e6, persistentBufferCapacity / 1e6,
 		double(s.allocatedBytes_persistent) / std::max(double(s.numPoints), 1.0),
-		s.allocatedBytes_momentary / 1e6, momentaryBufferCapacity / 1e6);
+		s.allocatedBytes_momentary / 1e6, momentaryBufferCapacity / 1e6,
+		freeNow / 1e6);
 	logLine("[load] integrity: %u points dropped (no chunk), %u upload-ring slots refilled while still in use\n",
 		s.numDroppedPoints, s.numRingMismatches);
 }
@@ -2062,7 +2097,7 @@ void spawnLoader(size_t i, int maxLazThreads) {
 
 		while (true) {
 			bool everythingIsDone = batchStreamUploadIndex == numBatchesTotal;
-			bool processingLagsBehind = numPointsLoaded > pointsProcessedHost + BATCH_STREAM_SIZE * MAX_BATCH_SIZE;
+			bool processingLagsBehind = numPointsLoaded > pointsProcessedHost + MAX_DECODED_AHEAD * MAX_BATCH_SIZE;
 
 			// if (processingLagsBehind) {
 			// 	printfmt("processing lags behind\n");
