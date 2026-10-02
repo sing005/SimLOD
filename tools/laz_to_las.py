@@ -1,0 +1,55 @@
+"""Decompress .laz point clouds to .las, which SimLOD loads many times faster.
+
+    python tools/laz_to_las.py <file.laz> [more.laz ...] [--out DIR]
+
+Writes <name>.las next to each input (or into --out). Streams in chunks, so
+memory use stays small however large the file. Needs:  pip install laspy[laszip]
+
+A .las file is about 6x larger than its .laz (34 bytes per point for the
+Rotokare scans), so the script checks free disk space before starting.
+"""
+import argparse
+import os
+import shutil
+import sys
+import time
+
+import laspy
+
+CHUNK = 5_000_000
+
+
+def convert(src, out_dir):
+    dst = os.path.join(out_dir or os.path.dirname(os.path.abspath(src)),
+                       os.path.splitext(os.path.basename(src))[0] + ".las")
+    with laspy.open(src) as reader:
+        header = reader.header
+        need = header.offset_to_point_data + header.point_count * header.point_format.size
+        free = shutil.disk_usage(os.path.dirname(os.path.abspath(dst))).free
+        print(f"{os.path.basename(src)}: {header.point_count / 1e6:.1f} M points, "
+              f"needs {need / 1e9:.2f} GB, {free / 1e9:.2f} GB free")
+        if need > free * 0.95:
+            print("  skipped: not enough disk space")
+            return False
+        start = time.time()
+        with laspy.open(dst, mode="w", header=header, do_compress=False) as writer:
+            done = 0
+            for chunk in reader.chunk_iterator(CHUNK):
+                writer.write_points(chunk)
+                done += len(chunk)
+                print(f"  {100.0 * done / header.point_count:5.1f}%", end="\r", flush=True)
+        print(f"  wrote {dst} in {time.time() - start:.0f} s")
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("files", nargs="+", help=".laz files to convert")
+    parser.add_argument("--out", help="output directory (default: next to each input)")
+    args = parser.parse_args()
+    ok = all(convert(f, args.out) for f in args.files)
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
