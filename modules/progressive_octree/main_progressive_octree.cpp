@@ -275,10 +275,17 @@ struct PinnedMemPool{
 		// reserve some extra bytes in case of IO with special alignment
 		uint64_t alignmentPadding = 1'048'576;
 
-		void* pinnedMem;
+		void* pinnedMem = nullptr;
 		CUevent slotEvent;
 
-		cuMemAllocHost((void**)&pinnedMem, bytesPerSlot + alignmentPadding);
+		// unchecked, a failure left pinnedMem uninitialised and the loaders
+		// then wrote 16 MB through it
+		CUresult res = cuMemAllocHost((void**)&pinnedMem, bytesPerSlot + alignmentPadding);
+		if(res != CUDA_SUCCESS || pinnedMem == nullptr){
+			fprintf(stderr, "[load] cuMemAllocHost of %.0f MB pinned memory failed (%d)\n",
+				double(bytesPerSlot + alignmentPadding) / 1e6, int(res));
+			throw std::bad_alloc();   // reaches the terminate handler, which logs a stack
+		}
 		cuEventCreate(&slotEvent, 0);
 
 		PinnedMemorySlot slot = {
@@ -1952,6 +1959,7 @@ void spawnLoader(size_t i) {
 	auto cpu = getCpuData();
 
 	thread t([&, i]() {
+		installThreadTerminateHandler();
 		cuCtxSetCurrent(context);
 
 		while (true) {
@@ -2023,9 +2031,24 @@ void spawnLoader(size_t i) {
 					laszip_BOOL is_compressed;
 					laszip_BOOL request_reader = true;
 
-					laszip_create(&laszip_reader);
+					// One reader per batch, destroyed at the end: it was created and
+					// never destroyed, leaking a reader for every batch of every load.
+					if(laszip_create(&laszip_reader) != 0 || laszip_reader == nullptr){
+						logLine("[load] laszip_create failed for %s\n", batch.file.c_str());
+						pinnedMemPool.release(pinnedMemSlot);
+						numThreadsLoading--;
+						continue;
+					}
 					laszip_request_compatibility_mode(laszip_reader, request_reader);
-					laszip_open_reader(laszip_reader, batch.file.c_str(), &is_compressed);
+					if(laszip_open_reader(laszip_reader, batch.file.c_str(), &is_compressed) != 0){
+						laszip_CHAR* err = nullptr;
+						laszip_get_error(laszip_reader, &err);
+						logLine("[load] cannot open %s: %s\n", batch.file.c_str(), err ? err : "unknown laszip error");
+						laszip_destroy(laszip_reader);
+						pinnedMemPool.release(pinnedMemSlot);
+						numThreadsLoading--;
+						continue;
+					}
 
 					laszip_get_header_pointer(laszip_reader, &header);
 					laszip_get_point_pointer(laszip_reader, &laz_point);
@@ -2056,6 +2079,7 @@ void spawnLoader(size_t i) {
 					}
 
 					laszip_close_reader(laszip_reader);
+					laszip_destroy(laszip_reader);
 
 					batch.pinnedMem = pinnedMemSlot;
 
@@ -2103,6 +2127,7 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 	double timestamp = now();
 
 	thread t([&]() {
+		installThreadTerminateHandler();
 
 		vector<PinnedMemorySlot> availableSlots;
 
@@ -2211,11 +2236,7 @@ int main(int argc, char** argv){
 	// thread and could not say where the fault was.
 	logLine("[host] SimLOD starting\n");   // opens the run log, so its path is known
 	installCrashHandler(g_logPath.c_str());
-	std::signal(SIGABRT, [](int){
-		logLine("[CRASH] SIGABRT - abort() called, usually an assertion or a failed allocation\n");
-		fflush(stdout);
-		std::_Exit(134);
-	});
+	// (abort() and uncaught exceptions are handled there too, with a stack)
 
 	auto renderer = make_shared<GLRenderer>();
 	auto cpu = getCpuData();
@@ -2339,7 +2360,7 @@ int main(int argc, char** argv){
 		printfmt("drop at {:.3f} \n", now());
 
 		for(auto file : files){
-			printfmt("dropped: {} \n", file);
+			logLine("[load] dropped: %s\n", file.c_str());
 
 			if(iEndsWith(file, "las") || iEndsWith(file, "laz")){
 				pointCloudFiles.push_back(file);

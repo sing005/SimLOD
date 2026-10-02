@@ -83,11 +83,9 @@ uint64_t loadLasNative(string file, LasHeader header, uint64_t firstPoint, uint6
 	}
 	uint64_t numBytes_aligned = endByte_aligned - firstByte_aligned;
 	
-	LPTSTR winPath = new TCHAR[1000];
-	std::copy(file.begin(), file.end(), winPath);
-	winPath[file.length()] = 0;
-
-	HANDLE hFile = CreateFile(winPath,
+	// was new TCHAR[1000], never freed (one leak per batch) and overflowed on
+	// paths of 1000+ characters
+	HANDLE hFile = CreateFileA(file.c_str(),
 		GENERIC_READ,
 		FILE_SHARE_READ,
 		NULL,

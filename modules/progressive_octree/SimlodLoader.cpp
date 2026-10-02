@@ -82,11 +82,8 @@ void loadFileNative(
 
 	dbg_file = file;
 
-	LPTSTR winPath = new TCHAR[1000];
-	std::copy(file.begin(), file.end(), winPath);
-	winPath[file.length()] = 0;
-
-	HANDLE hFile = CreateFile(winPath,
+	// was new TCHAR[1000], never freed (one leak per batch)
+	HANDLE hFile = CreateFileA(file.c_str(),
 		GENERIC_READ,
 		FILE_SHARE_READ,
 		NULL,
