@@ -384,15 +384,36 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 		// top at window size. The UI used to be drawn into the frame itself,
 		// which only works while frame and window are the same size; this
 		// also leaves the frame free of UI for screenshots.
+		// A frame of another shape than the window (--render) is letterboxed,
+		// not stretched.
 		auto source = view.framebuffer;
-		glBlitNamedFramebuffer(
-			source->handle, 0,
-			0, 0, source->width, source->height,
-			0, 0, this->windowWidth, this->windowHeight,
-			GL_COLOR_BUFFER_BIT, GL_LINEAR);
+		presentX = 0;
+		presentY = 0;
+		presentWidth  = this->windowWidth;
+		presentHeight = this->windowHeight;
+		if(source->width > 0 && source->height > 0 && this->windowWidth > 0 && this->windowHeight > 0){
+			int64_t frameByWindow = int64_t(source->width) * this->windowHeight;
+			int64_t windowByFrame = int64_t(this->windowWidth) * source->height;
+			if(frameByWindow > windowByFrame){        // frame wider: bars top and bottom
+				presentHeight = int(windowByFrame / source->width);
+			}else if(frameByWindow < windowByFrame){  // frame taller: bars left and right
+				presentWidth = int(frameByWindow / source->height);
+			}
+			presentX = (this->windowWidth  - presentWidth)  / 2;
+			presentY = (this->windowHeight - presentHeight) / 2;
+		}
 
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		glViewport(0, 0, this->windowWidth, this->windowHeight);
+		if(presentWidth != this->windowWidth || presentHeight != this->windowHeight){
+			glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+			glClear(GL_COLOR_BUFFER_BIT);
+		}
+		glBlitNamedFramebuffer(
+			source->handle, 0,
+			0, 0, source->width, source->height,
+			presentX, presentY, presentX + presentWidth, presentY + presentHeight,
+			GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
 		ImGui::Render();
 		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());

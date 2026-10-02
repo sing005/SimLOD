@@ -1139,6 +1139,10 @@ static void updateAdaptiveDetail(){
 		return;
 	}
 	if(stats.stageNs[6] == 0) return;   // no measurement yet
+	// each measurement once: the stats readback can repeat a frame's values
+	static uint32_t lastFrameID = ~0u;
+	if(stats.frameID == lastFrameID) return;
+	lastFrameID = stats.frameID;
 	double ms = double(stats.stageNs[6]) / 1e6;
 	if(ms > settings.frameBudgetMs * 1.10)      g_adaptReduce += 0.03f;
 	else if(ms < settings.frameBudgetMs * 0.70) g_adaptReduce -= 0.015f;
@@ -1151,10 +1155,9 @@ static int   effectiveMaxSplatPx(){
 }
 
 static bool g_frameRenderable = false;   // the render buffer holds this frame's size
+static bool g_frameDrawn      = false;   // set by renderCUDA: kernel_render was launched this frame
 
 static void beginFrameState(int width, int height){
-	updateAdaptiveDetail();
-
 	// A minimised window reports 0 x 0: nothing to draw (loading goes on).
 	// Drawing anyway registered a zero-size GL texture with CUDA, and mapping
 	// it crashed in the driver.
@@ -1169,6 +1172,10 @@ static void beginFrameState(int width, int height){
 		g_frameLightDirty = false;
 		return;
 	}
+
+	// only on frames that are drawn: on the others the last render time is
+	// stale, and the controller would drive detail to an extreme meanwhile
+	updateAdaptiveDetail();
 
 	// Recount only once the device has processed every point. During a load
 	// the construct kernel counts points as it inserts them, and a recount
@@ -1700,7 +1707,9 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 // draw the octree with a CUDA kernel
 void renderCUDA(shared_ptr<GLRenderer> renderer){
 
-	// the window outgrew free memory (ensureRenderBuffer said why, once)
+	g_frameDrawn = false;
+
+	// minimised, or the window outgrew free memory (ensureRenderBuffer said why, once)
 	if(!g_frameRenderable) return;
 
 	Uniforms uniforms = getUniforms(renderer);
@@ -1717,6 +1726,12 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 		// mapping a resource that did not register crashes in the driver
 		static bool warned = false;
 		if(!warned){ warned = true; logLine("[host] cannot register the frame texture with CUDA (%d); frame skipped\n", int(registered_res)); }
+		// kernel_render does not run: put back the requests beginFrameState
+		// took for this frame, for the next one that is drawn
+		if(g_frameGridRefill) g_gridRefill = true;
+		if(g_frameLightDirty) g_lightDirty = true;
+		g_frameGridRefill = false;
+		g_frameLightDirty = false;
 		return;
 	}
 
@@ -1757,8 +1772,9 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 		workgroupSize, 1, 1,
 		0, 0, args);
 
+	g_frameDrawn = res_launch == CUDA_SUCCESS;
 	if(res_launch != CUDA_SUCCESS){
-		const char* str; 
+		const char* str;
 		cuGetErrorString(res_launch, &str);
 		printf("error: %s \n", str);
 	}
@@ -2663,7 +2679,11 @@ int main(int argc, char** argv){
 			std::ifstream in(list);
 			if(!in) logLine("[shot] cannot open %s\n", list.string().c_str());
 			string line;
+			bool firstLine = true;
 			while(std::getline(in, line)){
+				// a UTF-8 BOM (PowerShell's utf8) would become part of the first name
+				if(firstLine && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
+				firstLine = false;
 				std::stringstream ss(line);
 				ShotRequest shot;
 				string name;
@@ -2723,6 +2743,8 @@ int main(int argc, char** argv){
 	}
 	if(!shots.empty()){
 		logLine("[shot] %d screenshot(s) after loading, %.1f s each%s\n", int(shots.size()), shotDelay, exitAfterShots ? ", then exit" : "");
+	}else if(exitAfterShots){
+		logLine("[shot] --exit given but there are no screenshots to take; exiting once the load finishes\n");
 	}
 
 	reload();
@@ -2827,14 +2849,16 @@ int main(int argc, char** argv){
 			bool leftDown = glfwGetMouseButton(renderer->window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;   // fix_pick_input
 			ImGuiIO& io = ImGui::GetIO();
 			bool pKey = glfwGetKey(renderer->window, GLFW_KEY_P) == GLFW_PRESS && !io.WantCaptureKeyboard;
-			if(((altDown && leftDown && !g_leftWasDown) || (pKey && !g_pKeyWasDown)) && !io.WantCaptureMouse){
-				double mx=0.0, my=0.0; glfwGetCursorPos(renderer->window,&mx,&my);
-				// window pixels to frame pixels: they differ when the frame is
-				// rendered at a fixed size (--render)
-				mx *= double(renderer->width)  / double(std::max(renderer->windowWidth, 1));
-				my *= double(renderer->height) / double(std::max(renderer->windowHeight, 1));
-				g_pickReqX = int(mx);
-				g_pickReqY = renderer->height - 1 - int(my);
+			// window pixels to frame pixels through the rectangle the frame is
+			// shown in: they differ when it is rendered at a fixed size (--render)
+			double mx=0.0, my=0.0; glfwGetCursorPos(renderer->window,&mx,&my);
+			double rectTop = double(renderer->windowHeight - (renderer->presentY + renderer->presentHeight));   // cursor y runs top down
+			double fx = (mx - renderer->presentX) * double(renderer->width)  / double(std::max(renderer->presentWidth, 1));
+			double fy = (my - rectTop)            * double(renderer->height) / double(std::max(renderer->presentHeight, 1));
+			bool onFrame = fx >= 0.0 && fy >= 0.0 && fx < renderer->width && fy < renderer->height;
+			if(((altDown && leftDown && !g_leftWasDown) || (pKey && !g_pKeyWasDown)) && !io.WantCaptureMouse && onFrame){
+				g_pickReqX = int(fx);
+				g_pickReqY = renderer->height - 1 - int(fy);
 				g_pickSeq++;
 				g_pickSeenDone = 0;
 				g_pickWaiting = true;
@@ -2914,32 +2938,47 @@ int main(int argc, char** argv){
 		// shot waits (anything but the controls' own adjustment on the first
 		// frame, such as pinning the radius in walk mode), the shot's camera
 		// is set again and the wait starts over.
+		if(exitAfterShots && shots.empty() && lastBatchFinishedDevice){
+			glfwSetWindowShouldClose(renderer->window, 1);
+		}
 		if(!shots.empty() && lastBatchFinishedDevice){
 			static size_t shotIndex = 0;
 			static int    shotPhase = 0;   // 0 set the camera, 1 note where it settled, 2 wait
 			static double shotStart = 0.0;
 			static double settled[6] = {0, 0, 0, 0, 0, 0};
+			static double startView[6] = {0, 0, 0, 0, 0, 0};
+			static bool   haveStartView = false;
 			auto& controls = renderer->controls;
 			double current[6] = {controls->yaw, controls->pitch, controls->radius,
 			                     controls->target.x, controls->target.y, controls->target.z};
+			// the camera after the load (the start camera, or --view): shots
+			// without a camera of their own (--screenshot) use it, even after
+			// --shots has moved the camera
+			if(!haveStartView){
+				std::copy(current, current + 6, startView);
+				haveStartView = true;
+			}
 			if(shotIndex < shots.size()){
 				const ShotRequest& shot = shots[shotIndex];
-				if(shotPhase == 2 && shot.hasView && !std::equal(current, current + 6, settled)){
+				const double* view = shot.hasView ? shot.view : startView;
+				if(shotPhase == 2 && !std::equal(current, current + 6, settled)){
 					logLine("[shot] camera moved while waiting for %s; setting it again\n", shot.path.c_str());
 					shotPhase = 0;
 				}
 				if(shotPhase == 0){
-					if(shot.hasView){
-						controls->yaw    = shot.view[0];
-						controls->pitch  = shot.view[1];
-						controls->radius = shot.view[2];
-						controls->target = { shot.view[3], shot.view[4], shot.view[5] };
-					}
+					controls->yaw    = view[0];
+					controls->pitch  = view[1];
+					controls->radius = view[2];
+					controls->target = { view[3], view[4], view[5] };
 					shotStart = now();
 					shotPhase = 1;
 				}else if(shotPhase == 1){
 					std::copy(current, current + 6, settled);
 					shotPhase = 2;
+				}else if(!g_frameDrawn){
+					// minimised, or nothing could be drawn: the frame texture is
+					// stale, so wait for shotDelay of frames that are drawn
+					shotStart = now();
 				}else if(now() - shotStart >= shotDelay){
 					bool ok = saveFrameBmp(*renderer, shot.path);
 					logLine("[shot] %s %s (%d x %d) camera %.3f %.3f %.3f  %.2f %.2f %.2f\n", ok ? "wrote" : "FAILED to write",
