@@ -2051,13 +2051,21 @@ void reload(){
 			LasHeader header = loadHeader(path);
 			numPointsTotal += header.numPoints;
 
-			boxMin.x = std::min(boxMin.x, float(header.min[0]));
-			boxMin.y = std::min(boxMin.y, float(header.min[1]));
-			boxMin.z = std::min(boxMin.z, float(header.min[2]));
+			// Rounded outward, so the float box contains every point the
+			// header bounds do: the octree stores points as fixed point
+			// within this box and clamps anything outside onto its faces.
+			// Rounding to nearest could cut off up to half a float spacing,
+			// 0.25 m for georeferenced northings near 5.6e6.
+			auto floorFloat = [](double v){ float f = float(v); return double(f) > v ? std::nextafter(f, -INFINITY) : f; };
+			auto ceilFloat  = [](double v){ float f = float(v); return double(f) < v ? std::nextafter(f,  INFINITY) : f; };
 
-			boxMax.x = std::max(boxMax.x, float(header.max[0]));
-			boxMax.y = std::max(boxMax.y, float(header.max[1]));
-			boxMax.z = std::max(boxMax.z, float(header.max[2]));
+			boxMin.x = std::min(boxMin.x, floorFloat(header.min[0]));
+			boxMin.y = std::min(boxMin.y, floorFloat(header.min[1]));
+			boxMin.z = std::min(boxMin.z, floorFloat(header.min[2]));
+
+			boxMax.x = std::max(boxMax.x, ceilFloat(header.max[0]));
+			boxMax.y = std::max(boxMax.y, ceilFloat(header.max[1]));
+			boxMax.z = std::max(boxMax.z, ceilFloat(header.max[2]));
 
 			for (uint64_t first = 0; first < header.numPoints; first += MAX_BATCH_SIZE) {
 				PointBatch batch;
@@ -2191,8 +2199,8 @@ void logLoadSummary(){
 		double(s.allocatedBytes_persistent) / std::max(double(s.numPoints), 1.0),
 		s.allocatedBytes_momentary / 1e6, momentaryBufferCapacity / 1e6,
 		freeNow / 1e6);
-	logLine("[load] integrity: %u points dropped (no chunk), %u upload-ring slots refilled while still in use\n",
-		s.numDroppedPoints, s.numRingMismatches);
+	logLine("[load] integrity: %u points dropped (no chunk), %u upload-ring slots refilled while still in use, %u points outside the header box (stored on its faces)\n",
+		s.numDroppedPoints, s.numRingMismatches, s.numClampedPoints);
 }
 
 void reset(shared_ptr<GLRenderer> renderer){
@@ -2995,8 +3003,9 @@ int main(int argc, char** argv){
 						current[0], current[1], current[2], current[3], current[4], current[5]);
 					shotIndex++;
 					shotPhase = 0;
-					if(shotIndex == shots.size() && exitAfterShots){
-						glfwSetWindowShouldClose(renderer->window, 1);
+					if(shotIndex == shots.size()){
+						GLRenderer::inputLocked = false;   // shots done: the viewer is the user's again
+						if(exitAfterShots) glfwSetWindowShouldClose(renderer->window, 1);
 					}
 				}
 			}

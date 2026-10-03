@@ -246,6 +246,7 @@ struct Stats{
 	uint32_t dbg                        = 0;
 	uint32_t numDroppedPoints           = 0;   // points whose leaf had no chunk for them; not stored
 	uint32_t numRingMismatches          = 0;   // upload-ring slots refilled before the kernel had finished their batch
+	uint32_t numClampedPoints           = 0;   // points outside the box, stored on its faces (header bounds too small)
 
 	bool memCapacityReached             = false;
 };

@@ -113,7 +113,19 @@ struct PointCodec{
 		return c;
 	}
 
-	// nearest unit, clamped to the box (header bounds can be a hair short)
+	// True if p lies outside the box by more than half a step on any axis, so
+	// encode would move it onto a face. The host rounds the header box
+	// outward; this catches headers whose bounds are simply too small.
+	bool outside(const Point& p) const{
+		float ux = (p.x - origin.x) * invStep.x;
+		float uy = (p.y - origin.y) * invStep.y;
+		float uz = (p.z - origin.z) * invStep.z;
+		return !(ux >= -0.5f && ux <= float(PACK_X_MAX) + 0.5f
+		      && uy >= -0.5f && uy <= float(PACK_Y_MAX) + 0.5f
+		      && uz >= -0.5f && uz <= float(PACK_Z_MAX) + 0.5f);
+	}
+
+	// nearest unit, clamped to the box (see outside)
 	static uint32_t quantize(float offset, float invStep, uint32_t maxUnit){
 		float f = offset * invStep + 0.5f;
 		if(!(f > 0.0f)) return 0;
