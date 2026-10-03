@@ -249,3 +249,5 @@ struct Node{
 	}
 
 };
+// the host sizes kernel_render's visible-node list from this
+static_assert(sizeof(Node) == NODE_BYTES, "NODE_BYTES in HostDeviceInterface.h must match struct Node");
