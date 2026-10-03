@@ -35,6 +35,7 @@ Node** backlog_targets     = nullptr;
 uint32_t* numBacklogVoxels = nullptr;
 Chunk** chunkQueue         = nullptr;
 CudaPrint* cudaprint       = nullptr;
+PointCodec g_codec;                    // stored-point encoding for this cloud, set per launch
 
 // https://colorbrewer2.org/#type=diverging&scheme=Spectral&n=8 (byte order inverted)
 uint32_t SPECTRAL[8] = {
@@ -133,7 +134,7 @@ bool doCounting(
 	float3 octreeMin, float3 octreeMax, float octreeSize,
 	Node* nodes, 
 	Node** spillingNodes, uint32_t* numSpillingNodes,
-	Point* spilledPoints, uint32_t* numSpilledPoints,
+	StoredPoint* spilledPoints, uint32_t* numSpilledPoints,
 	uint32_t countIteration
 ){
 	auto grid = cg::this_grid();
@@ -228,10 +229,14 @@ bool doCounting(
 
 	auto t_10 = nanotime();
 
-	// Count points of current batch
+	// Count points of current batch. Every point is placed by its position as
+	// stored (decode(encode(p))), here, in voxelSampling and in insertPoints:
+	// a point placed by its exact position could decode just across its
+	// leaf's boundary, and when that leaf split it would be re-inserted into a
+	// neighbour that the counting below no longer counts into.
 	processRange(numPoints, [&](int pointID){
-		Point point = points[pointID];
-		
+		Point point = g_codec.decode(g_codec.encode(points[pointID]));
+
 		countPoint(point);
 	});
 
@@ -241,8 +246,8 @@ bool doCounting(
 
 	// count spilled points of previous iterations of current batch
 	processRange(*numSpilledPoints, [&](int pointID){
-		Point point = spilledPoints[pointID];
-		
+		Point point = g_codec.decode(spilledPoints[pointID]);
+
 		countPoint(point);
 	});
 
@@ -288,10 +293,10 @@ bool doCounting(
 				chunkIndex++;
 			}
 
+			// moved as stored: decoding and encoding again could shift it a unit
 			int pIndex = pointIndex % POINTS_PER_CHUNK;
-			Point point = chunk->points[pIndex];
 			uint32_t spillID = atomicAdd(numSpilledPoints, 1);
-			spilledPoints[spillID] = point;
+			spilledPoints[spillID] = chunk->points[pIndex];
 		}
 	}
 
@@ -394,7 +399,7 @@ void expand(
 	float3 octreeMin, float3 octreeMax, float octreeSize,
 	Node* nodes, 
 	Node** spillingNodes, uint32_t* numSpillingNodes,
-	Point* spilledPoints, uint32_t* numSpilledPoints,
+	StoredPoint* spilledPoints, uint32_t* numSpilledPoints,
 	uint32_t batchIndex
 ){
 	auto grid = cg::this_grid();
@@ -424,7 +429,7 @@ void expand(
 void voxelSampling(
 	Node* root, Point* points, int numPoints, 
 	float3 octreeMin, float3 octreeMax, float octreeSize,
-	Point* spilledPoints, uint32_t* numSpilledPoints
+	StoredPoint* spilledPoints, uint32_t* numSpilledPoints
 ){
 	auto grid = cg::this_grid();
 
@@ -477,13 +482,13 @@ void voxelSampling(
 	};
 
 	processRange(numPoints, [&](int index){
-		Point point = points[index];
+		Point point = g_codec.decode(g_codec.encode(points[index]));   // placed as stored, as in doCounting
 
 		traverse(point);
 	});
 
 	processRange(*numSpilledPoints, [&](int index){
-		Point point = spilledPoints[index];
+		Point point = g_codec.decode(spilledPoints[index]);
 
 		traverse(point);
 	});
@@ -547,17 +552,18 @@ void allocatePointChunks(Node* root, Point* points, int numPoints, Node* nodes){
 void insertPoints(
 	Node* root, Point* points, uint32_t numPoints,
 	float3 octreeMin, float3 octreeMax, float octreeSize,
-	Point* spilledPoints, uint32_t* numSpilledPoints,
+	StoredPoint* spilledPoints, uint32_t* numSpilledPoints,
 	int batchIndex
 ){
 	auto grid = cg::this_grid();
 
-	// INSERT POINTS INTO NODES 
+	// INSERT POINTS INTO NODES
 	// PRINT("insert points into nodes \n");
 	float fGridSize = pow(2.0f, float(MAX_DEPTH));
 	// float3 octreeSize = octreeMax - octreeMin;
-	
-	auto insertPoint = [&](Point point){
+
+	// point: where it goes (as doCounting saw it); stored: what is written
+	auto insertPoint = [&](Point point, StoredPoint stored){
 		// node coordinate at MAX_DEPTH
 		uint32_t X = fGridSize * (point.x - octreeMin.x) / octreeSize;
 		uint32_t Y = fGridSize * (point.y - octreeMin.y) / octreeSize;
@@ -621,12 +627,14 @@ void insertPoints(
 			return;
 		}
 
-		chunk->points[pointInChunkIndex] = point;
+		chunk->points[pointInChunkIndex] = stored;
 	};
 
 	// INSERT POINTS FROM CURRENT BATCH
 	processRange(numPoints, [&](int pointID){
-		Point point = points[pointID];
+		// placed as stored, as doCounting placed it
+		StoredPoint stored = g_codec.encode(points[pointID]);
+		Point point = g_codec.decode(stored);
 
 		// voxel occupancy grid (apply_voxel_grid.ps1). Every batch point
 		// passes through here exactly once. Spilled points re-enter through
@@ -640,7 +648,7 @@ void insertPoints(
 			}
 		}
 
-		insertPoint(point);
+		insertPoint(point, stored);
 	});
 
 	grid.sync();
@@ -654,9 +662,10 @@ void insertPoints(
 			return;
 		}
 
-		Point point = spilledPoints[pointID];
+		// placed by its decoded position, as doCounting placed it; kept as stored
+		StoredPoint stored = spilledPoints[pointID];
 
-		insertPoint(point);
+		insertPoint(g_codec.decode(stored), stored);
 	});
 
 	grid.sync();
@@ -717,7 +726,7 @@ void insertVoxels(int batchIndex){
 
 		uint32_t chunkLocalVoxelIndex = voxelIndex % POINTS_PER_CHUNK;
 
-		chunk->points[chunkLocalVoxelIndex] = voxel;
+		chunk->points[chunkLocalVoxelIndex] = g_codec.encode(voxel);
 	});
 }
 
@@ -727,7 +736,7 @@ void addBatch(
 	float3 octreeMin, float3 octreeMax, float octreeSize,
 	Node* nodes, 
 	Node** spillingNodes, uint32_t* numSpillingNodes,
-	Point* spilledPoints, uint32_t* numSpilledPoints
+	StoredPoint* spilledPoints, uint32_t* numSpilledPoints
 ){
 
 	auto grid = cg::this_grid();
@@ -858,6 +867,9 @@ void kernel_construct(
 	_gridZ     = uniforms.gridZ;
 	_cellSize  = uniforms.cellSize;
 
+	// every thread writes the same value; the box is fixed for a load
+	g_codec    = PointCodec::forBox(uniforms.boxMin, uniforms.boxMax);
+
 	Allocator _allocator(buffer, 0);
 	allocator = &_allocator;
 	allocator_persistent = (AllocatorGlobal*)buffer_persistent;
@@ -883,7 +895,7 @@ void kernel_construct(
 	// Points from spilled&split nodes that need to be redistributed to the new leaves
 	// It's quite large because in the worst case, a single point can trigger
 	// <MAX_POINTS_PER_NODE> points to be spilled
-	Point* spilledPoints = allocator->alloc<Point*>(CONSTRUCT_SPILLED_POINTS * sizeof(Point));
+	StoredPoint* spilledPoints = allocator->alloc<StoredPoint*>(CONSTRUCT_SPILLED_POINTS * sizeof(StoredPoint));
 	uint32_t* numSpilledPoints = allocator->alloc<uint32_t*>(4);
 
 	// One entry for every point chunk the octree pool can hold: chunks freed by

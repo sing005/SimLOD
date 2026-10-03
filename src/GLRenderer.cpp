@@ -28,6 +28,8 @@ void error_callback(int error, const char* description){
 
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods){
 
+	if(GLRenderer::inputLocked) return;
+
 	cout << "key: " << key << ", scancode: " << scancode << ", action: " << action << ", mods: " << mods << endl;
 
 	if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
@@ -41,7 +43,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 
 static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos){
 	ImGuiIO& io = ImGui::GetIO();
-	if(io.WantCaptureMouse){
+	if(io.WantCaptureMouse || GLRenderer::inputLocked){
 		return;
 	}
 	
@@ -52,7 +54,7 @@ static void cursor_position_callback(GLFWwindow* window, double xpos, double ypo
 
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset){
 	ImGuiIO& io = ImGui::GetIO();
-	if(io.WantCaptureMouse){
+	if(io.WantCaptureMouse || GLRenderer::inputLocked){
 		return;
 	}
 
@@ -71,7 +73,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 	// cout << "start button: " << button << ", action: " << action << ", mods: " << mods << endl;
 
 	ImGuiIO& io = ImGui::GetIO();
-	if(io.WantCaptureMouse){
+	if(io.WantCaptureMouse || GLRenderer::inputLocked){
 		return;
 	}
 
@@ -109,7 +111,7 @@ void GLRenderer::init(){
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 	glfwWindowHint(GLFW_DECORATED, true);
 	glfwWindowHint(GLFW_RESIZABLE, true);
-	glfwWindowHint(GLFW_VISIBLE, true);
+	glfwWindowHint(GLFW_VISIBLE, !startHidden);
 
 	int numMonitors;
 	GLFWmonitor** monitors = glfwGetMonitors(&numMonitors);
