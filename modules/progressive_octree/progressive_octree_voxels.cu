@@ -636,6 +636,9 @@ void insertPoints(
 		StoredPoint stored = g_codec.encode(points[pointID]);
 		Point point = g_codec.decode(stored);
 
+		// every batch point passes here once: count those the box clamped
+		if(g_codec.outside(points[pointID])) atomicAdd(&stats->numClampedPoints, 1);
+
 		// voxel occupancy grid (apply_voxel_grid.ps1). Every batch point
 		// passes through here exactly once. Spilled points re-enter through
 		// the loop below and are deliberately NOT counted again.
