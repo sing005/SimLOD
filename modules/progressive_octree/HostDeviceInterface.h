@@ -163,6 +163,23 @@ struct Uniforms{
 	int      lightSteps;        // cells marched toward the light
 	int      lightDirty;        // 1 = rebuild the transmittance grid this frame
 
+	// blown-out colour repair: the scanner's camera whites out the sunlit canopy
+	uint64_t colourGridPtr;     // per occupancy cell, uint64: see render.cu, colour repair
+	int      whiteFix;          // 1 = recolour blown-out points from their neighbours
+	float    whiteLevel;        // darkest channel at or above this ...
+	float    whiteSpread;       // ... and channels within this of each other = blown out
+	int      whiteReach;        // cells searched for a colour when a cell has none
+	float    tintMargin;        // blue above green by more than this = sky cast; 0 = off
+
+	// torch: a spotlight from the camera, aimed through the mouse pixel
+	int      torchOn;
+	float    torchX;            // frame pixel the torch points through (y up, as pickY)
+	float    torchY;
+	float    torchIntensity;    // added light at the beam centre, 1 m away
+	float    torchCosInner;     // cos of the half-angle of the full-strength core
+	float    torchCosOuter;     // cos of the half-angle where the beam ends
+	float    torchRange;        // metres at which the light has fallen to half
+
 	// regroup (apply_regroup.ps1)
 	int      lightOn;           // key light switch
 	float    nearClip;          // metres: points nearer than this are not drawn
@@ -194,13 +211,7 @@ struct Uniforms{
 	float    belowG;
 	float    belowB;
 
-	// find the checkerboards (fix_walk_targets.ps1)
-	int      findTargets;       // 1 = paint bright points magenta
-	float    findThreshold;     // sRGB byte value all three channels must exceed
 	float    markerScale;       // marker cluster size, metres
-	float    findGrey;          // max allowed spread between R, G and B
-	int      findIsolate;       // 1 = draw ONLY matches, everything else hidden
-	int      findBoost;         // extra splat pixels for a match
 	float    horizonSoftness;   // degrees the sky-to-void blend spans; 0 = hard edge
 	float eventX[MAX_EVENTS];
 	float eventY[MAX_EVENTS];
@@ -231,7 +242,6 @@ struct Stats{
 	uint32_t numDrawn                   = 0;   // apply_sweep_fixes.ps1
 	uint64_t stageNs[8]                 = {0,0,0,0,0,0,0,0};   // apply_stage_timers.ps1: ns since kernel start at each stage boundary
 	int      pickValid                  = 0;   // apply_navigate.ps1: a pick landed on geometry
-	uint32_t numTargets                 = 0;   // fix_find_targets.ps1: points matching the target test
 	float    pickWX                     = 0;   // its position, renderer frame
 	float    pickWY                     = 0;
 	float    pickWZ                     = 0;

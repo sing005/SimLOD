@@ -108,19 +108,9 @@ void sampleVoxel(Node* node,
 		// first point in cell!
 		atomicAdd(&node->numVoxels, 1);
 
-		float nodeSize = octreeSize / pow(2.0f, float(node->level));
-
-		// node-min
-		float nodeMin_x = (float(node->X) + 0.0f) * nodeSize + octreeMin.x;
-		float nodeMin_y = (float(node->Y) + 0.0f) * nodeSize + octreeMin.y;
-		float nodeMin_z = (float(node->Z) + 0.0f) * nodeSize + octreeMin.z;
-
-		// TODO: QUANTIZE
-		Point voxel;
-		voxel.x = nodeMin_x + nodeSize * (float(pX) + 0.5f) / float(GRID_SIZE);
-		voxel.y = nodeMin_y + nodeSize * (float(pY) + 0.5f) / float(GRID_SIZE);
-		voxel.z = nodeMin_z + nodeSize * (float(pZ) + 0.5f) / float(GRID_SIZE);
-		voxel.color = point.color;
+		// the voxel is the cell's first point, kept at its scanned position;
+		// snapping to the cell centre put LOD levels on a visible lattice
+		Point voxel = point;
 
 		uint32_t backlogIndex = atomicAdd(numBacklogVoxels, 1);
 		backlog_voxels[backlogIndex] = voxel;
