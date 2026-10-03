@@ -434,11 +434,18 @@ inline uint32_t applyTorch(uint32_t lit, uint32_t base, float px, float py, floa
 //   while summing:  R sum <<46 | G sum <<28 | B sum <<10 | count (10 bits)
 //   finished:       COLOUR_OWN  | rgb   (from the cell's own points)
 //                   COLOUR_FILL | rgb   (taken from neighbouring cells)
+//
+// Only a cell's first COLOUR_MAX_TICKETS points are offered as sources: the
+// occupancy count's atomicAdd hands out the tickets, so the cap is exact at no
+// extra cost and the 10-bit count and 18-bit sums (1023 x 255 < 2^18) cannot
+// overflow. The old cap was a plain read before the add, which concurrent
+// blocks raced past: the count wrapped into the blue sum and cells came out
+// in garbage hues, magenta and teal specks in the repaired canopy.
 constexpr uint64_t COLOUR_OWN  = 1ull << 63;
 constexpr uint64_t COLOUR_FILL = 1ull << 62;
-constexpr uint32_t COLOUR_MAX_SAMPLES = 512;
+constexpr uint32_t COLOUR_MAX_TICKETS = 1023;
 constexpr uint32_t COLOUR_MIN_SOURCE  = 60;    // brightest channel a source point needs
-constexpr float    COLOUR_MIN_LUMA    = 85.0f; // repaired colours are lifted to at least this   // keeps the 18-bit sums from overflowing
+constexpr float    COLOUR_MIN_LUMA    = 85.0f; // repaired colours are lifted to at least this
 
 inline bool isBlownOut(uint32_t c){
 	if(uniforms.whiteFix == 0) return false;
@@ -456,7 +463,6 @@ inline bool isBlownOut(uint32_t c){
 }
 
 inline void accumulateColour(uint64_t* cell, uint32_t c){
-	if((*cell & 0x3ffull) >= COLOUR_MAX_SAMPLES) return;   // enough to average
 	// Shadowed points are not a colour source: with an aggressive white test
 	// they were the only "good" points left, and the canopy came out black.
 	uint32_t mx = max((c) & 0xff, max((c >> 8) & 0xff, (c >> 16) & 0xff));
@@ -928,8 +934,8 @@ void countNodeIntoGrid(Chunk* chunk, uint32_t numElements){
 		int cz = int(floorf(point.z / c));
 		if(cx >= 0 && cx < uniforms.gridX && cy >= 0 && cy < uniforms.gridY && cz >= 0 && cz < uniforms.gridZ){
 			uint32_t cell = cx + uniforms.gridX * (cy + uniforms.gridY * cz);
-			atomicAdd(&g[cell], 1u);
-			if(uniforms.colourGridPtr != 0 && !isBlownOut(point.color)){
+			uint32_t ticket = atomicAdd(&g[cell], 1u);   // also caps the colour samples
+			if(uniforms.colourGridPtr != 0 && ticket < COLOUR_MAX_TICKETS && !isBlownOut(point.color)){
 				accumulateColour(((uint64_t*)uniforms.colourGridPtr) + cell, point.color);
 			}
 		}
@@ -1530,10 +1536,9 @@ void drawNodesBoundingBoxes(
 	});
 }
 
-// Capacity of the visibleNodes buffer allocated in kernel_render. Fisheye
-// disables frustum culling, so wide lenses inside a large cloud can exceed it.
-// Writes past the cap are dropped and the count is clamped after visibility.
-constexpr uint32_t MAX_VISIBLE_NODES = 100'000;
+// The visibleNodes buffer allocated in kernel_render holds MAX_VISIBLE_NODES
+// (HostDeviceInterface.h). Writes past the cap are dropped and the count is
+// clamped after visibility.
 
 void compute_visibility_disjunct(
 	uint32_t& numVisibleNodes,
@@ -2037,7 +2042,7 @@ void kernel_render(
 	Allocator _allocator(buffer, 0);
 	allocator = &_allocator;
 
-	Node* visibleNodes                 = allocator->alloc<Node*>(100'000 * sizeof(Node));
+	Node* visibleNodes                 = allocator->alloc<Node*>(uint64_t(MAX_VISIBLE_NODES) * sizeof(Node));
 	uint32_t& numVisibleNodes          = *allocator->alloc<uint32_t*>(4);
 	uint32_t& numVisiblePoints         = *allocator->alloc<uint32_t*>(4);
 	uint32_t& numVisibleVoxels         = *allocator->alloc<uint32_t*>(4);

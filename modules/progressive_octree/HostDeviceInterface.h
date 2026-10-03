@@ -36,6 +36,15 @@ constexpr uint64_t CONSTRUCT_SCRATCH_FIXED_BYTES =
 // which a pool over 16 GB could overflow. The host sizes it from total VRAM.
 constexpr uint64_t CHUNK_BYTES = 12'016;                     // sizeof(Chunk): 1000 12-byte points + header; checked in structures.cuh
 
+// kernel_render's scratch starts with a list of up to MAX_VISIBLE_NODES copies
+// of struct Node. The host sizes that buffer from these (renderBufferBytesFor),
+// so a field added to Node must update NODE_BYTES: when the LOD cross-fade
+// grew Node from 152 to 168 B, every frame under ~2.1 Mpx overran the buffer
+// and drew nothing. Fisheye disables frustum culling, so wide lenses inside a
+// large cloud can exceed the cap; writes past it are dropped.
+constexpr uint32_t MAX_VISIBLE_NODES = 100'000;
+constexpr uint64_t NODE_BYTES        = 168;                  // sizeof(Node); checked in structures.cuh
+
 struct Uniforms{
 	float width;
 	float height;
