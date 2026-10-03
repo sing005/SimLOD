@@ -2586,6 +2586,12 @@ int main(int argc, char** argv){
 	installCrashHandler(g_logPath.c_str());
 	// (abort() and uncaught exceptions are handled there too, with a stack)
 
+	// --hidden: an invisible window for unattended runs; frames still render
+	// offscreen, so --shots works, and nothing appears on the desktop
+	for(int i = 1; i < argc; i++){
+		if(string(argv[i]) == "--hidden") GLRenderer::startHidden = true;
+	}
+
 	auto renderer = make_shared<GLRenderer>();
 	auto cpu = getCpuData();
 	// One loader per hardware thread (was two). LAZ decoding is capped lower,
@@ -2698,6 +2704,8 @@ int main(int argc, char** argv){
 			shotDelay = std::max(0.0, std::atof(argv[++i]));
 		}else if(arg == "--exit"){
 			exitAfterShots = true;
+		}else if(arg == "--hidden"){
+			// applied before the window was created
 		}else if(arg == "--set" && i + 1 < argc){
 			// --set name=value, for the settings that matter most on a small GPU,
 			// and for repeatable screenshots
@@ -2743,6 +2751,7 @@ int main(int argc, char** argv){
 	}
 	if(!shots.empty()){
 		logLine("[shot] %d screenshot(s) after loading, %.1f s each%s\n", int(shots.size()), shotDelay, exitAfterShots ? ", then exit" : "");
+		GLRenderer::inputLocked = true;   // a stray click or scroll would move the shots' camera
 	}else if(exitAfterShots){
 		logLine("[shot] --exit given but there are no screenshots to take; exiting once the load finishes\n");
 	}
@@ -2821,7 +2830,7 @@ int main(int argc, char** argv){
 		// second, so it is the same at any frame rate.
 		{
 			ImGuiIO& io = ImGui::GetIO();
-			if(!io.WantCaptureKeyboard){
+			if(!io.WantCaptureKeyboard && !GLRenderer::inputLocked){
 				float dt = timeSinceLastFrame > 0.0f && timeSinceLastFrame < 0.5f ? timeSinceLastFrame : 0.016f;
 				double d = double(g_walkSpeed) * double(dt);
 				auto held = [](int key){ return Runtime::keyStates[key] > 0; };
@@ -2856,7 +2865,7 @@ int main(int argc, char** argv){
 			double fx = (mx - renderer->presentX) * double(renderer->width)  / double(std::max(renderer->presentWidth, 1));
 			double fy = (my - rectTop)            * double(renderer->height) / double(std::max(renderer->presentHeight, 1));
 			bool onFrame = fx >= 0.0 && fy >= 0.0 && fx < renderer->width && fy < renderer->height;
-			if(((altDown && leftDown && !g_leftWasDown) || (pKey && !g_pKeyWasDown)) && !io.WantCaptureMouse && onFrame){
+			if(((altDown && leftDown && !g_leftWasDown) || (pKey && !g_pKeyWasDown)) && !io.WantCaptureMouse && onFrame && !GLRenderer::inputLocked){
 				g_pickReqX = int(fx);
 				g_pickReqY = renderer->height - 1 - int(fy);
 				g_pickSeq++;

@@ -69,8 +69,83 @@ float4 operator*(const mat4& a, const float4& b){
 	);
 }
 
+// ---- points as stored in the octree: 12 bytes instead of 16 ---------------
+// Position as fixed point across the cloud's bounding box, 22 bits for x and
+// 21 each for y and z, packed into 64 bits; colour as it was. On the full
+// Rotokare scan (213 x 182 x 77 m) the steps are 0.05, 0.09 and 0.04 mm, finer
+// than the LAS files' own 0.1 mm grid. Points and voxels both, so the octree
+// is a quarter smaller. The encoding is the same for the whole cloud: a point
+// that moves to a child when its leaf splits keeps its stored value, and is
+// never decoded and encoded again (float32 cannot round-trip a 22-bit index).
+// Points are placed in the octree by their stored position, decode(encode(p)),
+// never by p itself: kernel_construct relies on a split leaf's points landing
+// in its own children, which a point placed by p near a boundary could miss.
+constexpr int      PACK_X_BITS = 22;
+constexpr int      PACK_Y_BITS = 21;
+constexpr int      PACK_Z_BITS = 64 - PACK_X_BITS - PACK_Y_BITS;
+constexpr uint32_t PACK_X_MAX  = (1u << PACK_X_BITS) - 1u;
+constexpr uint32_t PACK_Y_MAX  = (1u << PACK_Y_BITS) - 1u;
+constexpr uint32_t PACK_Z_MAX  = (1u << PACK_Z_BITS) - 1u;
+
+struct StoredPoint{
+	uint32_t lo;      // x, then the low bits of y
+	uint32_t hi;      // the rest of y, then z
+	uint32_t color;
+};
+static_assert(sizeof(StoredPoint) == 12, "StoredPoint must be 12 bytes");
+
+struct PointCodec{
+	float3 origin;
+	float3 step;      // metres per unit, per axis
+	float3 invStep;
+
+	// From the cloud's box, fixed for a load. A flat axis gets a token extent.
+	static PointCodec forBox(float3 boxMin, float3 boxMax){
+		PointCodec c;
+		c.origin    = boxMin;
+		c.step.x    = fmaxf(boxMax.x - boxMin.x, 1e-3f) / float(PACK_X_MAX);
+		c.step.y    = fmaxf(boxMax.y - boxMin.y, 1e-3f) / float(PACK_Y_MAX);
+		c.step.z    = fmaxf(boxMax.z - boxMin.z, 1e-3f) / float(PACK_Z_MAX);
+		// correctly rounded even under --use_fast_math
+		c.invStep.x = __frcp_rn(c.step.x);
+		c.invStep.y = __frcp_rn(c.step.y);
+		c.invStep.z = __frcp_rn(c.step.z);
+		return c;
+	}
+
+	// nearest unit, clamped to the box (header bounds can be a hair short)
+	static uint32_t quantize(float offset, float invStep, uint32_t maxUnit){
+		float f = offset * invStep + 0.5f;
+		if(!(f > 0.0f)) return 0;
+		if(f >= float(maxUnit)) return maxUnit;
+		return uint32_t(f);
+	}
+
+	StoredPoint encode(const Point& p) const{
+		uint64_t x = quantize(p.x - origin.x, invStep.x, PACK_X_MAX);
+		uint64_t y = quantize(p.y - origin.y, invStep.y, PACK_Y_MAX);
+		uint64_t z = quantize(p.z - origin.z, invStep.z, PACK_Z_MAX);
+		uint64_t v = x | (y << PACK_X_BITS) | (z << (PACK_X_BITS + PACK_Y_BITS));
+		StoredPoint s;
+		s.lo    = uint32_t(v);
+		s.hi    = uint32_t(v >> 32);
+		s.color = p.color;
+		return s;
+	}
+
+	Point decode(const StoredPoint& s) const{
+		uint64_t v = uint64_t(s.lo) | (uint64_t(s.hi) << 32);
+		Point p;
+		p.x     = origin.x + float(uint32_t(v) & PACK_X_MAX) * step.x;
+		p.y     = origin.y + float(uint32_t(v >> PACK_X_BITS) & PACK_Y_MAX) * step.y;
+		p.z     = origin.z + float(uint32_t(v >> (PACK_X_BITS + PACK_Y_BITS))) * step.z;
+		p.color = s.color;
+		return p;
+	}
+};
+
 struct Chunk{
-	Point points[POINTS_PER_CHUNK];
+	StoredPoint points[POINTS_PER_CHUNK];   // scanned points or voxels
 	int size;
 	int padding_0;
 	Chunk* next;

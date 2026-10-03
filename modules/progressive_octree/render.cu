@@ -24,6 +24,7 @@ Allocator* allocator;
 Uniforms uniforms;
 Lines* _lines = nullptr;
 float* _emission = nullptr;   // RGB per pixel, added by apply_emission.ps1
+PointCodec g_codec;           // decodes the octree's stored points; set with uniforms each frame
 uint32_t _numEmitting = 0;    // debug counter, apply_debug_log.ps1
 uint32_t _numDrawn    = 0;    // points that survived the density gate, apply_sweep_fixes.ps1
 uint32_t _numTargets  = 0;    // fix_find_targets.ps1
@@ -693,7 +694,7 @@ void drawNode(Chunk* chunk, Node* node, uint32_t numElements, uint64_t* framebuf
 		}
 
 		int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
-		Point point = chunk->points[pointInChunkIndex];
+		Point point = g_codec.decode(chunk->points[pointInChunkIndex]);
 
 		drawPoint(point, node, framebuffer, minWorldSize);
 
@@ -754,7 +755,7 @@ void countNodeIntoGrid(Chunk* chunk, uint32_t numElements){
 			chunkIndex++;
 		}
 		int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
-		Point point = chunk->points[pointInChunkIndex];
+		Point point = g_codec.decode(chunk->points[pointInChunkIndex]);
 
 		int cx = int(floorf(point.x / c));
 		int cy = int(floorf(point.y / c));
@@ -933,7 +934,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				}
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
-				Point point = chunk->points[pointInChunkIndex];
+				Point point = g_codec.decode(chunk->points[pointInChunkIndex]);
 
 				int x, y, R; float depth; uint32_t color; bool isTarget;
 				if(!hqsAcceptPoint(point, node, 0.0f, x, y, depth, R, color, isTarget)) continue;
@@ -996,7 +997,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				}
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
-				Point point = chunk->points[pointInChunkIndex];
+				Point point = g_codec.decode(chunk->points[pointInChunkIndex]);
 
 				// cull voxels in areas where child nodes are visible
 				float3 posuv = (float3{point.x, point.y, point.z} - nodeMin) / nodeSize;
@@ -1095,7 +1096,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				// if(chunkIndex > (int(10 * uniforms.time) % 50)) break;
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
-				Point point = chunk->points[pointInChunkIndex];
+				Point point = g_codec.decode(chunk->points[pointInChunkIndex]);
 
 				int x, y, R; float depth; uint32_t color; bool isTarget;
 				if(!hqsAcceptPoint(point, node, 0.0f, x, y, depth, R, color, isTarget)) continue;
@@ -1186,7 +1187,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				// if(chunkIndex > (int(10 * uniforms.time) % 30)) break;
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
-				Point point = chunk->points[pointInChunkIndex];
+				Point point = g_codec.decode(chunk->points[pointInChunkIndex]);
 
 				// cull voxels in areas where child nodes are visible
 				float3 posuv = (float3{point.x, point.y, point.z} - nodeMin) / nodeSize;
@@ -1820,7 +1821,10 @@ void kernel_render(
 	// One thread copies the ~2 KB uniforms into the device global. Every thread
 	// used to do it, which on an 80k-thread launch meant ~150 MB of redundant
 	// global stores per frame.
-	if(grid.thread_rank() == 0) uniforms = _uniforms;
+	if(grid.thread_rank() == 0){
+		uniforms = _uniforms;
+		g_codec  = PointCodec::forBox(_uniforms.boxMin, _uniforms.boxMax);   // stored points
+	}
 	grid.sync();
 	Allocator _allocator(buffer, 0);
 	allocator = &_allocator;

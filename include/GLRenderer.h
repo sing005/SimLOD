@@ -199,6 +199,12 @@ struct GLRenderer{
 	int presentHeight = 0;
 	string selectedMethod = "";
 
+	// For unattended runs (--hidden, --shots): create the window invisible,
+	// and ignore mouse and keyboard so a stray click cannot move the camera.
+	// Set before the renderer is constructed / once shots are known.
+	static inline bool startHidden = false;
+	static inline bool inputLocked = false;
+
 	GLRenderer();
 
 	void init();
