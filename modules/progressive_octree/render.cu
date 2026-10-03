@@ -27,7 +27,6 @@ float* _emission = nullptr;   // RGB per pixel, added by apply_emission.ps1
 PointCodec g_codec;           // decodes the octree's stored points; set with uniforms each frame
 uint32_t _numEmitting = 0;    // debug counter, apply_debug_log.ps1
 uint32_t _numDrawn    = 0;    // points that survived the density gate, apply_sweep_fixes.ps1
-uint32_t _numTargets  = 0;    // fix_find_targets.ps1
 
 // ---- warp-aggregated counting (apply_counter_opt.ps1) -------------------
 // A plain atomicAdd(&counter, 1) per point sends 31 MILLION atomics to one
@@ -128,10 +127,13 @@ inline float eventFalloff(float d, float r){
 	float x = d / r;
 	if(x >= 1.0f) return 0.0f;
 
+	// A feathered body plus a narrow gaussian core: bright at the source,
+	// fading smoothly to nothing at the radius. The core used to be a broad
+	// 1/(1+80x^2) lobe that still held a fifth of its strength at x = 0.1.
 	float feather = __powf(1.0f - x, uniforms.falloffPower);
-	float core    = uniforms.coreBoost / (1.0f + 80.0f * x * x);
+	float core    = uniforms.coreBoost * __expf(-x * x * 120.0f);
 
-	return feather * (1.0f + core);
+	return feather + core * 4.0f;
 }
 
 inline void evalEmission(float px, float py, float pz,
@@ -196,28 +198,6 @@ inline bool projectPoint(float px, float py, float pz, int& sx, int& sy, float& 
 	sy = int(uniforms.height * 0.5f + uy * radPx);
 	depth = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
 	return depth > 0.0f;
-}
-
-// ---- survey target test (fix_find_targets.ps1) --------------------------
-// Brightness alone was a poor test: a sunlit leaf and a gap of sky both pass
-// it, and a checkerboard in shade fails. What actually separates a survey
-// target from a forest is that it is ACHROMATIC - black, grey and white, so
-// its three channels are nearly equal - while foliage is strongly green and
-// bark strongly red-brown. Testing the SPREAD between channels finds a target
-// in shadow and rejects a bright leaf.
-//
-// Both halves of a checkerboard qualify: the white squares and the black ones
-// are equally grey. Only the brightness floor decides which side is caught,
-// so a low floor finds the whole board.
-inline bool isSurveyTarget(uint32_t c){
-	if(uniforms.findTargets == 0) return false;
-	float r = float((c      ) & 0xff);
-	float g = float((c >>  8) & 0xff);
-	float b = float((c >> 16) & 0xff);
-	float mx = fmaxf(r, fmaxf(g, b));
-	float mn = fminf(r, fminf(g, b));
-	if(mx < uniforms.findThreshold) return false;   // too dark to judge
-	return (mx - mn) <= uniforms.findGrey;          // achromatic
 }
 
 // ---- pixel to world ray (apply_navigate.ps1) -----------------------------
@@ -385,7 +365,190 @@ inline float lightAt(float px, float py, float pz){
 	if(cx < 0 || cy < 0 || cz < 0) return 1.0f;
 	if(cx >= uniforms.gridX || cy >= uniforms.gridY || cz >= uniforms.gridZ) return 1.0f;
 	const float* g = (const float*)uniforms.lightGridPtr;
-	return g[cx + uniforms.gridX * (cy + uniforms.gridY * cz)];
+
+	// Trilinear between cell centres. One cell per point lit every point in a
+	// 0.35 m cube identically, so light and shadow met in hard-edged blocks.
+	float fx = px / c - 0.5f, fy = py / c - 0.5f, fz = pz / c - 0.5f;
+	int x0 = int(floorf(fx)), y0 = int(floorf(fy)), z0 = int(floorf(fz));
+	float tx = fx - float(x0), ty = fy - float(y0), tz = fz - float(z0);
+	auto at = [&](int x, int y, int z){
+		x = min(max(x, 0), uniforms.gridX - 1);
+		y = min(max(y, 0), uniforms.gridY - 1);
+		z = min(max(z, 0), uniforms.gridZ - 1);
+		return g[x + uniforms.gridX * (y + uniforms.gridY * z)];
+	};
+	float c00 = at(x0, y0,     z0    ) * (1.0f - tx) + at(x0 + 1, y0,     z0    ) * tx;
+	float c10 = at(x0, y0 + 1, z0    ) * (1.0f - tx) + at(x0 + 1, y0 + 1, z0    ) * tx;
+	float c01 = at(x0, y0,     z0 + 1) * (1.0f - tx) + at(x0 + 1, y0,     z0 + 1) * tx;
+	float c11 = at(x0, y0 + 1, z0 + 1) * (1.0f - tx) + at(x0 + 1, y0 + 1, z0 + 1) * tx;
+	float c0  = c00 * (1.0f - ty) + c10 * ty;
+	float c1  = c01 * (1.0f - ty) + c11 * ty;
+	return c0 * (1.0f - tz) + c1 * tz;
+}
+
+// ---- torch -------------------------------------------------------------
+// A spotlight held at the camera and aimed through the mouse pixel. It adds
+// light in proportion to a point's own (repaired) colour, so a lit leaf stays
+// a leaf colour, with a soft-edged cone and inverse-square-like falloff.
+// No shadows: the beam lights what is inside the cone at any depth.
+float3 _torchDir   = {0.0f, 0.0f, 1.0f};   // set once per frame by thread 0
+int    _torchValid = 0;
+
+inline uint32_t applyTorch(uint32_t lit, uint32_t base, float px, float py, float pz){
+	if(uniforms.torchOn == 0 || _torchValid == 0) return lit;
+	float vx = px - uniforms.camPos.x, vy = py - uniforms.camPos.y, vz = pz - uniforms.camPos.z;
+	float d2 = vx*vx + vy*vy + vz*vz;
+	if(d2 < 1e-6f) return lit;
+	float d = sqrtf(d2);
+	float c = (vx * _torchDir.x + vy * _torchDir.y + vz * _torchDir.z) / d;
+	if(c <= uniforms.torchCosOuter) return lit;
+	float t = (c - uniforms.torchCosOuter) / fmaxf(uniforms.torchCosInner - uniforms.torchCosOuter, 1e-4f);
+	t = fminf(t, 1.0f);
+	float spot = t * t * (3.0f - 2.0f * t);
+	float rr = d / fmaxf(uniforms.torchRange, 0.1f);
+	float k = uniforms.torchIntensity * spot / (1.0f + rr * rr);
+	float r = float((lit      ) & 0xff) + k * float((base      ) & 0xff);
+	float g = float((lit >>  8) & 0xff) + k * float((base >>  8) & 0xff);
+	float b = float((lit >> 16) & 0xff) + k * float((base >> 16) & 0xff);
+	uint32_t ri = uint32_t(fminf(r, 255.0f));
+	uint32_t gi = uint32_t(fminf(g, 255.0f));
+	uint32_t bi = uint32_t(fminf(b, 255.0f));
+	return (lit & 0xff000000u) | (bi << 16) | (gi << 8) | ri;
+}
+
+// ---- blown-out colour repair -------------------------------------------
+// The scanner colours each point from its camera, and in the sunlit canopy
+// the camera saturates: leaves and branches come out white or pale grey.
+// Those points are recognisable - every channel high and the three nearly
+// equal - and their geometry is fine, only the colour is lost.
+//
+// While the occupancy grid is rebuilt from the octree, each cell also sums
+// the colour of its well-exposed points. Cells holding only blown points
+// then take the average of the nearest cells that have colour, searched
+// outward shell by shell, so a branch in the bright crown inherits the brown
+// of the bark below it and a leaf cluster the green around it. At draw time
+// a blown point takes its position's colour from the grid, interpolated
+// between cells, with a little per-point variation so a patch keeps texture.
+//
+// Cell layout, uint64:
+//   while summing:  R sum <<46 | G sum <<28 | B sum <<10 | count (10 bits)
+//   finished:       COLOUR_OWN  | rgb   (from the cell's own points)
+//                   COLOUR_FILL | rgb   (taken from neighbouring cells)
+constexpr uint64_t COLOUR_OWN  = 1ull << 63;
+constexpr uint64_t COLOUR_FILL = 1ull << 62;
+constexpr uint32_t COLOUR_MAX_SAMPLES = 512;
+constexpr uint32_t COLOUR_MIN_SOURCE  = 60;    // brightest channel a source point needs
+constexpr float    COLOUR_MIN_LUMA    = 85.0f; // repaired colours are lifted to at least this   // keeps the 18-bit sums from overflowing
+
+inline bool isBlownOut(uint32_t c){
+	if(uniforms.whiteFix == 0) return false;
+	float r = float((c      ) & 0xff);
+	float g = float((c >>  8) & 0xff);
+	float b = float((c >> 16) & 0xff);
+	float mx = fmaxf(r, fmaxf(g, b));
+	float mn = fminf(r, fminf(g, b));
+	if(mn >= uniforms.whiteLevel && (mx - mn) <= uniforms.whiteSpread) return true;
+	// Sky cast: the same saturation leaves lilac, pink and blue points, the
+	// sky bleeding into the camera's pixel. Bark (r > g > b) and foliage
+	// (g highest) never have more blue than green, so that alone marks them.
+	if(uniforms.tintMargin > 0.0f && mx >= 40.0f && b > g + uniforms.tintMargin) return true;
+	return false;
+}
+
+inline void accumulateColour(uint64_t* cell, uint32_t c){
+	if((*cell & 0x3ffull) >= COLOUR_MAX_SAMPLES) return;   // enough to average
+	// Shadowed points are not a colour source: with an aggressive white test
+	// they were the only "good" points left, and the canopy came out black.
+	uint32_t mx = max((c) & 0xff, max((c >> 8) & 0xff, (c >> 16) & 0xff));
+	if(mx < COLOUR_MIN_SOURCE) return;
+	uint64_t r = (c      ) & 0xff;
+	uint64_t g = (c >>  8) & 0xff;
+	uint64_t b = (c >> 16) & 0xff;
+	atomicAdd((unsigned long long*)cell, (unsigned long long)((r << 46) | (g << 28) | (b << 10) | 1ull));
+}
+
+// Called by refillVoxelGrid once every point is counted. Two passes, so the
+// fill reads only cells finished by the first and never one it is writing.
+void finishColourGrid(){
+	if(uniforms.colourGridPtr == 0) return;
+	auto grid = cg::this_grid();
+	uint64_t* cg64 = (uint64_t*)uniforms.colourGridPtr;
+	const uint32_t* occ = (const uint32_t*)uniforms.voxelGridPtr;
+	int numCells = uniforms.gridX * uniforms.gridY * uniforms.gridZ;
+
+	processRange(0, numCells, [&](int i){
+		uint64_t v = cg64[i];
+		uint64_t n = v & 0x3ffull;
+		if(n == 0){ cg64[i] = 0; return; }
+		uint64_t r = ((v >> 46) & 0x3ffffull) / n;
+		uint64_t g = ((v >> 28) & 0x3ffffull) / n;
+		uint64_t b = ((v >> 10) & 0x3ffffull) / n;
+		cg64[i] = COLOUR_OWN | (b << 16) | (g << 8) | r;
+	});
+	grid.sync();
+
+	int reach = uniforms.whiteReach;
+	processRange(0, numCells, [&](int i){
+		if(cg64[i] != 0 || occ[i] == 0) return;   // has colour, or nothing to colour
+		int x = i % uniforms.gridX;
+		int y = (i / uniforms.gridX) % uniforms.gridY;
+		int z = i / (uniforms.gridX * uniforms.gridY);
+		for(int d = 1; d <= reach; d++){
+			uint32_t sr = 0, sg = 0, sb = 0, n = 0;
+			for(int dz = -d; dz <= d; dz++)
+			for(int dy = -d; dy <= d; dy++)
+			for(int dx = -d; dx <= d; dx++){
+				if(max(abs(dx), max(abs(dy), abs(dz))) != d) continue;   // this shell only
+				int qx = x + dx, qy = y + dy, qz = z + dz;
+				if(qx < 0 || qy < 0 || qz < 0 || qx >= uniforms.gridX || qy >= uniforms.gridY || qz >= uniforms.gridZ) continue;
+				uint64_t q = cg64[qx + uniforms.gridX * (qy + uniforms.gridY * qz)];
+				if((q & COLOUR_OWN) == 0) continue;
+				sr += (q      ) & 0xff;
+				sg += (q >>  8) & 0xff;
+				sb += (q >> 16) & 0xff;
+				n++;
+			}
+			if(n > 0){
+				cg64[i] = COLOUR_FILL | (uint64_t(sb / n) << 16) | (uint64_t(sg / n) << 8) | uint64_t(sr / n);
+				return;
+			}
+		}
+	});
+	grid.sync();
+}
+
+// Colour for a blown-out point at this position, or the point's own colour
+// if the grid has nothing nearby. Trilinear over the cells that have colour.
+inline uint32_t repairColour(uint32_t c, float px, float py, float pz){
+	if(uniforms.colourGridPtr == 0 || !isBlownOut(c)) return c;
+	const uint64_t* g = (const uint64_t*)uniforms.colourGridPtr;
+	float cs = uniforms.cellSize;
+	float fx = px / cs - 0.5f, fy = py / cs - 0.5f, fz = pz / cs - 0.5f;
+	int x0 = int(floorf(fx)), y0 = int(floorf(fy)), z0 = int(floorf(fz));
+	float tx = fx - float(x0), ty = fy - float(y0), tz = fz - float(z0);
+	float sr = 0.0f, sg = 0.0f, sb = 0.0f, sw = 0.0f;
+	for(int k = 0; k < 8; k++){
+		int x = x0 + (k & 1), y = y0 + ((k >> 1) & 1), z = z0 + (k >> 2);
+		if(x < 0 || y < 0 || z < 0 || x >= uniforms.gridX || y >= uniforms.gridY || z >= uniforms.gridZ) continue;
+		uint64_t q = g[x + uniforms.gridX * (y + uniforms.gridY * z)];
+		if((q & (COLOUR_OWN | COLOUR_FILL)) == 0) continue;
+		float w = ((k & 1) ? tx : 1.0f - tx) * (((k >> 1) & 1) ? ty : 1.0f - ty) * ((k >> 2) ? tz : 1.0f - tz);
+		sr += w * float((q      ) & 0xff);
+		sg += w * float((q >>  8) & 0xff);
+		sb += w * float((q >> 16) & 0xff);
+		sw += w;
+	}
+	if(sw <= 1e-4f) return c;
+	// per-point variation, +-12%, stable for a given position
+	uint32_t h = insectHash(__float_as_uint(px) ^ insectHash(__float_as_uint(py) ^ insectHash(__float_as_uint(pz))));
+	float v = (0.88f + 0.24f * insectUnit(h)) / sw;
+	// brightness floor: a borrowed colour is never darker than a mid-tone leaf
+	float luma = (0.299f * sr + 0.587f * sg + 0.114f * sb) / sw;
+	if(luma > 1.0f && luma < COLOUR_MIN_LUMA) v *= COLOUR_MIN_LUMA / luma;
+	uint32_t r  = uint32_t(fminf(sr * v, 255.0f));
+	uint32_t gg = uint32_t(fminf(sg * v, 255.0f));
+	uint32_t b  = uint32_t(fminf(sb * v, 255.0f));
+	return (c & 0xff000000u) | (b << 16) | (gg << 8) | r;
 }
 
 // Combine the key light with an ambient floor. Backlit foliage goes toward the
@@ -396,7 +559,7 @@ inline uint32_t applyKeyLight(uint32_t c, float trans){
 	// brightest fully-lit point cannot exceed 2x its own colour, which is
 	// plenty and stops strength 4 turning foliage into flat yellow.
 	float k = uniforms.ambient + (1.0f - uniforms.ambient) * trans * uniforms.lightIntensity;
-	if(k > 2.0f) k = 2.0f;
+	if(k > 4.0f) k = 4.0f;
 	float r = float((c      ) & 0xff) * k * uniforms.lightR;
 	float g = float((c >>  8) & 0xff) * k * uniforms.lightG;
 	float b = float((c >> 16) & 0xff) * k * uniforms.lightB;
@@ -465,17 +628,20 @@ inline void drawMarkerBall(float px, float py, float pz, uint64_t* framebuffer){
 inline int splatRadiusPx(float depth, float minWorldSize){
 	if(uniforms.pointWorldSize <= 0.0f && minWorldSize <= 0.0f) return uniforms.pointSize;
 	float pxPerMetre = pxPerMetreAt(depth);
-	int R = uniforms.pointWorldSize > 0.0f ? int(uniforms.pointWorldSize * pxPerMetre + 0.5f) : uniforms.pointSize;
-	int Rmin = int(ceilf(minWorldSize * pxPerMetre));
-	if(R < Rmin) R = Rmin;
+	// A voxel is drawn at least its cell spacing, so a coarse node has no
+	// holes, but no larger than that: adding the spacing to the point size made
+	// coarse nodes' splats far bigger than their neighbours' leaf points, and
+	// every node boundary between two levels showed as a patch.
+	float worldSize = fmaxf(uniforms.pointWorldSize > 0.0f ? uniforms.pointWorldSize : 0.0f, minWorldSize);
+	int R = worldSize > 0.0f ? int(worldSize * pxPerMetre + 0.5f) : uniforms.pointSize;
 	if(R < 1) R = 1;
 	if(R > uniforms.maxSplatPx) R = uniforms.maxSplatPx;
 	return R;
 }
 
-// Smallest splat for the voxels of a node of this size: the cell spacing
-// times sqrt(2), so a round splat reaches its cell's corners.
-constexpr float VOXEL_SPLAT_COVER = 1.42f;
+// Smallest splat for the voxels of a node of this size: one cell spacing, so
+// neighbouring voxels close up into a surface.
+constexpr float VOXEL_SPLAT_COVER = 1.0f;
 inline float voxelSplatMetres(float nodeSize){
 	return VOXEL_SPLAT_COVER * nodeSize / float(GRID_SIZE);
 }
@@ -532,8 +698,6 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 		else if(stray) return;
 		countUp(&_numDrawn);     // on-screen points that pass density and the cull
 
-		bool isTarget = false;   // fix_find_targets.ps1: needed later for the size boost,
-		                         // so it must live outside the colour if/else below
 		uint32_t color = point.color;
 		if(uniforms.colorByNode){
 			color = (node->getID() % 127) * 123456789ull;
@@ -544,15 +708,10 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 			// the lowest point takes the ground colour. z is in the translated
 			// frame, so the lowest point is at 0.
 			// (ground band removed by apply_navigate.ps1: points keep their scanned colour)
-			// Find the checkerboards (fix_walk_targets.ps1): a survey target is
-			// white, and nothing else in a forest is. Paint anything whose
-			// three channels all clear the threshold in magenta, before the
-			// light touches it, so it stays visible in shadow.
-			isTarget = isSurveyTarget(color);
-			if(isTarget) countUp(&_numTargets);
-			if(uniforms.findIsolate != 0 && uniforms.findTargets != 0 && !isTarget) return;
+			color = repairColour(color, point.x, point.y, point.z);   // blown-out canopy
+			uint32_t base = color;
 			if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated: no grid read while off
-			if(isTarget) color = 0x00ff00ffu;   // magenta, full brightness
+			color = applyTorch(color, base, point.x, point.y, point.z);
 		}
 
 		// float w = y - 3.0 * x;
@@ -573,7 +732,6 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 		// in +x/+y, so the splat sat below-right of the point. Clamp to
 		// width-1/height-1 also closes a latent one-past-the-end write.
 		int   R    = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
-		if(isTarget) R += uniforms.findBoost;   // fix_find_targets.ps1: a 15 cm board is sub-pixel from 30 m
 		float half = float(R - 1) * 0.5f;
 		float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
 
@@ -612,6 +770,18 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 	}
 }
 
+// LOD cross-fade (see the disjunct visibility pass): a stable per-sample
+// dither, so the same samples stay drawn from frame to frame. A parent
+// fading out keeps samples at or above the blend, its children fading in keep
+// those below it, so together they cover the area at every blend.
+inline bool lodKeep(const Node* node, int index){
+	if(node->lodRole == 0) return true;
+	uint32_t h = insectHash(uint32_t(index) * 0x9E3779B9u
+	                      ^ node->X * 73856093u ^ node->Y * 19349663u ^ node->Z * 83492791u ^ node->level);
+	float u = insectUnit(h);
+	return node->lodRole == 1 ? (u >= node->lodBlend) : (u < node->lodBlend);
+}
+
 // Point density as a loop stride: keep every step-th point.
 inline int densityStep(){
 	if(uniforms.pointDensity >= 0.999f) return 1;
@@ -624,12 +794,11 @@ inline int densityStep(){
 // The depth pass and the colour pass must agree exactly on which points exist,
 // where they land and how large they are, or the depth test hides points the
 // colour pass then cannot draw. The four loops used to repeat this inline and
-// had drifted: find/isolate and the target size boost were in the colour pass
-// only, so isolated targets behind foliage stayed hidden.
+// had drifted.
 // minWorldSize: see splatRadiusPx; 0 for scanned points. Both passes must pass
 // the same value for the same sample.
 inline bool hqsAcceptPoint(const Point& point, Node* node, float minWorldSize,
-                           int& x, int& y, float& depth, int& R, uint32_t& color, bool& isTarget){
+                           int& x, int& y, float& depth, int& R, uint32_t& color){
 	if(!projectPoint(point.x, point.y, point.z, x, y, depth)) return false;   // apply_fisheye.ps1
 	if(!(depth > 0.0f) || depth < uniforms.nearClip) return false;
 	if(!(x > 1 && x < uniforms.width  - 2.0)) return false;
@@ -650,11 +819,7 @@ inline bool hqsAcceptPoint(const Point& point, Node* node, float minWorldSize,
 		color = (node->getID() % 127) * 123456789;
 	}
 
-	isTarget = isSurveyTarget(color);
-	if(uniforms.findIsolate != 0 && uniforms.findTargets != 0 && !isTarget) return false;
-
 	R = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
-	if(isTarget) R += uniforms.findBoost;   // fix_find_targets.ps1
 	return true;
 }
 
@@ -694,6 +859,7 @@ void drawNode(Chunk* chunk, Node* node, uint32_t numElements, uint64_t* framebuf
 		}
 
 		int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
+		if(!lodKeep(node, pointIndex)) continue;   // LOD cross-fade
 		Point point = g_codec.decode(chunk->points[pointInChunkIndex]);
 
 		drawPoint(point, node, framebuffer, minWorldSize);
@@ -761,7 +927,11 @@ void countNodeIntoGrid(Chunk* chunk, uint32_t numElements){
 		int cy = int(floorf(point.y / c));
 		int cz = int(floorf(point.z / c));
 		if(cx >= 0 && cx < uniforms.gridX && cy >= 0 && cy < uniforms.gridY && cz >= 0 && cz < uniforms.gridZ){
-			atomicAdd(&g[cx + uniforms.gridX * (cy + uniforms.gridY * cz)], 1u);
+			uint32_t cell = cx + uniforms.gridX * (cy + uniforms.gridY * cz);
+			atomicAdd(&g[cell], 1u);
+			if(uniforms.colourGridPtr != 0 && !isBlownOut(point.color)){
+				accumulateColour(((uint64_t*)uniforms.colourGridPtr) + cell, point.color);
+			}
 		}
 	}
 }
@@ -776,6 +946,7 @@ void refillVoxelGrid(Node* nodes){
 	// zero first: a refill must not add to whatever was already there
 	processRange(0, uniforms.gridX * uniforms.gridY * uniforms.gridZ, [&](int i){
 		((uint32_t*)uniforms.voxelGridPtr)[i] = 0;
+		if(uniforms.colourGridPtr != 0) ((uint64_t*)uniforms.colourGridPtr)[i] = 0;
 	});
 	grid.sync();
 
@@ -800,6 +971,8 @@ void refillVoxelGrid(Node* nodes){
 		block.sync();
 	}
 	grid.sync();
+
+	finishColourGrid();
 }
 
 void drawNodes(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
@@ -934,10 +1107,11 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				}
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
+				if(!lodKeep(node, pointIndex)) continue;   // LOD cross-fade
 				Point point = g_codec.decode(chunk->points[pointInChunkIndex]);
 
-				int x, y, R; float depth; uint32_t color; bool isTarget;
-				if(!hqsAcceptPoint(point, node, 0.0f, x, y, depth, R, color, isTarget)) continue;
+				int x, y, R; float depth; uint32_t color;
+				if(!hqsAcceptPoint(point, node, 0.0f, x, y, depth, R, color)) continue;
 				{
 					// HQS depth pass, brought into line with drawPoint by
 					// apply_test_source.ps1: centred, optionally round, and
@@ -997,6 +1171,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				}
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
+				if(!lodKeep(node, pointIndex)) continue;   // LOD cross-fade
 				Point point = g_codec.decode(chunk->points[pointInChunkIndex]);
 
 				// cull voxels in areas where child nodes are visible
@@ -1015,8 +1190,8 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				// 	if(node->children[childIndex]->visible) continue;
 				// }
 
-				int x, y, R; float depth; uint32_t color; bool isTarget;
-				if(!hqsAcceptPoint(point, node, voxelSplatMetres(nodeSize), x, y, depth, R, color, isTarget)) continue;
+				int x, y, R; float depth; uint32_t color;
+				if(!hqsAcceptPoint(point, node, voxelSplatMetres(nodeSize), x, y, depth, R, color)) continue;
 				{
 
 					// HQS depth pass, brought into line with drawPoint by
@@ -1096,14 +1271,16 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				// if(chunkIndex > (int(10 * uniforms.time) % 50)) break;
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
+				if(!lodKeep(node, pointIndex)) continue;   // LOD cross-fade
 				Point point = g_codec.decode(chunk->points[pointInChunkIndex]);
 
-				int x, y, R; float depth; uint32_t color; bool isTarget;
-				if(!hqsAcceptPoint(point, node, 0.0f, x, y, depth, R, color, isTarget)) continue;
+				int x, y, R; float depth; uint32_t color;
+				if(!hqsAcceptPoint(point, node, 0.0f, x, y, depth, R, color)) continue;
 				{
-					if(isTarget) countUp(&_numTargets);
+					if(!uniforms.colorByNode && !uniforms.colorByLOD) color = repairColour(color, point.x, point.y, point.z);   // blown-out canopy
+					uint32_t base = color;
 					if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
-					if(isTarget) color = 0x00ff00ffu;
+					color = applyTorch(color, base, point.x, point.y, point.z);
 					uint8_t* rgba = (uint8_t*)&color;
 
 					// HQS colour pass (apply_test_source.ps1): the same splat as
@@ -1187,6 +1364,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				// if(chunkIndex > (int(10 * uniforms.time) % 30)) break;
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
+				if(!lodKeep(node, pointIndex)) continue;   // LOD cross-fade
 				Point point = g_codec.decode(chunk->points[pointInChunkIndex]);
 
 				// cull voxels in areas where child nodes are visible
@@ -1205,13 +1383,14 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 					if(childIsVisible) continue;
 				}
 
-				int x, y, R; float depth; uint32_t color; bool isTarget;
-				if(!hqsAcceptPoint(point, node, voxelSplatMetres(nodeSize), x, y, depth, R, color, isTarget)) continue;
+				int x, y, R; float depth; uint32_t color;
+				if(!hqsAcceptPoint(point, node, voxelSplatMetres(nodeSize), x, y, depth, R, color)) continue;
 				{
 
-					if(isTarget) countUp(&_numTargets);
+					if(!uniforms.colorByNode && !uniforms.colorByLOD) color = repairColour(color, point.x, point.y, point.z);   // blown-out canopy
+					uint32_t base = color;
 					if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
-					if(isTarget) color = 0x00ff00ffu;
+					color = applyTorch(color, base, point.x, point.y, point.z);
 					uint8_t* rgba = (uint8_t*)&color;
 
 					// HQS colour pass (apply_test_source.ps1): the same splat as
@@ -1412,10 +1591,12 @@ void compute_visibility_disjunct(
 	}
 	grid.sync();
 
-	auto makeVisible = [&](Node* node){
+	auto makeVisible = [&](Node* node, uint32_t lodRole, float lodBlend){
 		uint32_t visibleNodeIndex = atomicAdd(&numVisibleNodes, 1);
 		if(visibleNodeIndex >= MAX_VISIBLE_NODES) return;
 		visibleNodes[visibleNodeIndex] = *node;
+		visibleNodes[visibleNodeIndex].lodRole  = lodRole;
+		visibleNodes[visibleNodeIndex].lodBlend = lodBlend;
 
 		if(node->numPoints > 0){
 			atomicAdd(&numVisibleLeaves, 1);
@@ -1552,6 +1733,7 @@ void compute_visibility_disjunct(
 
 		node->visible = visible;
 		node->isLarge = dx > 2.0 * uniforms.minNodeSize || dy > 2.0 * uniforms.minNodeSize;
+		node->screenSize = fmaxf(dx, dy);
 
 		// if(strequal(node->name, "r")){
 
@@ -1617,11 +1799,34 @@ void compute_visibility_disjunct(
 				if(child->isLarge) continue;
 				if(!child->visible) continue;
 
-				makeVisible(child);
-				// printf("test \n");
+				// Cross-fade across the level switch. A drawn node refines once
+				// it passes 2 x minNodeSize on screen. From 1 x upward its own
+				// samples thin out while its children's fill in, so at the
+				// switch it is already fully replaced and nothing pops, and
+				// neighbouring nodes at different levels meet with matching
+				// density instead of a hard edge.
+				float t = 0.0f;
+				if(!child->isLeafFn()){
+					t = child->screenSize / uniforms.minNodeSize - 1.0f;
+					t = fminf(fmaxf(t, 0.0f), 1.0f);
+					t = t * t * (3.0f - 2.0f * t);
+				}
+
+				if(t <= 0.0f){
+					makeVisible(child, 0, 0.0f);
+					continue;
+				}
+
+				makeVisible(child, 1, t);
+				for(int j = 0; j < 8; j++){
+					Node* gc = child->children[j];
+					if(gc == nullptr || !gc->visible) continue;
+					if(gc->numPoints == 0 && gc->numVoxels == 0) continue;
+					makeVisible(gc, 2, t);
+				}
 			}
 		}else if(node->isLarge && node->isLeafFn() && node->visible){
-			makeVisible(node);
+			makeVisible(node, 0, 0.0f);
 		}
 	});
 }
@@ -1824,6 +2029,9 @@ void kernel_render(
 	if(grid.thread_rank() == 0){
 		uniforms = _uniforms;
 		g_codec  = PointCodec::forBox(_uniforms.boxMin, _uniforms.boxMax);   // stored points
+		float3 td;
+		_torchValid = (uniforms.torchOn != 0 && pixelRayDir(uniforms.torchX + 0.5f, uniforms.torchY + 0.5f, td)) ? 1 : 0;
+		if(_torchValid) _torchDir = td;
 	}
 	grid.sync();
 	Allocator _allocator(buffer, 0);
@@ -1878,7 +2086,7 @@ void kernel_render(
 		return;
 	}
 
-	if(grid.thread_rank() == 0){ _numEmitting = 0; _numDrawn = 0; _numTargets = 0; }
+	if(grid.thread_rank() == 0){ _numEmitting = 0; _numDrawn = 0; }
 
 	// Recount the occupancy grid first: the light grid below is derived from
 	// these counts, and the host requests both together after a reallocation.
@@ -2065,7 +2273,6 @@ void kernel_render(
 		stats->frameID          = uniforms.frameCounter;
 		stats->numEmitting      = _numEmitting;
 		stats->numDrawn         = _numDrawn;
-		stats->numTargets       = _numTargets;
 	}
 
 	// if(false)
@@ -2492,9 +2699,10 @@ void kernel_render(
 		// result is round, smooth at any width, and roughly thirty times cheaper.
 		// Bloom radius now chooses how many levels to use rather than a sigma.
 		int mipW[8], mipH[8], mipOff[8];
-		int numMips = 2 + int(uniforms.bloomRadius);
+		// spread 0 keeps only the half-resolution level: a tight halo
+		int numMips = 1 + int(uniforms.bloomRadius);
 		if(numMips > 7) numMips = 7;
-		if(numMips < 2) numMips = 2;
+		if(numMips < 1) numMips = 1;
 		{
 			int off = 0;
 			for(int L = 0; L < numMips; L++){

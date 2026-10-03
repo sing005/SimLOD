@@ -196,6 +196,14 @@ struct Node{
 	uint32_t numVoxels = 0;
 	uint32_t numVoxelsStored = 0;
 
+	// LOD cross-fade, set per frame on the render kernel's visible copies only.
+	// screenSize: projected size in px from the visibility pass.
+	// lodRole 0 draws every sample; 1 is a parent fading out (keeps samples
+	// whose hash is >= lodBlend); 2 a child fading in (hash < lodBlend).
+	float screenSize = 0.0f;
+	float lodBlend = 0.0f;
+	uint32_t lodRole = 0;
+
 	// bool spilled(){
 	// 	return counter > MAX_POINTS_PER_NODE;
 	// }
