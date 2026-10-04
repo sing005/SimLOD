@@ -180,9 +180,30 @@ struct GLRenderer{
 
 	vector<function<void(vector<string>)>> fileDropListeners;
 
+	// width x height is the size frames are rendered at: the window's, unless
+	// renderWidth x renderHeight is set (e.g. 3840 x 2160 for a 4K frame on a
+	// smaller screen, or a smaller frame scaled up). Frames are scaled to the
+	// window, windowWidth x windowHeight, when presented; the UI is drawn at
+	// window size on top.
 	int width = 0;
 	int height = 0;
+	int windowWidth = 0;
+	int windowHeight = 0;
+	int renderWidth = 0;
+	int renderHeight = 0;
+	// where the frame lands in the window, in GL window coordinates (origin
+	// bottom left): all of it, or letterboxed when the shapes differ
+	int presentX = 0;
+	int presentY = 0;
+	int presentWidth = 0;
+	int presentHeight = 0;
 	string selectedMethod = "";
+
+	// For unattended runs (--hidden, --shots): create the window invisible,
+	// and ignore mouse and keyboard so a stray click cannot move the camera.
+	// Set before the renderer is constructed / once shots are known.
+	static inline bool startHidden = false;
+	static inline bool inputLocked = false;
 
 	GLRenderer();
 

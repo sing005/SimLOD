@@ -41,7 +41,20 @@ target_include_directories(laszip PRIVATE
 	../
 )
 
-set(CMAKE_BUILD_TYPE "Release" CACHE STRING "" FORCE)
+# laszip is always built optimised: an unoptimised build decodes LAZ several
+# times slower, and Debug builds of SimLOD are still used for loading real
+# scans. Optimisation is switched per directory because /RTC1 (in the Debug
+# defaults) cannot be combined with /O2. These variables apply to the targets
+# in this directory only. The FORCE'd CMAKE_BUILD_TYPE this replaces did
+# nothing for Visual Studio, and for single-config generators it overwrote the
+# build type of the whole project.
+if (MSVC)
+	string(REPLACE "/RTC1" ""    CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+	string(REPLACE "/Od"   "/O2" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+	string(REPLACE "/Ob0"  "/Ob2" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+else ()
+	target_compile_options(laszip PRIVATE $<$<CONFIG:Debug>:-O2>)
+endif ()
 
 add_compile_definitions(OPENCV_VERSION=${OpenCV_VERSION})
 add_compile_definitions(_CRT_SECURE_NO_DEPRECATE)

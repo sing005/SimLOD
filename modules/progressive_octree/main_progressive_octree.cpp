@@ -28,6 +28,7 @@ using namespace fmt;
 #include "laszip_api.h"
 
 #include "HostDeviceInterface.h"
+#include "ProggyTinyFont.h"
 #include "CrashHandler.h"
 
 // Uniforms is passed to the kernels by value, and CUDA caps kernel parameters
@@ -39,8 +40,10 @@ static_assert(sizeof(Uniforms) <= 4096, "Uniforms exceeds the 4 KB kernel-parame
 using namespace std;
 
 constexpr uint64_t PINNED_MEM_POOL_SIZE = 200;         // pool of pointers to batches of pinned memory
-constexpr uint64_t BATCH_STREAM_SIZE    = 50;          // ring buffer of batches that are async streamed to GPU
+// BATCH_STREAM_SIZE, the device upload ring, is in HostDeviceInterface.h
+constexpr uint64_t MAX_DECODED_AHEAD    = 50;          // batches the loaders may decode ahead of the kernel, in pinned host memory
 constexpr uint64_t MAX_BATCH_SIZE       = 1'000'000;   // each loaded batch comprises <size> points
+constexpr uint64_t VRAM_RESERVE_BYTES   = 512'000'000; // left free beside the octree pool: grids, GL framebuffers, headroom
 constexpr int MAX_LOADQUEUE_SIZE        = 300;         // stop loading from disk if processing lags behind
 
 CudaPrint cudaprint;
@@ -69,10 +72,13 @@ struct Point{
 		uint8_t rgba[4];
 	};
 };
+// the device Point (structures.cuh) is 16 bytes too; the upload ring and
+// CONSTRUCT_SCRATCH_FIXED_BYTES are sized on that
+static_assert(sizeof(Point) == 16, "Point must stay 16 bytes, as on the device");
 
 struct PointBatch{
 	string file = "";
-	int first = 0;
+	uint64_t first = 0;   // index of its first point in the file; an int wrapped past 2^31
 	int count = 0;
 	shared_ptr<vector<Point>> points;
 	PinnedMemorySlot pinnedMem;
@@ -93,7 +99,7 @@ mutex mtx_batchesInPinnedMemory;
 mutex mtx_batchesInPageableMemory;
 mutex mtx_pinnedMemoryInUpload;
 
-int batchStreamUploadIndex = 0;
+atomic_int batchStreamUploadIndex = 0;   // written by the uploader, read by the loaders and main thread
 CUdeviceptr cptr_points_ring[BATCH_STREAM_SIZE];
 
 CUdevice device;
@@ -107,6 +113,7 @@ CUdeviceptr cptr_renderbuffer;
 CUdeviceptr cptr_stats;
 CUdeviceptr cptr_numBatchesUploaded;
 CUdeviceptr cptr_batchSizes;
+CUdeviceptr cptr_batchTags;
 CUdeviceptr cptr_frameStart;
 CUgraphicsResource cugl_colorbuffer;
 CUevent ce_render_start, ce_render_end;
@@ -135,39 +142,36 @@ struct {
 	bool markersOnly                 = false;   // apply_markers2.ps1: hide forest and insects
 	bool colorByNode                 = false;
 	bool colorByLOD                  = false;
-	bool colorWhite                  = false;
 	bool autoFocusOnLoad             = true;
 	bool benchmarkRendering          = false;
-	float LOD                        = 0.2f;
 	float minNodeSize                = 64.0f;
 	bool  adaptiveDetail             = true;    // coarsen LOD when frames exceed the budget
 	float frameBudgetMs              = 33.0f;   // render-kernel time to aim for (30 fps)
 	bool  vsync                      = true;    // cap at display refresh: saves power and heat
 	int pointSize                    = 1;
-	float fovy                       = 60.0f;
+	float fovy                       = 90.0f;
 	bool enableEDL                   = false;   // reference has no outlines (apply_look.ps1)
 	float edlStrength                = 0.8f;
 
 	// tier 1 shading
 	bool  roundSplats                = true;
-	bool  enableFog                  = true;    // distance goes LIGHTER
-	float fogDensity                 = 0.018f;
-	// Pale green haze, in sRGB like the other colour pickers. The renderer used
-	// to take these numbers as linear (0.72, 0.82, 0.70); these are the same
-	// colour encoded, so the default haze renders exactly as before.
-	float fogR                       = 0.865f;
-	float fogG                       = 0.916f;
-	float fogB                       = 0.854f;
+	// Depth haze: distance goes LIGHTER. The slider is logarithmic: 0.001 is
+	// already a visible haze, 0.018 washes out past ~30 m. The colour is sRGB,
+	// like the other colour pickers (white is the same either way).
+	bool  enableFog                  = true;
+	float fogDensity                 = 0.00024f;
+	float fogR                       = 1.0f;    // white haze
+	float fogG                       = 1.0f;
+	float fogB                       = 1.0f;
 	float fogHeightFalloff           = 0.0f;    // per metre; 0 keeps the haze even with height
 	float fogBase                    = 0.0f;    // metres above the lowest point
 	bool  fogSky                     = false;   // haze between the camera and the sky as well
 	bool  enableBloom                = false;
-	float bloomThreshold             = 0.55f;
 	float bloomStrength              = 1.2f;
 	float bloomRadius                = 3.0f;   // now a mip level count, 0-5
-	float exposure                   = 0.75f;   // low-key, as the reference
+	float exposure                   = 4.0f;   // low-key, as the reference
 	float emissionGain               = 3.0f;
-	int   numInsects                 = 6000;
+	int   numInsects                 = 12273;
 	int   insectSize                 = 2;
 	float insectGlow                 = 2.0f;
 	float insectSpeed                = 0.5f;
@@ -203,53 +207,58 @@ struct {
 
 	// apply_features.ps1
 	int64_t targetPoints             = 0;       // 0 = not yet set; filled from the cloud on load
-	float saturation                 = 1.25f;
-	float temperature                = -0.10f;  // blue-shifted blacks
+	float saturation                 = 2.5f;
+	float temperature                = 0.07f;  // blue-shifted blacks
 	float tintColour[3]              = {0.55f, 0.75f, 0.60f};
 	float tintMix                    = 0.0f;
-	float skyColour[3]               = {0.72f, 0.82f, 0.70f};   // pale green: the haze's hue, darker
+	float skyColour[3]               = {0.16f, 0.17f, 0.17f};   // dark grey
 
 	// look refinement (apply_look.ps1)
-	float pointWorldSize             = 0.06f;   // metres; 0 falls back to pointSize pixels
-	float pointShading               = 0.6f;
+	float pointWorldSize             = 0.085f;   // metres; 0 falls back to pointSize pixels
+	float pointShading               = 1.0f;
 	int   maxSplatPx                 = 24;
-	float grain                      = 0.04f;
-	float vignette                   = 0.35f;
+	float grain                      = 0.0f;
+	float vignette                   = 0.402f;
 
 	// directional key light. Defaults: high and behind, as in the reference,
 	// warm-green light through the canopy.
-	float lightAzimuth               = 205.0f;  // degrees
-	float lightElevation             = 62.0f;   // degrees above horizon
-	float lightColour[3]             = {0.98f, 1.00f, 0.90f};   // near white, faintly warm
-	float lightIntensity             = 1.2f;
-	float ambient                    = 0.35f;   // shadowed points keep a third of their colour
-	float lightAbsorb                = 0.40f;   // per metre: 5 m of canopy passes ~14%
+	float lightAzimuth               = 295.35f;  // degrees
+	float lightElevation             = 56.1f;   // degrees above horizon
+	float lightColour[3]             = {1.0f, 1.0f, 1.0f};      // white
+	float lightIntensity             = 2.5f;
+	float ambient                    = 0.109f;   // shadowed points keep a third of their colour
+	float lightAbsorb                = 0.16f;   // per metre: 5 m of canopy passes ~14%
 	int   lightSteps                 = 40;
 	float sunbeams                   = 1.0f;    // key light in the haze; 0 = haze lit by ambient only
 	float sunAnisotropy              = 0.5f;    // forward scattering of the haze (Henyey-Greenstein g)
 
-	// regroup (apply_regroup.ps1)
-	bool  lightOn                    = false;   // off until you switch it on
-	float nearClip                   = 0.5f;
-	bool  groundOn                   = true;
-	float groundHeight               = 0.35f;
-	float groundColour[3]            = {0.0f, 0.0f, 0.0f};
-	float mixColour[3]               = {1.0f, 1.0f, 1.0f};
-	float eyeHeight                  = 1.8f;    // metres above the lowest point
-	float lookUpDeg                  = 75.0f;
+	// key light switch, near clip, mixer, camera, lens, horizon, markers
+	bool  lightOn                    = true;   // key light switch
+	float nearClip                   = 0.81f;
+	float mixColour[3]               = {1.075f, 1.267f, 1.495f};
+	float eyeHeight                  = 3.37f;    // metres above the lowest point
+	float lookUpDeg                  = 17.05f;
 	int   lensMode                   = 0;       // 0 perspective, 1 fisheye
 	float fisheyeFov                 = 180.0f;
 	float belowColour[3]             = {0.0f, 0.0f, 0.0f};   // void under the ground
-	bool  findTargets                = false;
-	float findThreshold              = 170.0f;
-	float markerScale                = 0.10f;   // apply_markers2.ps1: metres, ball diameter
-	float findGrey                   = 30.0f;
-	bool  findIsolate                = false;
-	int   findBoost                  = 6;
-	float horizonSoftness            = 12.0f;   // degrees
+	float markerScale                = 0.20f;   // metres, ball diameter
+	float horizonSoftness            = 0.0f;    // degrees
+
+	// blown-out colour repair (render.cu): the scanner's camera whites out the
+	// sunlit canopy; those points take the colour of their neighbourhood
+	bool  whiteFix                   = true;
+	float whiteLevel                 = 100.0f;  // darkest channel at least this ...
+	float whiteSpread                = 120.0f;  // ... and channels this close = blown out
+	int   whiteReach                 = 1;       // cells searched for colour
+	float tintMargin                 = 0.0f;    // blue this far above green = sky cast
+
+	// torch: spotlight from the camera, aimed with the mouse (T toggles)
+	bool  torchOn                    = false;
+	float torchIntensity             = 4.0f;
+	float torchAngle                 = 18.0f;   // degrees, half-angle of the beam
+	float torchRange                 = 12.0f;   // metres to half strength
 	float emissionColour[3]          = {1.0f, 0.45f, 0.85f};   // the reference pink
 	bool  emissionByFrequency        = false;
-	bool  fitToCloudDone             = false;
 } settings;
 
 struct PinnedMemPool{
@@ -283,10 +292,17 @@ struct PinnedMemPool{
 		// reserve some extra bytes in case of IO with special alignment
 		uint64_t alignmentPadding = 1'048'576;
 
-		void* pinnedMem;
+		void* pinnedMem = nullptr;
 		CUevent slotEvent;
 
-		cuMemAllocHost((void**)&pinnedMem, bytesPerSlot + alignmentPadding);
+		// unchecked, a failure left pinnedMem uninitialised and the loaders
+		// then wrote 16 MB through it
+		CUresult res = cuMemAllocHost((void**)&pinnedMem, bytesPerSlot + alignmentPadding);
+		if(res != CUDA_SUCCESS || pinnedMem == nullptr){
+			fprintf(stderr, "[load] cuMemAllocHost of %.0f MB pinned memory failed (%d)\n",
+				double(bytesPerSlot + alignmentPadding) / 1e6, int(res));
+			throw std::bad_alloc();   // reaches the terminate handler, which logs a stack
+		}
 		cuEventCreate(&slotEvent, 0);
 
 		PinnedMemorySlot slot = {
@@ -342,7 +358,7 @@ atomic_bool requestStepthrough     = false;
 atomic_bool requestStep            = false;
 bool requestColorFiltering         = false;
 float renderingDuration            = 0.0f;
-uint32_t numPointsUploaded         = 0;
+atomic_uint64_t numPointsUploaded  = 0;   // written by the uploader, read by the main thread's progress log
 float loadStart                    = 0.0f;
 
 float kernelUpdateDuration         = 0.0f;
@@ -364,11 +380,40 @@ atomic_uint64_t numPointsLoaded    = 0;
 atomic_uint64_t numBytesTotal      = 0;
 atomic_uint64_t numBytesLoaded     = 0;
 atomic_uint64_t numThreadsLoading  = 0;
-int numBatchesTotal                = 0;
+atomic_int numBatchesTotal         = 0;
 int numBatchesProcessed            = 0;
 bool lastBatchFinishedDevice       = false;
+bool loadStoppedAtCapacity         = false;
+
+// --set keep=f: load an evenly spaced fraction f of each LAS/LAZ file, for a
+// cloud larger than the GPU holds (the 455 M-point scan on 8 GB) - instead of
+// stopping at capacity with the end of the file missing. Point i of a file is
+// kept when floor((i + 1) f) > floor(i f), so n points give exactly floor(n f)
+// and numPointsTotal stays exact for the load-finished test.
+uint32_t loadKeepPer10k            = 10000;
+inline uint64_t keptBefore(uint64_t i){ return i * loadKeepPer10k / 10000; }
+inline bool keepPoint(uint64_t i){ return keptBefore(i + 1) != keptBefore(i); }
+
+// Points in batches a loader could not read: the file moved, locked or
+// damaged during the load. skipUnreadableBatch takes such a batch off the
+// totals, or the load never counted as finished (no refill, no colour grid,
+// and --exit and --shots waited for ever). The main loop reports the count.
+atomic_uint64_t g_pointsUnreadable = 0;
+static void skipUnreadableBatch(const PointBatch& batch){
+	uint64_t kept = keptBefore(batch.first + uint64_t(batch.count)) - keptBefore(batch.first);
+	g_pointsUnreadable += kept;
+	numPointsTotal     -= kept;
+	numBatchesTotal--;
+}
+
+// How far the construct kernel has got, for the loader and uploader threads to
+// gate on. Copied from stats after each readback: the main thread overwrites
+// the stats struct itself every frame while those threads would be reading it.
+atomic_uint32_t batchesProcessedHost = 0;
+atomic_uint64_t pointsProcessedHost  = 0;
 uint64_t momentaryBufferCapacity   = 0;
 uint64_t persistentBufferCapacity  = 0;
+uint64_t renderBufferCapacity      = 0;
 vector<double> processFrameTimes; 
 
 PinnedMemPool pinnedMemPool;
@@ -411,6 +456,10 @@ static void logLine(const char* fmt, ...){
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
+
+	// loader threads log a file they cannot read, often several at once
+	static std::mutex mtx_log;
+	std::lock_guard<std::mutex> lock(mtx_log);
 
 	fputs(buf, stdout);
 
@@ -515,6 +564,7 @@ static double g_showClock    = 0.0;
 static bool   g_showPlaying  = false;
 static float  g_visualTail   = 1.2f;    // seconds the glow outlasts the call
 static float  g_eventRadius  = 4.0f;    // metres
+static float  g_eventRadiusArg = 0.0f;  // --set radius=: replaces the fit to the cloud; 0 = fit
 static int    g_activeEvents = 0;        // for the GUI readout
 
 #include <cstring>
@@ -580,6 +630,8 @@ static std::vector<std::string> splitCsvLine(const std::string& line){
 	return f;
 }
 
+static void notice(const char* fmt, ...);   // one line on screen for three seconds, defined below
+
 static void loadCallSchedule(const std::string& path){
 	g_calls.clear();
 	std::ifstream in(path);
@@ -610,6 +662,10 @@ static void loadCallSchedule(const std::string& path){
 		g_calls.push_back(c);
 	}
 	g_callsLoaded = !g_calls.empty();
+	if(g_callsLoaded && g_callsInSurvey && !g_surveyValid){
+		logLine("[calls] calls.csv is marked as survey coordinates, but no survey frame is fitted: positions used as file coordinates\n");
+		notice("calls.csv is marked as survey coordinates, but there is no survey fit: positions used as file (LAS) coordinates");
+	}
 	std::cout << "[calls] loaded " << g_calls.size() << " calls from " << path;
 	if(skipped > 0) std::cout << " (" << skipped << " malformed rows skipped, see log)";
 	std::cout << std::endl;
@@ -641,6 +697,7 @@ static CUdeviceptr g_voxelGrid  = 0;
 static int         g_gridResolution = 256;   // cells along the longest side
 static int         g_gridBuiltAtRes = 0;     // what the CURRENT counts were built with
 static CUdeviceptr g_lightGrid  = 0;         // apply_keylight.ps1: per-cell transmittance
+static CUdeviceptr g_colourGrid = 0;         // per-cell repair colour, uint64; same dimensions
 
 // ---- markers (apply_navigate.ps1) -----------------------------------------
 // Picked positions, renderer frame (translated by boxMin). Exported in FILE
@@ -653,6 +710,7 @@ struct Marker {
 	bool  hasSurvey;
 };
 static std::vector<Marker> g_markers;
+static float3 g_markerFrameMin = {InfinityF, InfinityF, InfinityF};   // the boxMin the markers are relative to
 static int g_nextMic = 1;   // fix_nextmic.ps1: above the CSV helpers that use it
 static Marker makeMarker(int mic, float x, float y, float z){
 	Marker m{}; m.mic = mic; m.x = x; m.y = y; m.z = z; m.hasSurvey = false;
@@ -709,6 +767,36 @@ static void jacobiMaxEigenvector4(double N[4][4], double q[4]){
 	for(int k = 0; k < 4; k++) q[k] = V[k][best];
 }
 
+// Eigenvalues of a symmetric 3x3 by cyclic Jacobi, as above, largest first.
+static void jacobiEigenvalues3(double A[3][3], double ev[3]){
+	for(int sweep = 0; sweep < 50; sweep++){
+		double off  = A[0][1]*A[0][1] + A[0][2]*A[0][2] + A[1][2]*A[1][2];
+		double diag = A[0][0]*A[0][0] + A[1][1]*A[1][1] + A[2][2]*A[2][2];
+		if(off <= 1e-30 * diag) break;
+		for(int p = 0; p < 2; p++){
+			for(int r = p + 1; r < 3; r++){
+				if(std::fabs(A[p][r]) < 1e-300) continue;
+				double theta = (A[r][r] - A[p][p]) / (2.0 * A[p][r]);
+				double t = (theta >= 0.0 ? 1.0 : -1.0) / (std::fabs(theta) + std::sqrt(theta*theta + 1.0));
+				double c = 1.0 / std::sqrt(t*t + 1.0);
+				double s = t * c;
+				for(int k = 0; k < 3; k++){           // rotate columns p and r
+					double kp = A[k][p], kr = A[k][r];
+					A[k][p] = c*kp - s*kr;
+					A[k][r] = s*kp + c*kr;
+				}
+				for(int k = 0; k < 3; k++){           // rotate rows p and r
+					double pk = A[p][k], rk = A[r][k];
+					A[p][k] = c*pk - s*rk;
+					A[r][k] = s*pk + c*rk;
+				}
+			}
+		}
+	}
+	ev[0] = A[0][0]; ev[1] = A[1][1]; ev[2] = A[2][2];
+	for(int i = 0; i < 2; i++) for(int j = 0; j < 2 - i; j++) if(ev[j] < ev[j + 1]) std::swap(ev[j], ev[j + 1]);
+}
+
 // Fit from every marker that has survey coordinates. Fills g_surveyR/T and
 // writes each marker's residual to the log. Returns false with fewer than
 // three pairs, which is the minimum for a unique rigid motion in 3D.
@@ -734,6 +822,32 @@ static bool fitSurveyFrame(){
 		cb[0] += bx[i]; cb[1] += by[i]; cb[2] += bz[i];
 	}
 	for(int k = 0; k < 3; k++){ ca[k] /= n; cb[k] /= n; }
+
+	// The markers must not lie on one line: any rotation about that line
+	// leaves them in place, so the fit cannot tell those rotations apart, and
+	// still reports a small rms. Their spread off their best line is the root
+	// of the second-largest eigenvalue of their scatter, per marker. A pick
+	// error e turns the frame about the line by about e / spread radians:
+	// with 1 cm and a 1 m spread that is 0.6 degrees, which moves a call 20 m
+	// from the line by 0.2 m; with a 5 cm spread it is 11 degrees. Below 5 cm
+	// the fit is refused, below 1 m it is made with a warning.
+	double spread = 0.0;
+	{
+		double C[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
+		for(int i = 0; i < n; i++){
+			double a[3] = {ax[i]-ca[0], ay[i]-ca[1], az[i]-ca[2]};
+			for(int r = 0; r < 3; r++) for(int c = 0; c < 3; c++) C[r][c] += a[r]*a[c];
+		}
+		double ev[3];
+		jacobiEigenvalues3(C, ev);
+		spread = std::sqrt(std::max(ev[1], 0.0) / n);
+	}
+	if(spread < 0.05){
+		logLine("[survey] the %d markers lie on one line (%.3f m off it), so the rotation about it is undetermined; place a marker away from that line\n", n, spread);
+		notice("Survey fit refused: the markers lie on one line (%.3f m off it). Add a marker away from that line.", spread);
+		g_surveyValid = false;
+		return false;
+	}
 
 	// cross-covariance, file (left) against survey (right): S_ab = sum a_i b_i
 	double S[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
@@ -793,7 +907,12 @@ static bool fitSurveyFrame(){
 		f << "R " << R[0]<<" "<<R[1]<<" "<<R[2]<<" "<<R[3]<<" "<<R[4]<<" "<<R[5]<<" "<<R[6]<<" "<<R[7]<<" "<<R[8] << "\n";
 		f << "t " << g_surveyT[0] << " " << g_surveyT[1] << " " << g_surveyT[2] << "\n";
 	}
-	notice("Survey frame fitted from %d markers: yaw %.1f deg, rms %.3f m (see log)", n, yawDeg, g_surveyRms);
+	logLine("[survey] the markers spread %.2f m off their best line\n", spread);
+	if(spread < 1.0){
+		notice("Survey frame fitted from %d markers, but they lie close to one line (%.2f m off it): the rotation about it is uncertain. Add a marker away from that line.", n, spread);
+	}else{
+		notice("Survey frame fitted from %d markers: yaw %.1f deg, rms %.3f m (see log)", n, yawDeg, g_surveyRms);
+	}
 	return true;
 }
 
@@ -803,6 +922,11 @@ static bool fitSurveyFrame(){
 // with fixed decimals: the default stream precision (6 significant digits)
 // rounds a georeferenced northing such as 5.9e6 to the nearest 10 m.
 static void saveMarkersCsv(){
+	// file coordinates need the cloud's corner: with none loaded they would be inf
+	if(!std::isfinite(boxMin.x) || !std::isfinite(boxMin.y) || !std::isfinite(boxMin.z)){
+		notice("Load a point cloud before saving markers");
+		return;
+	}
 	std::ofstream f("markers.csv");
 	if(!f.is_open()){
 		logLine("[pick] cannot open markers.csv for writing\n");
@@ -878,6 +1002,7 @@ static void loadMarkersCsv(){
 	else            notice("Loaded %d markers from markers.csv", int(g_markers.size()));
 }
 static int    g_pickReqX = -1, g_pickReqY = -1;   // pixel of the outstanding request
+static float  g_torchPx = -1.0f, g_torchPy = -1.0f;  // frame pixel the torch aims through; < 0 = centre
 static bool   g_pickWaiting = false;              // a request has not been answered yet
 static int    g_pickSeq = 0;                      // id of the latest request
 static int    g_pickSeenDone = 0;                 // consecutive Stats reads showing it answered
@@ -885,22 +1010,25 @@ static bool   g_pKeyWasDown = false;          // P key state last frame (pick sh
 static bool   g_leftWasDown = false;
 // g_nextMic moved up to the marker block (fix_nextmic.ps1)
 static float  g_walkSpeed = 3.0f;                 // metres per second, W/A/S/D
+static ImFont* g_menuFont = nullptr;              // 10-pixel ProggyTiny for the Settings window
+static bool   g_smallMenuText = true;             // Settings window in g_menuFont, with tighter spacing
 static bool        g_lightDirty = true;
 static bool        g_gridRefill = false;     // apply_grid_refill.ps1: counts need rebuilding
 static int         g_gridX = 0, g_gridY = 0, g_gridZ = 0;
 static float       g_cellSize   = 1.0f;
 static size_t      g_gridBytes  = 0;
 
-// Momentary buffer overrun check (apply_buffer_fix.ps1). The allocator does
-// an atomicAdd and returns buffer + offset with no bounds test, so an overrun
-// is silent until it corrupts something. Warn once per session.
+// Construct scratch (momentary buffer) check. The buffer is sized from the
+// kernel's own capacities (CONSTRUCT_* in HostDeviceInterface.h); kernel_construct
+// refuses to run, and reports its layout size here, if it would not fit with
+// 1 KB to spare. Loading then stalls, so say why, once per session.
 static void checkMomentaryBudget(uint64_t used, uint64_t capacity){
 	static bool warned = false;
-	if(!warned && used > capacity){
+	if(!warned && used + 1024 > capacity){
 		warned = true;
-		printf("[WARN] momentary buffer overrun: %.1f MB used of %.1f MB. "
-			   "Raise cptr_buffer_bytes. Expect crashes until you do.\n",
-			   double(used) / 1'000'000.0, double(capacity) / 1'000'000.0);
+		logLine("[WARN] construct scratch overrun: the kernel lays out %.1f MB in a %.1f MB buffer and will not run. "
+			"Keep CONSTRUCT_SCRATCH_FIXED_BYTES in HostDeviceInterface.h in step with kernel_construct's allocations.\n",
+			double(used) / 1'000'000.0, double(capacity) / 1'000'000.0);
 	}
 }
 
@@ -919,10 +1047,17 @@ static void ensureLightGrid(bool wanted){
 	static int failedX = -1, failedY = -1, failedZ = -1;
 	if(g_gridX == failedX && g_gridY == failedY && g_gridZ == failedZ) return;
 	size_t lbytes = size_t(g_gridX) * size_t(g_gridY) * size_t(g_gridZ) * sizeof(float);
-	if(cuMemAlloc(&g_lightGrid, lbytes) != CUDA_SUCCESS){
+	// Checked against free memory first, as ensureVoxelGrid does: with the
+	// driver's sysmem fallback on (the default), cuMemAlloc does not fail when
+	// VRAM is short but quietly places the grid in system memory, which the
+	// render kernel would then read over PCIe every frame.
+	size_t freeMem = 0, totalMem = 0;
+	cuMemGetInfo(&freeMem, &totalMem);
+	if(lbytes + 64'000'000 >= freeMem || cuMemAlloc(&g_lightGrid, lbytes) != CUDA_SUCCESS){
 		g_lightGrid = 0;
 		failedX = g_gridX; failedY = g_gridY; failedZ = g_gridZ;
-		logLine("[grid] light grid (%.0f MB) would not fit; key light disabled\n", double(lbytes) / 1e6);
+		logLine("[grid] light grid (%.0f MB) would not fit (%.0f MB free); key light disabled\n",
+			double(lbytes) / 1e6, double(freeMem) / 1e6);
 		notice("Key light needs %.0f MB of GPU memory that is not free - lower the grid resolution", double(lbytes) / 1e6);
 		return;
 	}
@@ -930,6 +1065,71 @@ static void ensureLightGrid(bool wanted){
 	cuMemsetD8(g_lightGrid, 0, lbytes);
 	g_lightDirty = true;
 	logLine("[grid] light grid allocated, %.0f MB\n", double(lbytes) / 1e6);
+}
+
+// kernel_render's scratch, per frame: the visible-node list (16.8 MB, from
+// HostDeviceInterface.h) and the 16 MB line list, then per pixel 45 B:
+// framebuffer 8, emission 12, bloom chain 4, quarter-resolution volumetrics
+// 1 (RGB and distance), and the high-quality pass's depth 4 and colour 16. The fixed 200 MB it
+// used to get was overrun with no check by any window above 3.8 Mpx: a 4K
+// frame needs 404 MB, a 1080p one 126 MB. Sized to the window instead,
+// growing but never shrinking; growth after startup comes out of the VRAM
+// reserve beside the octree pool.
+static uint64_t renderBufferBytesFor(int width, int height){
+	uint64_t pixels = uint64_t(std::max(width, 1)) * uint64_t(std::max(height, 1));
+	uint64_t lists  = uint64_t(MAX_VISIBLE_NODES) * NODE_BYTES + 16'000'000;   // nodes, line vertices
+	return lists + 45 * pixels + 1'000'000;   // + alignment and the bloom chain's padding
+}
+
+// Returns whether the buffer holds a frame of this size. On failure the old
+// buffer is kept and renderCUDA skips its launch until the window shrinks.
+static bool ensureRenderBuffer(int width, int height){
+	static uint64_t failedNeed = 0;   // a size that would not fit, and how much was free then
+	static size_t   failedFree = 0;
+	uint64_t need = renderBufferBytesFor(width, height);
+	if(need <= renderBufferCapacity){ failedNeed = 0; return true; }
+
+	// do not retry (and re-log) a size that failed every frame, but do once
+	// memory has been freed: a grid made smaller, the key light off
+	if(need == failedNeed){
+		size_t freeNow = 0, totalNow = 0;
+		cuMemGetInfo(&freeNow, &totalNow);
+		if(freeNow < failedFree + 32'000'000) return false;
+	}
+
+	// the previous frame's render may still be reading the old buffer
+	cuCtxSynchronize();
+
+	// Free first, then allocate, so only the growth needs to be free. If the
+	// allocation fails anyway, put the old size back: it was free a moment ago.
+	size_t freeMem = 0, totalMem = 0;
+	cuMemGetInfo(&freeMem, &totalMem);
+	bool grown = need - renderBufferCapacity + 64'000'000 < freeMem;
+	if(grown){
+		if(cptr_renderbuffer != 0){ cuMemFree(cptr_renderbuffer); cptr_renderbuffer = 0; }
+		grown = cuMemAlloc(&cptr_renderbuffer, need) == CUDA_SUCCESS;
+		if(!grown){
+			cptr_renderbuffer = 0;
+			if(renderBufferCapacity > 0 && cuMemAlloc(&cptr_renderbuffer, renderBufferCapacity) != CUDA_SUCCESS){
+				cptr_renderbuffer = 0;
+				renderBufferCapacity = 0;
+			}
+		}
+	}
+	if(!grown){
+		failedNeed = need;
+		cuMemGetInfo(&failedFree, &totalMem);   // after the restore
+		logLine("[vram] a %d x %d frame needs a %.0f MB render buffer, which does not fit (%.0f MB free); not drawing at this size\n",
+			width, height, need / 1e6, freeMem / 1e6);
+		notice("Window too large for free GPU memory (needs %.0f MB) - make it smaller", need / 1e6);
+		return false;
+	}
+
+	logLine("[vram] render buffer %.0f -> %.0f MB for a %d x %d frame\n",
+		renderBufferCapacity / 1e6, need / 1e6, width, height);
+	renderBufferCapacity = need;
+	failedNeed = 0;
+	return true;
 }
 
 static void ensureVoxelGrid(){
@@ -962,6 +1162,7 @@ static void ensureVoxelGrid(){
 		g_voxelGrid = 0;          // way, and holding it makes the new one more
 		g_gridBytes = 0;          // likely to fail for want of room
 	}
+	if(g_colourGrid != 0){ cuMemFree(g_colourGrid); g_colourGrid = 0; }
 
 	// cuMemAlloc was unchecked. On failure g_voxelGrid stayed 0, cuMemsetD8
 	// then wrote through a null device pointer and the kernel read and wrote
@@ -1019,6 +1220,25 @@ static void ensureVoxelGrid(){
 
 	g_gridX = gx; g_gridY = gy; g_gridZ = gz; g_cellSize = cell;
 	g_gridBuiltAtRes = R;
+
+	// Colour repair grid, twice the occupancy grid's size. Optional: without
+	// it blown-out points keep their white, nothing else is affected. The key
+	// light's grid (the occupancy grid's size) is allocated after this one,
+	// so leave room for it: the optional grid must not cost the light.
+	{
+		size_t cbytes = size_t(gx) * size_t(gy) * size_t(gz) * sizeof(uint64_t);
+		size_t lightRoom = bytes;
+		size_t freeMem = 0, totalMem = 0;
+		cuMemGetInfo(&freeMem, &totalMem);
+		if(cbytes + lightRoom + 64'000'000 < freeMem && cuMemAlloc(&g_colourGrid, cbytes) == CUDA_SUCCESS){
+			cuMemsetD8(g_colourGrid, 0, cbytes);
+			logLine("[grid] colour repair grid %.1f MB\n", double(cbytes) / 1e6);
+		}else{
+			g_colourGrid = 0;
+			logLine("[grid] colour repair grid (%.0f MB) would not fit (%.0f MB free); blown-out points stay white\n",
+				double(cbytes) / 1e6, double(freeMem) / 1e6);
+		}
+	}
 	// The grid has just been zeroed, so whatever counts it held are gone. Say
 	// so, rather than setting g_gridBuiltAtRes and reporting it as current -
 	// which is what hid this: the resolution slider emptied the grid on every
@@ -1026,6 +1246,137 @@ static void ensureVoxelGrid(){
 	g_gridRefill = true;
 	logLine("[grid] %d x %d x %d cells, %.3f m each, %.1f MB\n",
 		gx, gy, gz, cell, double(bytes) / 1e6);
+}
+
+// ---- bird's-eye view -------------------------------------------------------
+// A plan view of the whole domain, built from the occupancy grid (and the
+// colour repair grid, when there is one) each time the grid is rebuilt: per
+// column, the colour of the highest coloured cell, or a green shade from the
+// column's point count. The camera, its view direction and the markers are
+// drawn over it every frame.
+static int    g_refillGen  = 0;     // bumped when a grid rebuild is launched
+static int    g_minimapGen = -1;    // the rebuild the minimap was made from
+static GLuint g_minimapTex = 0;
+static int    g_minimapW = 0, g_minimapH = 0;
+
+static void buildMinimap(){
+	if(g_voxelGrid == 0 || g_gridX <= 0 || g_gridY <= 0 || g_gridZ <= 0) return;
+	cuCtxSynchronize();   // the rebuild must have finished
+	size_t n = size_t(g_gridX) * size_t(g_gridY) * size_t(g_gridZ);
+	std::vector<uint32_t> occ(n);
+	if(cuMemcpyDtoH(occ.data(), g_voxelGrid, n * sizeof(uint32_t)) != CUDA_SUCCESS) return;
+	std::vector<uint64_t> col;
+	if(g_colourGrid != 0){
+		col.resize(n);
+		if(cuMemcpyDtoH(col.data(), g_colourGrid, n * sizeof(uint64_t)) != CUDA_SUCCESS) col.clear();
+	}
+
+	int W = g_gridX, H = g_gridY;
+	std::vector<uint32_t> img(size_t(W) * size_t(H), 0xff141414u);   // ABGR: near-black ground
+	std::vector<float> dens(size_t(W) * size_t(H), 0.0f);
+	float maxD = 1.0f;
+	for(int y = 0; y < H; y++) for(int x = 0; x < W; x++){
+		float s = 0.0f;
+		for(int z = 0; z < g_gridZ; z++) s += float(occ[x + size_t(W) * (y + size_t(H) * z)]);
+		float d = std::log1p(s);
+		dens[x + size_t(W) * y] = d;
+		maxD = std::max(maxD, d);
+	}
+	const uint64_t HAS_COLOUR = (1ull << 63) | (1ull << 62);
+	for(int y = 0; y < H; y++) for(int x = 0; x < W; x++){
+		float d = dens[x + size_t(W) * y] / maxD;
+		if(d <= 0.0f) continue;
+		uint32_t r = uint32_t(20 + 40 * d), g = uint32_t(40 + 150 * d), b = uint32_t(20 + 30 * d);
+		if(!col.empty()){
+			for(int z = g_gridZ - 1; z >= 0; z--){
+				uint64_t q = col[x + size_t(W) * (y + size_t(H) * z)];
+				if(q & HAS_COLOUR){
+					float k = 0.55f + 0.45f * d;   // denser columns brighter
+					r = uint32_t(std::min(255.0f, float((q      ) & 0xff) * k * 1.6f));
+					g = uint32_t(std::min(255.0f, float((q >>  8) & 0xff) * k * 1.6f));
+					b = uint32_t(std::min(255.0f, float((q >> 16) & 0xff) * k * 1.6f));
+					break;
+				}
+			}
+		}
+		// row 0 of the image is the NORTH edge (largest y)
+		img[x + size_t(W) * (H - 1 - y)] = 0xff000000u | (b << 16) | (g << 8) | r;
+	}
+
+	if(g_minimapTex == 0) glGenTextures(1, &g_minimapTex);
+	glBindTexture(GL_TEXTURE_2D, g_minimapTex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
+	glBindTexture(GL_TEXTURE_2D, 0);
+	g_minimapW = W; g_minimapH = H;
+	logLine("[host] bird's-eye view rebuilt, %d x %d\n", W, H);
+}
+
+static void drawBirdsEye(shared_ptr<GLRenderer> renderer){
+	if(g_refillGen != g_minimapGen && !g_gridRefill && g_voxelGrid != 0){
+		buildMinimap();
+		g_minimapGen = g_refillGen;
+	}
+	ImGui::TextDisabled("Bird's eye  (north up)");
+	if(g_minimapTex == 0 || g_minimapW <= 0){
+		ImGui::TextDisabled("   appears once the cloud has loaded");
+		return;
+	}
+	float availW = ImGui::GetContentRegionAvail().x;
+	float w = std::min(availW, 420.0f);
+	float h = w * float(g_minimapH) / float(g_minimapW);
+	if(h > 420.0f){ h = 420.0f; w = h * float(g_minimapW) / float(g_minimapH); }
+	ImVec2 p0 = ImGui::GetCursorScreenPos();
+	ImGui::Image((ImTextureID)(intptr_t)g_minimapTex, ImVec2(w, h));
+	ImDrawList* dl = ImGui::GetWindowDrawList();
+
+	// renderer frame (metres from the cloud's minimum corner) to minimap pixels
+	float extX = float(g_gridX) * g_cellSize, extY = float(g_gridY) * g_cellSize;
+	auto toMap = [&](double x, double y){
+		return ImVec2(p0.x + float(x / extX) * w, p0.y + (1.0f - float(y / extY)) * h);
+	};
+
+	// The window's draw list clips to the whole window, so without this the
+	// overlay was painted over the widgets around the map whenever the camera
+	// stood outside the cloud - as the orbit camera usually does.
+	ImVec2 p1(p0.x + w, p0.y + h);
+	dl->PushClipRect(p0, p1, true);
+
+	for(const Marker& m : g_markers){
+		ImVec2 q = toMap(m.x, m.y);
+		dl->AddCircleFilled(q, 3.0f, IM_COL32(255, 0, 255, 255));
+	}
+
+	// A camera off the map is drawn at the nearest edge as a ring, with a
+	// tick pointing toward where it really is.
+	const ImU32 yellow = IM_COL32(255, 220, 60, 255);
+	glm::dvec3 cp = renderer->camera->position;
+	glm::dvec3 fwd = -glm::normalize(glm::dvec3(renderer->camera->world[2]));
+	ImVec2 cTrue = toMap(cp.x, cp.y);
+	ImVec2 c(std::clamp(cTrue.x, p0.x + 6.0f, p1.x - 6.0f), std::clamp(cTrue.y, p0.y + 6.0f, p1.y - 6.0f));
+	bool offMap = c.x != cTrue.x || c.y != cTrue.y;
+	double fl = std::sqrt(fwd.x * fwd.x + fwd.y * fwd.y);
+	if(fl > 1e-6){
+		float len = 0.12f * w;
+		ImVec2 tip(c.x + float(fwd.x / fl) * len, c.y - float(fwd.y / fl) * len);
+		dl->AddLine(c, tip, yellow, 2.0f);
+	}
+	if(offMap){
+		float dx = cTrue.x - c.x, dy = cTrue.y - c.y, dl2 = std::sqrt(dx * dx + dy * dy);
+		dl->AddCircle(c, 5.0f, yellow, 0, 2.0f);
+		dl->AddLine(c, ImVec2(c.x + dx / dl2 * 10.0f, c.y + dy / dl2 * 10.0f), yellow, 2.0f);
+	}else{
+		dl->AddCircleFilled(c, 5.0f, yellow);
+		dl->AddCircle(c, 5.0f, IM_COL32(0, 0, 0, 255), 0, 1.5f);
+	}
+	dl->PopClipRect();
+	ImGui::TextDisabled("   camera %.1f, %.1f m, %.1f m up%s  (yellow; magenta = markers)", cp.x, cp.y, cp.z,
+		offMap ? ", off the map" : "");
+	ImGui::Separator();
 }
 
 // ---- per-frame state --------------------------------------------------------
@@ -1053,6 +1404,10 @@ static void updateAdaptiveDetail(){
 		return;
 	}
 	if(stats.stageNs[6] == 0) return;   // no measurement yet
+	// each measurement once: the stats readback can repeat a frame's values
+	static uint32_t lastFrameID = ~0u;
+	if(stats.frameID == lastFrameID) return;
+	lastFrameID = stats.frameID;
 	double ms = double(stats.stageNs[6]) / 1e6;
 	if(ms > settings.frameBudgetMs * 1.10)      g_adaptReduce += 0.03f;
 	else if(ms < settings.frameBudgetMs * 0.70) g_adaptReduce -= 0.015f;
@@ -1064,11 +1419,28 @@ static int   effectiveMaxSplatPx(){
 	return std::max(2, std::min(px, settings.maxSplatPx));
 }
 
-static void beginFrameState(){
-	updateAdaptiveDetail();
+static bool g_frameRenderable = false;   // the render buffer holds this frame's size
+static bool g_frameDrawn      = false;   // set by renderCUDA: kernel_render was launched this frame
 
+static void beginFrameState(int width, int height){
+	// A minimised window reports 0 x 0: nothing to draw (loading goes on).
+	// Drawing anyway registered a zero-size GL texture with CUDA, and mapping
+	// it crashed in the driver.
+	g_frameRenderable = width > 0 && height > 0 && ensureRenderBuffer(width, height);
 	ensureVoxelGrid();
 	ensureLightGrid(settings.lightOn);
+
+	// kernel_render is the only one to act on the requests below; on a frame
+	// renderCUDA skips, leave them pending for the next frame that is drawn
+	if(!g_frameRenderable){
+		g_frameGridRefill = false;
+		g_frameLightDirty = false;
+		return;
+	}
+
+	// only on frames that are drawn: on the others the last render time is
+	// stale, and the controller would drive detail to an extreme meanwhile
+	updateAdaptiveDetail();
 
 	// Recount only once the device has processed every point. During a load
 	// the construct kernel counts points as it inserts them, and a recount
@@ -1146,12 +1518,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.belowR = settings.belowColour[0];
 		uniforms.belowG = settings.belowColour[1];
 		uniforms.belowB = settings.belowColour[2];
-		uniforms.findTargets   = settings.findTargets ? 1 : 0;
-		uniforms.findThreshold = settings.findThreshold;
 		uniforms.markerScale   = settings.markerScale;
-		uniforms.findGrey      = settings.findGrey;
-		uniforms.findIsolate   = settings.findIsolate ? 1 : 0;
-		uniforms.findBoost     = settings.findBoost;
 		uniforms.horizonSoftness = settings.horizonSoftness;
 		uniforms.pickX = g_pickReqX;
 		uniforms.pickY = g_pickReqY;
@@ -1181,17 +1548,15 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.boxMax                   = boxSize;
 	uniforms.frameCounter             = frameCounter;
 	uniforms.showBoundingBox          = settings.showBoundingBox;
-	uniforms.doUpdateVisibility       = settings.doUpdateVisibility;
 	uniforms.showPoints               = settings.showPoints;
 	uniforms.colorByNode              = settings.colorByNode;
 	uniforms.colorByLOD               = settings.colorByLOD;
-	uniforms.colorWhite               = settings.colorWhite;
-	uniforms.LOD                      = settings.LOD;
 	uniforms.minNodeSize              = effectiveMinNodeSize();
 	uniforms.pointSize                = settings.pointSize;
 	uniforms.useHighQualityShading    = settings.useHighQualityShading;
 	uniforms.persistentBufferCapacity = persistentBufferCapacity;
 	uniforms.momentaryBufferCapacity  = momentaryBufferCapacity;
+	uniforms.renderBufferCapacity     = renderBufferCapacity;
 	uniforms.enableEDL                = settings.enableEDL;
 	uniforms.edlStrength              = settings.edlStrength;
 
@@ -1205,7 +1570,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.fogBase                  = settings.fogBase;
 	uniforms.fogSky                   = settings.fogSky ? 1 : 0;
 	uniforms.enableBloom              = settings.enableBloom;
-	uniforms.bloomThreshold           = settings.bloomThreshold;
 	uniforms.bloomStrength            = settings.bloomStrength;
 	uniforms.bloomRadius              = settings.bloomRadius;
 	uniforms.exposure                 = settings.exposure;
@@ -1277,9 +1641,8 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 			settings.testY = boxMin.y + boxSize.y * 0.5f;
 			settings.testZ = boxMin.z + boxSize.z * 0.55f;
 
-			g_eventRadius        = longest * 0.12f;    // 12% of the longest side
+			g_eventRadius        = g_eventRadiusArg > 0.0f ? g_eventRadiusArg : longest * 0.12f;    // 12% of the longest side
 			settings.volMaxDist  = diag * 1.5f;        // rays can cross the whole cloud
-			settings.fitToCloudDone = true;
 			logLine("[host] fitted to cloud: extent %.1f x %.1f x %.1f m, test source (%.1f, %.1f, %.1f), radius %.1f m, reach %.0f m\n",
 				boxSize.x, boxSize.y, boxSize.z, settings.testX, settings.testY, settings.testZ, g_eventRadius, settings.volMaxDist);
 		}
@@ -1301,13 +1664,32 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		if(untouched && totalI > 0){
 			settings.targetPoints = totalI;
 		}
-		lastTotal = totalI;
+		// A drop zeroes the stats. Remembering that 0 made the old cloud's total
+		// look like a target the user had set, so a newly dropped cloud was
+		// drawn at old total / new total of its points.
+		if(totalI > 0) lastTotal = totalI;
 		if(total > 0.0){
 			double d = double(settings.targetPoints) / total;
 			settings.pointDensity = float(d < 0.001 ? 0.001 : (d > 1.0 ? 1.0 : d));
 		}
 	}
 	uniforms.voxelGridPtr    = (uint64_t)g_voxelGrid;
+	uniforms.colourGridPtr   = (uint64_t)g_colourGrid;
+	uniforms.whiteFix        = settings.whiteFix ? 1 : 0;
+	uniforms.whiteLevel      = settings.whiteLevel;
+	uniforms.whiteSpread     = settings.whiteSpread;
+	uniforms.whiteReach      = settings.whiteReach;
+	uniforms.tintMargin      = settings.tintMargin;
+	uniforms.torchOn         = settings.torchOn ? 1 : 0;
+	uniforms.torchX          = g_torchPx >= 0.0f ? g_torchPx : 0.5f * float(renderer->width);
+	uniforms.torchY          = g_torchPy >= 0.0f ? g_torchPy : 0.5f * float(renderer->height);
+	uniforms.torchIntensity  = settings.torchIntensity;
+	{
+		float outer = std::clamp(settings.torchAngle, 1.0f, 80.0f) * 0.017453292f;
+		uniforms.torchCosOuter = std::cos(outer);
+		uniforms.torchCosInner = std::cos(outer * 0.6f);   // soft edge over the outer 40%
+	}
+	uniforms.torchRange      = settings.torchRange;
 	uniforms.gridX           = g_gridX;
 	uniforms.gridY           = g_gridY;
 	uniforms.gridZ           = g_gridZ;
@@ -1366,11 +1748,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	}
 	uniforms.lightOn        = settings.lightOn ? 1 : 0;
 	uniforms.nearClip       = settings.nearClip;
-	uniforms.groundOn       = settings.groundOn ? 1 : 0;
-	uniforms.groundHeight   = settings.groundHeight;
-	uniforms.groundR        = settings.groundColour[0];
-	uniforms.groundG        = settings.groundColour[1];
-	uniforms.groundB        = settings.groundColour[2];
 	uniforms.mixR           = settings.mixColour[0];
 	uniforms.mixG           = settings.mixColour[1];
 	uniforms.mixB           = settings.mixColour[2];
@@ -1479,7 +1856,12 @@ void resetCUDA(shared_ptr<GLRenderer> renderer){
 	// they are when the same cloud is reloaded. The construct kernel adds to
 	// the counts as points arrive, so without this every reset doubled them.
 	if(g_voxelGrid != 0) cuMemsetD8(g_voxelGrid, 0, g_gridBytes);
-	g_gridRefill = false;
+	// The colour repair grid and the bird's-eye view are built only by a
+	// refill. Without one, a cloud with the same bounds as the last (the same
+	// scan, recoloured) kept the old cloud's colours. The refill waits for
+	// the load to finish (beginFrameState), then runs once on the new cloud.
+	if(g_colourGrid != 0) cuMemsetD8(g_colourGrid, 0, size_t(g_gridX) * size_t(g_gridY) * size_t(g_gridZ) * sizeof(uint64_t));
+	g_gridRefill = true;
 	g_lightDirty = true;
 
 	Uniforms uniforms = getUniforms(renderer);
@@ -1529,6 +1911,7 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 		&cudaprint.cptr,
 		&cptr_numBatchesUploaded,
 		&cptr_batchSizes,
+		&cptr_batchTags,
 	};
 
 	// printfmt("launching update!\n");
@@ -1614,16 +1997,33 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 // draw the octree with a CUDA kernel
 void renderCUDA(shared_ptr<GLRenderer> renderer){
 
+	g_frameDrawn = false;
+
+	// minimised, or the window outgrew free memory (ensureRenderBuffer said why, once)
+	if(!g_frameRenderable) return;
+
 	Uniforms uniforms = getUniforms(renderer);
 
 	static bool registered = false;
 	static GLuint registeredHandle = -1;
 
-	cuGraphicsGLRegisterImage(
-		&cugl_colorbuffer, 
-		renderer->view.framebuffer->colorAttachments[0]->handle, 
-		GL_TEXTURE_2D, 
+	CUresult registered_res = cuGraphicsGLRegisterImage(
+		&cugl_colorbuffer,
+		renderer->view.framebuffer->colorAttachments[0]->handle,
+		GL_TEXTURE_2D,
 		CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
+	if(registered_res != CUDA_SUCCESS){
+		// mapping a resource that did not register crashes in the driver
+		static bool warned = false;
+		if(!warned){ warned = true; logLine("[host] cannot register the frame texture with CUDA (%d); frame skipped\n", int(registered_res)); }
+		// kernel_render does not run: put back the requests beginFrameState
+		// took for this frame, for the next one that is drawn
+		if(g_frameGridRefill) g_gridRefill = true;
+		if(g_frameLightDirty) g_lightDirty = true;
+		g_frameGridRefill = false;
+		g_frameLightDirty = false;
+		return;
+	}
 
 	// map OpenGL resources to CUDA
 	vector<CUgraphicsResource> dynamic_resources = {cugl_colorbuffer};
@@ -1662,8 +2062,10 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 		workgroupSize, 1, 1,
 		0, 0, args);
 
+	g_frameDrawn = res_launch == CUDA_SUCCESS;
+	if(g_frameDrawn && g_frameGridRefill) g_refillGen++;   // the bird's-eye view follows the grid
 	if(res_launch != CUDA_SUCCESS){
-		const char* str; 
+		const char* str;
 		cuGetErrorString(res_launch, &str);
 		printf("error: %s \n", str);
 	}
@@ -1701,19 +2103,21 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	// allocate most gpu buffers
 	uint64_t nodesCapacity           = 200'000;
 	uint64_t estimatedNodeSize       = 200;           // see struct Node in progressive_octree.cu, but some more just in case
-	// Raised from 300 MB by apply_buffer_fix.ps1. The Stats panel reported
-	// "momentary buffer 408.8 MB" against a 300 MB allocation while displaying
-	// a 54.5 M point scan - writing 109 MB past the end of a CUDA allocation,
-	// which is exactly the sort of fault that shows up as an intermittent
-	// crash when something shifts the allocation pattern, such as moving a
-	// slider. The allocator has no bounds check at all.
-	//
-	// 1.2 GB leaves room for the emission, bloom chain and volumetric buffers
-	// at up to two abutted 1440p screens. See the overrun warning below, which
-	// now reports the condition instead of letting it corrupt silently.
-	uint64_t cptr_buffer_bytes       = 1'200'000'000;
+	// What the device had free before any of this. Everything else that is
+	// already on the GPU (another SimLOD, a browser) shrinks the octree pool.
+	size_t freeAtStart = 0;
+	size_t totalMem = 0;
+	cuMemGetInfo(&freeAtStart, &totalMem);
+
+	// kernel_construct's scratch, and nothing else's: the render kernel's
+	// emission, bloom and volumetric buffers live in cptr_renderbuffer. Sized
+	// from the kernel's own capacities, 405 MB plus a chunk queue entry per
+	// point chunk the pool could hold (total VRAM bounds the pool: 4 MB on an
+	// 8 GB card). It was a fixed 1.2 GB, and before that 300 MB, which the
+	// kernel overran by 109 MB with no check. The kernel now refuses to run if
+	// its layout outgrows this.
+	uint64_t cptr_buffer_bytes       = CONSTRUCT_SCRATCH_FIXED_BYTES + 8 * (totalMem / CHUNK_BYTES + 1);
 	uint64_t cptr_nodes_bytes        = nodesCapacity * estimatedNodeSize;
-	uint64_t cptr_renderbuffer_bytes = 200'000'000;
 
 	momentaryBufferCapacity = cptr_buffer_bytes;
 
@@ -1721,10 +2125,32 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	// wrote through. Fail at startup with the reason in the log instead.
 	cuCheck(cuMemAlloc(&cptr_buffer                , cptr_buffer_bytes), "cuMemAlloc momentary buffer");
 	cuCheck(cuMemAlloc(&cptr_nodes                 , cptr_nodes_bytes), "cuMemAlloc nodes");
-	cuCheck(cuMemAlloc(&cptr_renderbuffer          , cptr_renderbuffer_bytes), "cuMemAlloc renderbuffer");
+	// Sized before the octree pool takes the rest, for the largest frame
+	// likely: a fixed --render size, or else the window (renderer->width is
+	// not set until the render loop starts), the largest monitor it could be
+	// maximised on, and at least 1080p. A 4K display gets its 405 MB here
+	// rather than from the reserve on the first frame.
+	int frameW = renderer->renderWidth, frameH = renderer->renderHeight;
+	if(frameW <= 0 || frameH <= 0){
+		glfwGetWindowSize(renderer->window, &frameW, &frameH);
+		if(uint64_t(frameW) * uint64_t(frameH) < 1920ull * 1080ull){ frameW = 1920; frameH = 1080; }
+		int numMonitors = 0;
+		GLFWmonitor** monitors = glfwGetMonitors(&numMonitors);
+		for(int i = 0; i < numMonitors; i++){
+			const GLFWvidmode* mode = glfwGetVideoMode(monitors[i]);
+			if(mode && uint64_t(mode->width) * uint64_t(mode->height) > uint64_t(frameW) * uint64_t(frameH)){
+				frameW = mode->width;
+				frameH = mode->height;
+			}
+		}
+	}
+	if(!ensureRenderBuffer(frameW, frameH)) ensureRenderBuffer(1920, 1080);
+	uint64_t cptr_renderbuffer_bytes = renderBufferCapacity;
 	cuCheck(cuMemAlloc(&cptr_stats                 , sizeof(Stats)), "cuMemAlloc stats");
 	cuCheck(cuMemAlloc(&cptr_numBatchesUploaded    , 4), "cuMemAlloc numBatchesUploaded");
 	cuCheck(cuMemAlloc(&cptr_batchSizes            , 4 * BATCH_STREAM_SIZE), "cuMemAlloc batchSizes");
+	cuCheck(cuMemAlloc(&cptr_batchTags             , 4 * BATCH_STREAM_SIZE), "cuMemAlloc batchTags");
+	cuCheck(cuMemsetD32(cptr_batchTags, 0xFFFFFFFFu, BATCH_STREAM_SIZE), "cuMemsetD32 batchTags");
 	cuCheck(cuMemAlloc(&cptr_frameStart            , 8), "cuMemAlloc frameStart");
 	cuCheck(cuMemAllocHost((void**)&h_stats_pinned , sizeof(Stats)), "cuMemAllocHost stats");
 
@@ -1737,30 +2163,6 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	for(uint64_t i = 0; i < BATCH_STREAM_SIZE; i++){
 		cptr_points_ring[i] = devicemem + i * cptr_points_bytes;
 	}
-
-	// allocate persistent (over multiple frames) buffer with remaining GPU memory
-	size_t availableMem = 0;
-	size_t totalMem = 0;
-	cuMemGetInfo(&availableMem, &totalMem);
-
-	size_t cptr_buffer_persistent_bytes = static_cast<size_t>(static_cast<double>(availableMem) * 0.80);
-	persistentBufferCapacity = cptr_buffer_persistent_bytes;
-	cuCheck(cuMemAlloc(&cptr_buffer_persistent, cptr_buffer_persistent_bytes), "cuMemAlloc persistent buffer");
-
-	uint64_t total = cptr_buffer_bytes 
-		+ cptr_nodes_bytes
-		+ cptr_renderbuffer_bytes
-		+ sizeof(Stats)
-		+ cptr_buffer_persistent_bytes;
-
-	printfmt("cuMemAlloc(&cptr_buffer,            {:8L} MB);\n", cptr_buffer_bytes / 1'000'000llu);
-	printfmt("cuMemAlloc(&cptr_nodes,             {:8L} MB);\n", cptr_nodes_bytes / 1'000'000llu);
-	printfmt("cuMemAlloc(&cptr_renderbuffer,      {:8L} MB);\n", cptr_renderbuffer_bytes / 1'000'000llu);
-	printfmt("cuMemAlloc(&cptr_stats,             {:8L}   );\n", sizeof(Stats));
-	printfmt("cuMemAlloc(&cptr_buffer_persistent, {:8L} MB);\n", cptr_buffer_persistent_bytes / 1'000'000llu);
-	printfmt("==============================================\n");
-	printfmt("                                    {:8L} MB  \n", total / 1'000'000llu);
-	printfmt("\n");
 
 	cuda_program_update = new CudaModularProgram({
 		.modules = {
@@ -1795,12 +2197,90 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	// 	.kernels = {"kernel"}
 	// });
 
+	// The octree pool gets the VRAM that is left, so it is sized only now that
+	// the kernels are compiled. Their local memory (register spills, stack) is
+	// claimed from the same VRAM when they are first launched, for every
+	// thread the GPU can hold at once, and a launch fails if it is not there.
+	size_t stackLimit = 0;
+	int maxThreadsPerSM = 0;
+	cuCtxGetLimit(&stackLimit, CU_LIMIT_STACK_SIZE);
+	cuDeviceGetAttribute(&maxThreadsPerSM, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, device);
+	int maxLocalBytes = 0;
+	for(CudaModularProgram* program : {cuda_program_update, cuda_program_reset, cuda_program_render}){
+		for(auto& [kernelName, kernel] : program->kernels){
+			int localBytes = 0;
+			int numRegisters = 0;
+			cuFuncGetAttribute(&localBytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+			cuFuncGetAttribute(&numRegisters, CU_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+			logLine("[kernel] %s: %d registers, %d bytes local memory per thread\n",
+				kernelName.c_str(), numRegisters, localBytes);
+			maxLocalBytes = std::max(maxLocalBytes, localBytes);
+		}
+	}
+	uint64_t localMemBytes = (uint64_t(maxLocalBytes) + stackLimit) * uint64_t(maxThreadsPerSM) * uint64_t(numSMs);
+
+	// Everything but a fixed reserve, instead of 80% of what was free, which
+	// left about 1 GB idle on an 8 GB card. The reserve is only what is left
+	// over, not set aside for anything in particular, and it is shared by:
+	// - the occupancy and light grids: about 21 MB each at the default
+	//   resolution of 256; at 512, 156-166 MB each for the Rotokare scans but
+	//   up to 537 MB for a cubic cloud. Both step down or switch off when
+	//   memory is short.
+	// - the render buffer growing with the window after startup (1080p to 4K
+	//   adds 280 MB; a window that starts at 4K is sized before the pool)
+	// - GL framebuffers, and the kernels' local memory.
+	size_t availableMem = 0;
+	cuMemGetInfo(&availableMem, &totalMem);
+
+	// Keep back the reserve, but never more than half of what is free, so the
+	// pool grows steadily with free memory (another GPU program may hold some).
+	uint64_t reserveBytes = VRAM_RESERVE_BYTES + localMemBytes;
+	size_t keepBack = size_t(std::min<uint64_t>(reserveBytes, availableMem / 2));
+	size_t cptr_buffer_persistent_bytes = availableMem - keepBack;
+	persistentBufferCapacity = cptr_buffer_persistent_bytes;
+	cuCheck(cuMemAlloc(&cptr_buffer_persistent, cptr_buffer_persistent_bytes), "cuMemAlloc persistent buffer");
+	if(cptr_buffer_persistent_bytes < 300'000'000){
+		// kernel_construct stops 200 MB short of the end
+		logLine("[WARN] only %.0f MB of VRAM for the octree: room for at most %.1f M points. Close other programs using the GPU.\n",
+			cptr_buffer_persistent_bytes / 1e6,
+			cptr_buffer_persistent_bytes > 200'000'000 ? (cptr_buffer_persistent_bytes - 200'000'000) / 30.0 / 1e6 : 0.0);
+	}
+
+	uint64_t total = cptr_buffer_bytes
+		+ cptr_nodes_bytes
+		+ cptr_renderbuffer_bytes
+		+ sizeof(Stats)
+		+ cptr_buffer_persistent_bytes;
+
+	printfmt("cuMemAlloc(&cptr_buffer,            {:8L} MB);\n", cptr_buffer_bytes / 1'000'000llu);
+	printfmt("cuMemAlloc(&cptr_nodes,             {:8L} MB);\n", cptr_nodes_bytes / 1'000'000llu);
+	printfmt("cuMemAlloc(&cptr_renderbuffer,      {:8L} MB);\n", cptr_renderbuffer_bytes / 1'000'000llu);
+	printfmt("cuMemAlloc(&cptr_stats,             {:8L}   );\n", sizeof(Stats));
+	printfmt("cuMemAlloc(&cptr_buffer_persistent, {:8L} MB);\n", cptr_buffer_persistent_bytes / 1'000'000llu);
+	printfmt("==============================================\n");
+	printfmt("                                    {:8L} MB  \n", total / 1'000'000llu);
+	printfmt("\n");
+
+	// The same plan in the run log: stdout is lost when the process is killed,
+	// and the octree pool decides how many points fit.
+	logLine("[vram] %.0f of %.0f MB free at start. Fixed: construct scratch %.0f, nodes %.0f, render %.0f, upload ring %.0f MB."
+		" Octree pool %.0f MB: the %.0f MB then free, less %.0f MB reserve (%.0f MB of it kernel local memory)\n",
+		freeAtStart / 1e6, totalMem / 1e6,
+		cptr_buffer_bytes / 1e6, cptr_nodes_bytes / 1e6, cptr_renderbuffer_bytes / 1e6,
+		(BATCH_STREAM_SIZE * cptr_points_bytes) / 1e6,
+		cptr_buffer_persistent_bytes / 1e6, availableMem / 1e6,
+		double(availableMem - cptr_buffer_persistent_bytes) / 1e6, localMemBytes / 1e6);
+
 	cuEventCreate(&ce_render_start, 0);
 	cuEventCreate(&ce_render_end, 0);
 	cuEventCreate(&ce_update_start, 0);
 	cuEventCreate(&ce_update_end, 0);
 	
 	cuGraphicsGLRegisterImage(&cugl_colorbuffer, renderer->view.framebuffer->colorAttachments[0]->handle, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
+
+	size_t freeAfterInit = 0;
+	cuMemGetInfo(&freeAfterInit, &totalMem);
+	logLine("[vram] %.0f MB free after allocating the octree pool\n", freeAfterInit / 1e6);
 }
 
 void reload(){
@@ -1839,11 +2319,13 @@ void reload(){
 	boxSize = float3{0.0, 0.0, 0.0};
 
 	numPointsTotal  = 0;
+	g_pointsUnreadable = 0;
 	numPointsLoaded = 0;
 	numBatchesTotal = 0;
 	numBytesTotal   = 0;
 	numBytesLoaded  = 0;
 	lazInBatches = false;
+	uint64_t numPointsInFiles = 0;   // before --set keep thins them
 
 	// query bounding box and number of points in input files
 	// vector<PointBatch> batches;
@@ -1860,20 +2342,29 @@ void reload(){
 		if(iEndsWith(path, "las") || iEndsWith(path, "laz")){
 
 			LasHeader header = loadHeader(path);
-			numPointsTotal += header.numPoints;
+			numPointsTotal += keptBefore(header.numPoints);
+			numPointsInFiles += header.numPoints;
 
-			boxMin.x = std::min(boxMin.x, float(header.min[0]));
-			boxMin.y = std::min(boxMin.y, float(header.min[1]));
-			boxMin.z = std::min(boxMin.z, float(header.min[2]));
+			// Rounded outward, so the float box contains every point the
+			// header bounds do: the octree stores points as fixed point
+			// within this box and clamps anything outside onto its faces.
+			// Rounding to nearest could cut off up to half a float spacing,
+			// 0.25 m for georeferenced northings near 5.6e6.
+			auto floorFloat = [](double v){ float f = float(v); return double(f) > v ? std::nextafter(f, -INFINITY) : f; };
+			auto ceilFloat  = [](double v){ float f = float(v); return double(f) < v ? std::nextafter(f,  INFINITY) : f; };
 
-			boxMax.x = std::max(boxMax.x, float(header.max[0]));
-			boxMax.y = std::max(boxMax.y, float(header.max[1]));
-			boxMax.z = std::max(boxMax.z, float(header.max[2]));
+			boxMin.x = std::min(boxMin.x, floorFloat(header.min[0]));
+			boxMin.y = std::min(boxMin.y, floorFloat(header.min[1]));
+			boxMin.z = std::min(boxMin.z, floorFloat(header.min[2]));
+
+			boxMax.x = std::max(boxMax.x, ceilFloat(header.max[0]));
+			boxMax.y = std::max(boxMax.y, ceilFloat(header.max[1]));
+			boxMax.z = std::max(boxMax.z, ceilFloat(header.max[2]));
 
 			for (uint64_t first = 0; first < header.numPoints; first += MAX_BATCH_SIZE) {
 				PointBatch batch;
 				batch.file = path;
-				batch.first = static_cast<int>(first);
+				batch.first = first;
 				batch.count = static_cast<int>(std::min(header.numPoints - first, MAX_BATCH_SIZE));
 				batch.lasHeader = header;
 
@@ -1894,12 +2385,13 @@ void reload(){
 			boxMax.y = std::max(boxMax.y, buffer->get<float>(16));
 			boxMax.z = std::max(boxMax.z, buffer->get<float>(20));
 
-			numPointsTotal += numPoints;
+			numPointsTotal += numPoints;   // .simlod is not thinned
+			numPointsInFiles += numPoints;
 
 			for(uint64_t first = 0; first < numPoints; first += MAX_BATCH_SIZE){
 				PointBatch batch;
 				batch.file = path;
-				batch.first = static_cast<int>(first);
+				batch.first = first;
 				batch.count = static_cast<int>(std::min(numPoints - first, MAX_BATCH_SIZE));
 
 				batchesToProcess.push_back(batch);
@@ -1911,6 +2403,21 @@ void reload(){
 
 		
 	}
+
+	// Markers stay put in FILE coordinates. Each cloud is shifted by its own
+	// minimum corner, so a marker kept in the renderer frame used to land in a
+	// different real place whenever a cloud with other bounds was dropped.
+	// They are moved from the corner of the last cloud that loaded, not of the
+	// last reload: a reload that found no cloud would otherwise break the chain.
+	bool haveBox = std::isfinite(boxMin.x) && std::isfinite(boxMin.y) && std::isfinite(boxMin.z);
+	if(haveBox && std::isfinite(g_markerFrameMin.x)){
+		for(Marker& m : g_markers){
+			m.x += g_markerFrameMin.x - boxMin.x;
+			m.y += g_markerFrameMin.y - boxMin.y;
+			m.z += g_markerFrameMin.z - boxMin.z;
+		}
+	}
+	if(haveBox) g_markerFrameMin = boxMin;
 
 	// std::random_device rd;
 	// std::mt19937 g(rd());
@@ -1927,11 +2434,87 @@ void reload(){
 	boxSize.z = boxMax.z - boxMin.z;
 
 	stats                   = Stats();
+	batchesProcessedHost    = 0;
+	pointsProcessedHost     = 0;
 	numPointsUploaded       = 0;
 	numBatchesProcessed     = 0;
 	lastBatchFinishedDevice = false;
+	loadStoppedAtCapacity   = false;
 	batchStreamUploadIndex  = 0;
 	processFrameTimes.clear();
+
+	if(numPointsTotal > 0){
+		logLine("[load] start: %.2f M points in %d batches, %.2f GB on disk%s\n",
+			numPointsTotal / 1e6, numBatchesTotal.load(), numBytesTotal / 1e9,
+			lazInBatches ? " (LAZ)" : "");
+		if(numPointsTotal != numPointsInFiles){
+			logLine("[load] keeping %.1f%% of the %.2f M points in the file(s), evenly spaced (--set keep)\n",
+				loadKeepPer10k / 100.0, numPointsInFiles / 1e6);
+		}
+	}
+}
+
+// The construct kernel stops inserting once the octree pool is nearly full.
+// The loaders went on decoding up to MAX_DECODED_AHEAD more batches that would
+// never be used, each holding a 16 MB pinned slot: about 50 M points, minutes
+// of LAZ decoding. Drop the queued work instead and mark the load complete.
+void stopLoadingAtCapacity(){
+	{
+		lock_guard<mutex> lock_batchesToProcess(mtx_batchesToProcess);
+		batchesToProcess.clear();
+	}
+
+	// The uploader holds mtx_uploader for all but ~100 ns of each ~100 us pass
+	// and std::mutex is not fair, so ask it to back off outside the lock first,
+	// as reset() does. Without this the main thread could wait indefinitely.
+	resetInProgress = true;
+	{
+		// same lock order as the uploader: mtx_uploader, then the pinned queue
+		lock_guard<mutex> lock_upload(mtx_uploader);
+		lock_guard<mutex> lock_batchesInPinnedMemory(mtx_batchesInPinnedMemory);
+
+		for(PointBatch& batch : batchesInPinnedMemory){
+			pinnedMemPool.release(batch.pinnedMem);
+		}
+		batchesInPinnedMemory.clear();
+
+		// Uploader and loaders idle once every batch counts as uploaded. Batches a
+		// loader is still decoding land in batchesInPinnedMemory and stay there
+		// until the next reload refills the pool.
+		numBatchesTotal = batchStreamUploadIndex.load();
+		loadStoppedAtCapacity = true;
+	}
+	resetInProgress = false;
+}
+
+// One-off, after the last batch: everything the octree build produced, so
+// capacity can be planned from measurements rather than estimates.
+void logLoadSummary(){
+	// synchronous on the default stream, so the counters are the final ones
+	Stats s;
+	if(cuMemcpyDtoH(&s, cptr_stats, sizeof(Stats)) != CUDA_SUCCESS) return;
+
+	double seconds = now() - double(loadStart);
+	double inserted = double(s.numPointsProcessed);
+
+	logLine("[load] done in %.1f s: %.2f M of %.2f M points inserted (%.1f M/s), %.2f M decoded%s\n",
+		seconds, inserted / 1e6, numPointsTotal / 1e6, inserted / 1e6 / std::max(seconds, 1e-3),
+		numPointsLoaded / 1e6,
+		loadStoppedAtCapacity ? ". Stopped: the octree pool is full, the remaining points are not shown" : "");
+	logLine("[load] octree: %u nodes (%u inner, %u leaves, %u non-empty), %.2f M points in leaves, %.2f M voxels (%.2f per point), %u point chunks, %u voxel chunks\n",
+		s.numNodes, s.numInner, s.numLeaves, s.numNonemptyLeaves,
+		s.numPoints / 1e6, s.numVoxels / 1e6, double(s.numVoxels) / std::max(double(s.numPoints), 1.0),
+		s.numChunksPoints, s.numChunksVoxels);
+	size_t freeNow = 0;
+	size_t totalNow = 0;
+	cuMemGetInfo(&freeNow, &totalNow);
+	logLine("[load] memory: octree pool %.0f of %.0f MB used, %.1f bytes per point; construct scratch %.0f of %.0f MB; %.0f MB of VRAM free\n",
+		s.allocatedBytes_persistent / 1e6, persistentBufferCapacity / 1e6,
+		double(s.allocatedBytes_persistent) / std::max(double(s.numPoints), 1.0),
+		s.allocatedBytes_momentary / 1e6, momentaryBufferCapacity / 1e6,
+		freeNow / 1e6);
+	logLine("[load] integrity: %u points dropped (no chunk), %u upload-ring slots refilled while still in use, %u points outside the header box (stored on its faces)\n",
+		s.numDroppedPoints, s.numRingMismatches, s.numClampedPoints);
 }
 
 void reset(shared_ptr<GLRenderer> renderer){
@@ -1971,16 +2554,21 @@ void reset(shared_ptr<GLRenderer> renderer){
 	}
 }
 
-void spawnLoader(size_t i) {
+void spawnLoader(size_t i, int maxLazThreads) {
 
-	auto cpu = getCpuData();
-
-	thread t([&, i]() {
+	// Captures by value: the thread is detached and outlives this call. It used
+	// to capture a local CpuData by reference, so the LAZ thread cap was read
+	// from a dead stack slot and could be anything.
+	thread t([i, maxLazThreads]() {
+		installThreadTerminateHandler();
 		cuCtxSetCurrent(context);
 
 		while (true) {
 			bool everythingIsDone = batchStreamUploadIndex == numBatchesTotal;
-			bool processingLagsBehind = numPointsLoaded > stats.numPointsProcessed + BATCH_STREAM_SIZE * MAX_BATCH_SIZE;
+			// in kept points: with --set keep a batch holds that fraction of
+			// MAX_BATCH_SIZE but still fills a whole pinned slot, and the
+			// unscaled limit let the loaders pin 1/keep times as many batches
+			bool processingLagsBehind = numPointsLoaded > pointsProcessedHost + keptBefore(MAX_DECODED_AHEAD * MAX_BATCH_SIZE);
 
 			// if (processingLagsBehind) {
 			// 	printfmt("processing lags behind\n");
@@ -1999,38 +2587,51 @@ void spawnLoader(size_t i) {
 			mtx_batchesToProcess.lock();
 			// get batch to load, if load queue isn't full
 			if (batchesToProcess.size() > 0) {
-				batch = batchesToProcess.front();
+				const PointBatch& next = batchesToProcess.front();
 
-				// if it's a laz file, limit loading to fewer thrads.
-				int maxThreads = std::max(double(cpu.numProcessors) / 2.0, 1.0);
-				if(batch.count > 0 && iEndsWith(batch.file, "laz"))
-				if(numThreadsLoading >= maxThreads)
-				{
+				// LAZ decoding is CPU-bound, so cap the threads loading at once.
+				// Tested and counted under this lock, so the cap is exact. Capped
+				// threads used to retry without sleeping and kept this mutex busy
+				// for the threads that were decoding.
+				if(next.count > 0 && iEndsWith(next.file, "laz") && numThreadsLoading >= uint64_t(maxLazThreads)){
 					mtx_batchesToProcess.unlock();
+					std::this_thread::sleep_for(1ms);
 					continue;
 				}
 
+				batch = next;
 				batchesToProcess.pop_front();
+
+				if(batch.count > 0) numThreadsLoading++;
 			}
 			mtx_batchesToProcess.unlock();
 
-			PinnedMemorySlot pinnedMemSlot = pinnedMemPool.acquire();
-			Point* pinnedPoints = (Point*)pinnedMemSlot.memLocation;
-			
 			if (batch.count > 0) {
 				// load points in batch
+
+				// Taken only with work in hand. Idle loaders took and returned a
+				// slot every millisecond, and allocated a new one whenever the
+				// pool happened to be empty.
+				PinnedMemorySlot pinnedMemSlot = pinnedMemPool.acquire();
+				Point* pinnedPoints = (Point*)pinnedMemSlot.memLocation;
 
 				int batchID = batch.first / MAX_BATCH_SIZE;
 				double t_start = now();
 				// printfmt("start loading batch {} at {:.3f} \n", batchID, t_start);
 
-				numThreadsLoading++;
 				if(iEndsWith(batch.file, "las")){
 					void* target = (void*)pinnedPoints;
 
 					double translation[3] = {-boxMin.x, -boxMin.y, -boxMin.z};
 					loadLasNative(batch.file, batch.lasHeader, batch.first, batch.count, target, translation);
 					numBytesLoaded += batch.count * batch.lasHeader.bytesPerPoint;
+					if(loadKeepPer10k < 10000){   // --set keep: compact what is kept
+						int kept = 0;
+						for(int k = 0; k < batch.count; k++){
+							if(keepPoint(uint64_t(batch.first) + k)) pinnedPoints[kept++] = pinnedPoints[k];
+						}
+						batch.count = kept;
+					}
 
 					batch.pinnedMem = pinnedMemSlot;
 
@@ -2047,17 +2648,36 @@ void spawnLoader(size_t i) {
 					laszip_BOOL is_compressed;
 					laszip_BOOL request_reader = true;
 
-					laszip_create(&laszip_reader);
+					// One reader per batch, destroyed at the end: it was created and
+					// never destroyed, leaking a reader for every batch of every load.
+					if(laszip_create(&laszip_reader) != 0 || laszip_reader == nullptr){
+						logLine("[load] laszip_create failed for %s; %d points skipped\n", batch.file.c_str(), batch.count);
+						skipUnreadableBatch(batch);
+						pinnedMemPool.release(pinnedMemSlot);
+						numThreadsLoading--;
+						continue;
+					}
 					laszip_request_compatibility_mode(laszip_reader, request_reader);
-					laszip_open_reader(laszip_reader, batch.file.c_str(), &is_compressed);
+					if(laszip_open_reader(laszip_reader, batch.file.c_str(), &is_compressed) != 0){
+						laszip_CHAR* err = nullptr;
+						laszip_get_error(laszip_reader, &err);
+						logLine("[load] cannot open %s: %s; %d points skipped\n", batch.file.c_str(), err ? err : "unknown laszip error", batch.count);
+						laszip_destroy(laszip_reader);
+						skipUnreadableBatch(batch);
+						pinnedMemPool.release(pinnedMemSlot);
+						numThreadsLoading--;
+						continue;
+					}
 
 					laszip_get_header_pointer(laszip_reader, &header);
 					laszip_get_point_pointer(laszip_reader, &laz_point);
 					laszip_seek_point(laszip_reader, batch.first);
 
+					int kept = 0;
 					for (int i = 0; i < batch.count; i++) {
 						double XYZ[3];
 						laszip_read_point(laszip_reader);
+						if(!keepPoint(uint64_t(batch.first) + i)) continue;   // --set keep
 						laszip_get_coordinates(laszip_reader, XYZ);
 
 						Point point;
@@ -2076,10 +2696,12 @@ void spawnLoader(size_t i) {
 						//point.rgba[2] = intensity / 200;
 
 
-						pinnedPoints[i] = point;
+						pinnedPoints[kept++] = point;
 					}
+					batch.count = kept;
 
 					laszip_close_reader(laszip_reader);
+					laszip_destroy(laszip_reader);
 
 					batch.pinnedMem = pinnedMemSlot;
 
@@ -2108,9 +2730,6 @@ void spawnLoader(size_t i) {
 				// printfmt("finished loading batch {} at {:.3f}. duration: {:.3f} ms \n", batchID, t_end, millies);
 
 				numThreadsLoading--;
-			}else {
-				// give back pinned memory slot if we didn't use it
-				pinnedMemPool.release(pinnedMemSlot);
 			}
 
 			std::this_thread::sleep_for(1ms);
@@ -2127,6 +2746,7 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 	double timestamp = now();
 
 	thread t([&]() {
+		installThreadTerminateHandler();
 
 		vector<PinnedMemorySlot> availableSlots;
 
@@ -2172,10 +2792,18 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 			availableSlots.clear();
 
 			bool everythingIsDone = batchStreamUploadIndex == numBatchesTotal;
-			bool processingLagsBehind = numPointsUploaded > stats.numPointsProcessed + BATCH_STREAM_SIZE * MAX_BATCH_SIZE;
+
+			// Batch k goes to ring slot k % BATCH_STREAM_SIZE, which last held
+			// batch k - BATCH_STREAM_SIZE. That slot may be refilled only once the
+			// kernel has finished its batch. batchletIndex counts finished batches
+			// and the host copy lags, so it can only under-report; the margin of
+			// two covers a copy read while it was being written. The old test
+			// compared point counts with '>', which with full batches let batch
+			// k + BATCH_STREAM_SIZE overwrite batch k before the kernel read it.
+			bool ringFull = int64_t(batchStreamUploadIndex) >= int64_t(batchesProcessedHost) + int64_t(BATCH_STREAM_SIZE) - 2;
 
 			if (everythingIsDone) continue;
-			if (processingLagsBehind) continue;
+			if (ringFull) continue;
 
 			auto t_00 = now();
 
@@ -2200,14 +2828,20 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 			auto target     = cptr_points_ring[uploadRingIndex];
 			size_t byteSize = batch.count * sizeof(Point);
 
-			cuMemcpyHtoDAsync(target, source, byteSize, stream_upload);
+			// Tag the slot as in transit, then with its batch index once the data
+			// is in. kernel_construct counts a slot whose tag is not the batch it
+			// expects (Stats::numRingMismatches): the tripwire for the gate above.
+			cuMemsetD32Async(cptr_batchTags + 4 * uploadRingIndex, 0xFFFFFFFFu, 1, stream_upload);
+
+			if(byteSize > 0) cuMemcpyHtoDAsync(target, source, byteSize, stream_upload);   // --set keep can empty a short batch
 
 			// record upload event
 			cuEventRecord(batch.pinnedMem.uploadEnd, stream_upload);
 
-			// since we process N batches per frame and batches may have varying amounts of points, 
+			// since we process N batches per frame and batches may have varying amounts of points,
 			// we need to let the kernel know the size of each individual batch
 			cuMemsetD32Async(cptr_batchSizes + 4 * uploadRingIndex, batch.count, 1, stream_upload);
+			cuMemsetD32Async(cptr_batchTags + 4 * uploadRingIndex, targetSlot, 1, stream_upload);
 
 			// also let the kernel know how many batches we uploaded
 			cuMemsetD32Async(cptr_numBatchesUploaded, batchStreamUploadIndex + 1, 1, stream_upload);
@@ -2225,6 +2859,58 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 	setThreadPriorityHigh(t);
 }
 
+// ---- screenshots from the command line ------------------------------------
+// --shots <list>: once the cloud has loaded, visit each camera in the list,
+// let the frame settle, and save it. --screenshot <file.bmp> saves the start
+// camera's frame. With --exit the app quits after the last one. For comparing
+// the look before and after a change, at a fixed size (--render).
+struct ShotRequest{
+	string path;                             // .bmp to write
+	bool   hasView = false;
+	double view[6] = {0, 0, 0, 0, 0, 0};     // yaw pitch radius tx ty tz, as --view
+};
+
+// The rendered frame, without the UI, as a 24-bit .bmp. GL rows run bottom to
+// top, as .bmp rows do, so they are written in order.
+static bool saveFrameBmp(GLRenderer& renderer, const string& path){
+	auto& texture = renderer.view.framebuffer->colorAttachments[0];
+	int w = texture->width;
+	int h = texture->height;
+	if(w <= 0 || h <= 0) return false;
+
+	vector<uint8_t> rgba(size_t(w) * size_t(h) * 4);
+	glGetTextureImage(texture->handle, 0, GL_RGBA, GL_UNSIGNED_BYTE, GLsizei(rgba.size()), rgba.data());
+
+	int rowBytes = (w * 3 + 3) & ~3;
+	uint32_t dataBytes = uint32_t(rowBytes) * uint32_t(h);
+	uint8_t header[54] = {'B', 'M'};
+	auto put32 = [&](int at, uint32_t v){ memcpy(header + at, &v, 4); };
+	auto put16 = [&](int at, uint16_t v){ memcpy(header + at, &v, 2); };
+	put32( 2, 54 + dataBytes);   // file size
+	put32(10, 54);               // pixel data offset
+	put32(14, 40);               // BITMAPINFOHEADER
+	put32(18, uint32_t(w));
+	put32(22, uint32_t(h));      // positive: rows bottom to top
+	put16(26, 1);
+	put16(28, 24);
+	put32(34, dataBytes);
+
+	std::ofstream out(path, std::ios::binary);
+	if(!out) return false;
+	out.write((const char*)header, 54);
+	vector<uint8_t> row(rowBytes, 0);
+	for(int y = 0; y < h; y++){
+		const uint8_t* src = &rgba[size_t(y) * size_t(w) * 4];
+		for(int x = 0; x < w; x++){
+			row[3 * x + 0] = src[4 * x + 2];
+			row[3 * x + 1] = src[4 * x + 1];
+			row[3 * x + 2] = src[4 * x + 0];
+		}
+		out.write((const char*)row.data(), rowBytes);
+	}
+	return bool(out);
+}
+
 int main(int argc, char** argv){
 
 	// ---- last-words handlers ---------------------------------------------
@@ -2235,20 +2921,37 @@ int main(int argc, char** argv){
 	// thread and could not say where the fault was.
 	logLine("[host] SimLOD starting\n");   // opens the run log, so its path is known
 	installCrashHandler(g_logPath.c_str());
-	std::signal(SIGABRT, [](int){
-		logLine("[CRASH] SIGABRT - abort() called, usually an assertion or a failed allocation\n");
-		fflush(stdout);
-		std::_Exit(134);
-	});
+	// (abort() and uncaught exceptions are handled there too, with a stack)
+
+	// --hidden: an invisible window for unattended runs; frames still render
+	// offscreen, so --shots works, and nothing appears on the desktop
+	for(int i = 1; i < argc; i++){
+		if(string(argv[i]) == "--hidden") GLRenderer::startHidden = true;
+	}
 
 	auto renderer = make_shared<GLRenderer>();
+
+	// Fonts, before the first frame builds the atlas. The default font goes in
+	// first so it stays the default for every other window. ProggyTiny gets
+	// the settings AddFontDefault uses for ProggyClean, by the same designer:
+	// no oversampling, glyphs snapped to whole pixels, one pixel lower.
+	{
+		ImGuiIO& io = ImGui::GetIO();
+		io.Fonts->AddFontDefault();
+		ImFontConfig cfg;
+		cfg.OversampleH   = 1;
+		cfg.OversampleV   = 1;
+		cfg.PixelSnapH    = true;
+		cfg.GlyphOffset.y = 1.0f;
+		g_menuFont = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ProggyTiny_compressed_data_base85, 10.0f, &cfg);
+	}
 	auto cpu = getCpuData();
-	// int numThreads = 2 * static_cast<int>(cpu.numProcessors);
-	int numThreads = 2 * static_cast<int>(cpu.numProcessors);
-	// numThreads = 16;
-	// int numThreads = max(2 * cpu.numProcessors - 10, 2ull);
-	printfmt("cpu.numProcessors: {} \n", cpu.numProcessors);
-	printfmt("launching {} loader threads \n", numThreads);
+	// One loader per hardware thread (was two). LAZ decoding is capped lower,
+	// leaving cores for the render loop, the uploader and the OS.
+	int numThreads    = std::max(4, static_cast<int>(cpu.numProcessors));
+	int maxLazThreads = std::max(1, static_cast<int>(cpu.numProcessors) - 4);
+	logLine("[load] %d loader threads, at most %d decoding LAZ at once (%d hardware threads)\n",
+		numThreads, maxLazThreads, static_cast<int>(cpu.numProcessors));
 
 
 	renderer->controls->yaw    = -1.15;
@@ -2277,6 +2980,16 @@ int main(int argc, char** argv){
 	// renderer->controls->target = { 354.609, 764.038, 25.101, };
 
 
+	// --render W H is read before the GPU buffers are sized, so that the render
+	// buffer for that frame size is in place before the octree pool
+	for(int i = 1; i + 2 < argc; i++){
+		if(string(argv[i]) == "--render"){
+			renderer->renderWidth  = std::max(0, std::atoi(argv[i + 1]));
+			renderer->renderHeight = std::max(0, std::atoi(argv[i + 2]));
+			logLine("[host] rendering at %d x %d, scaled to the window\n", renderer->renderWidth, renderer->renderHeight);
+		}
+	}
+
 	initCuda();
 	initCudaProgram(renderer);
 
@@ -2285,7 +2998,7 @@ int main(int argc, char** argv){
 	mtx_loader.reserve(numThreads);
 	for(int i = 0; i < numThreads; i++){
 		mtx_loader.push_back(make_unique<mutex>());
-		spawnLoader(i);
+		spawnLoader(i, maxLazThreads);
 	}
 
 	cudaprint.init();
@@ -2299,31 +3012,87 @@ int main(int argc, char** argv){
 	bool haveView = false;
 	double view[6] = {0, 0, 0, 0, 0, 0};
 	vector<string> argFiles;
+	string argCalls;
+	vector<ShotRequest> shots;
+	double shotDelay = 3.0;        // seconds at each shot's camera before saving
+	int benchFrames = 0;           // --bench N: time N frames at each shot's camera first
+	bool exitAfterShots = false;
 	for(int i = 1; i < argc; i++){
 		string arg = argv[i];
 		if(arg == "--view" && i + 6 < argc){
 			for(int k = 0; k < 6; k++) view[k] = std::atof(argv[i + 1 + k]);
 			haveView = true;
 			i += 6;
+		}else if(arg == "--render" && i + 2 < argc){
+			i += 2;   // applied before the GPU buffers were sized
+		}else if(arg == "--calls" && i + 1 < argc){
+			argCalls = argv[++i];
+		}else if(arg == "--screenshot" && i + 1 < argc){
+			ShotRequest shot;
+			shot.path = argv[++i];
+			shots.push_back(shot);
+		}else if(arg == "--shots" && i + 1 < argc){
+			// one shot per line: name yaw pitch radius tx ty tz, written to
+			// <name>.bmp beside the list; '#' starts a comment
+			std::filesystem::path list = argv[++i];
+			std::ifstream in(list);
+			if(!in) logLine("[shot] cannot open %s\n", list.string().c_str());
+			string line;
+			bool firstLine = true;
+			while(std::getline(in, line)){
+				// a UTF-8 BOM (PowerShell's utf8) would become part of the first name
+				if(firstLine && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
+				firstLine = false;
+				std::stringstream ss(line);
+				ShotRequest shot;
+				string name;
+				if(!(ss >> name) || name[0] == '#') continue;
+				for(int k = 0; k < 6; k++) ss >> shot.view[k];
+				if(!ss){ logLine("[shot] %s: malformed line skipped: %s\n", list.string().c_str(), line.c_str()); continue; }
+				shot.hasView = true;
+				shot.path = (list.parent_path() / (name + ".bmp")).string();
+				shots.push_back(shot);
+			}
+		}else if(arg == "--shot-delay" && i + 1 < argc){
+			shotDelay = std::max(0.0, std::atof(argv[++i]));
+		}else if(arg == "--exit"){
+			exitAfterShots = true;
+		}else if(arg == "--bench" && i + 1 < argc){
+			benchFrames = std::max(0, std::atoi(argv[++i]));
+		}else if(arg == "--hidden"){
+			// applied before the window was created
 		}else if(arg == "--set" && i + 1 < argc){
-			// --set name=value, for the settings that matter most on a small GPU
+			// --set name=value, for the settings that matter most on a small GPU,
+			// and for repeatable screenshots
 			string kv = argv[++i];
 			size_t eq = kv.find('=');
 			string key = kv.substr(0, eq);
 			double v = (eq == string::npos) ? 1.0 : std::atof(kv.c_str() + eq + 1);
-			if     (key == "hqs")      settings.useHighQualityShading = v != 0.0;
-			else if(key == "splat")    settings.maxSplatPx            = int(v);
-			else if(key == "detail")   settings.minNodeSize           = float(v);
-			else if(key == "adaptive") settings.adaptiveDetail        = v != 0.0;
-			else if(key == "budget")   settings.frameBudgetMs         = float(v);
-			else if(key == "vsync")    settings.vsync                 = v != 0.0;
-			else if(key == "light")    settings.lightOn               = v != 0.0;
-			else if(key == "sunbeams") settings.sunbeams              = float(v);
-			else if(key == "haze"){    settings.fogDensity            = float(v); settings.enableFog = v > 0.0; }
-			else if(key == "hazefall") settings.fogHeightFalloff      = float(v);
-			else if(key == "hazefloor") settings.fogBase              = float(v);
-			else if(key == "hazesky")  settings.fogSky                = v != 0.0;
-			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, light, sunbeams, haze, hazefall, hazefloor, hazesky)\n", key);
+			if     (key == "hqs")       settings.useHighQualityShading = v != 0.0;
+			else if(key == "splat")     settings.maxSplatPx            = int(v);
+			else if(key == "detail")    settings.minNodeSize           = float(v);
+			else if(key == "adaptive")  settings.adaptiveDetail        = v != 0.0;
+			else if(key == "budget")    settings.frameBudgetMs         = float(v);
+			else if(key == "vsync")     settings.vsync                 = v != 0.0;
+			else if(key == "insects")   settings.numInsects            = int(v);
+			else if(key == "grain")     settings.grain                 = float(v);
+			else if(key == "bloom")   { settings.bloomStrength         = float(v); settings.enableBloom = v > 0.0; }
+			else if(key == "markers") { settings.showEventMarkers      = v != 0.0; settings.showMarkers = v != 0.0; }
+			else if(key == "pointsize") settings.pointWorldSize        = float(v);
+			else if(key == "gain")      settings.emissionGain          = float(v);
+			else if(key == "haze")    { settings.fogDensity            = float(v); settings.enableFog = v > 0.0; }
+			else if(key == "hazefall")  settings.fogHeightFalloff      = float(v);
+			else if(key == "hazefloor") settings.fogBase               = float(v);
+			else if(key == "hazesky")   settings.fogSky                = v != 0.0;
+			else if(key == "light")     settings.lightOn               = v != 0.0;
+			else if(key == "sunbeams")  settings.sunbeams              = float(v);
+			else if(key == "whitefix")  settings.whiteFix              = v != 0.0;
+			else if(key == "skycast")   settings.tintMargin            = float(v);   // Scan clean-up > Sky cast
+			else if(key == "torch")     settings.torchOn               = v != 0.0;   // aims at the frame centre
+			else if(key == "radius")  { g_eventRadiusArg = float(v); if(v > 0.0) g_eventRadius = float(v); }
+			else if(key == "exposure")  settings.exposure              = float(v);
+			else if(key == "keep")      loadKeepPer10k = uint32_t(std::clamp(v, 0.01, 1.0) * 10000.0 + 0.5);   // fraction of each file loaded
+			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze, hazefall, hazefloor, hazesky, light, sunbeams, whitefix, skycast, torch, radius, exposure, keep)\n", key);
 		}else if(iEndsWith(arg, "las") || iEndsWith(arg, "laz") || iEndsWith(arg, "simlod")){
 			std::error_code ec;
 			auto absolute = std::filesystem::absolute(arg, ec);   // dropped files are absolute too
@@ -2335,6 +3104,22 @@ int main(int argc, char** argv){
 	if(argc > 1){
 		logLine("[host] command line: %d file(s)%s\n", int(argFiles.size()), haveView ? ", --view" : "");
 		for(auto& f : argFiles) logLine("[host]   %s\n", f.c_str());
+	}
+
+	// --calls: load and play the schedule, as the Calls panel's Load and Play
+	// buttons do, with bloom on as opening that panel turns it on
+	if(!argCalls.empty()){
+		loadCallSchedule(argCalls);
+		g_showClock   = 0.0;
+		g_showPlaying = g_callsLoaded;
+		settings.enableBloom = settings.bloomStrength > 0.0f;
+		logLine("[calls] %s: %d calls, %s\n", argCalls.c_str(), int(g_calls.size()), g_callsLoaded ? "playing" : "none loaded");
+	}
+	if(!shots.empty()){
+		logLine("[shot] %d screenshot(s) after loading, %.1f s each%s\n", int(shots.size()), shotDelay, exitAfterShots ? ", then exit" : "");
+		GLRenderer::inputLocked = true;   // a stray click or scroll would move the shots' camera
+	}else if(exitAfterShots){
+		logLine("[shot] --exit given but there are no screenshots to take; exiting once the load finishes\n");
 	}
 
 	reload();
@@ -2369,13 +3154,20 @@ int main(int argc, char** argv){
 		printfmt("drop at {:.3f} \n", now());
 
 		for(auto file : files){
-			printfmt("dropped: {} \n", file);
+			logLine("[load] dropped: %s\n", file.c_str());
 
 			if(iEndsWith(file, "las") || iEndsWith(file, "laz")){
 				pointCloudFiles.push_back(file);
 			}else if(iEndsWith(file, "simlod")){
 				pointCloudFiles.push_back(file);
 			}
+		}
+
+		// a stray CSV or folder must not clear the scene (and a reload of the
+		// full scan takes minutes)
+		if(pointCloudFiles.empty()){
+			notice("No .las, .laz or .simlod in the drop - keeping the current cloud");
+			return;
 		}
 
 		paths = pointCloudFiles;
@@ -2411,7 +3203,7 @@ int main(int argc, char** argv){
 		// second, so it is the same at any frame rate.
 		{
 			ImGuiIO& io = ImGui::GetIO();
-			if(!io.WantCaptureKeyboard){
+			if(!io.WantCaptureKeyboard && !GLRenderer::inputLocked){
 				float dt = timeSinceLastFrame > 0.0f && timeSinceLastFrame < 0.5f ? timeSinceLastFrame : 0.016f;
 				double d = double(g_walkSpeed) * double(dt);
 				auto held = [](int key){ return Runtime::keyStates[key] > 0; };
@@ -2439,10 +3231,32 @@ int main(int argc, char** argv){
 			bool leftDown = glfwGetMouseButton(renderer->window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;   // fix_pick_input
 			ImGuiIO& io = ImGui::GetIO();
 			bool pKey = glfwGetKey(renderer->window, GLFW_KEY_P) == GLFW_PRESS && !io.WantCaptureKeyboard;
-			if(((altDown && leftDown && !g_leftWasDown) || (pKey && !g_pKeyWasDown)) && !io.WantCaptureMouse){
-				double mx=0.0, my=0.0; glfwGetCursorPos(renderer->window,&mx,&my);
-				g_pickReqX = int(mx);
-				g_pickReqY = renderer->height - 1 - int(my);
+			// window pixels to frame pixels through the rectangle the frame is
+			// shown in: they differ when it is rendered at a fixed size (--render)
+			double mx=0.0, my=0.0; glfwGetCursorPos(renderer->window,&mx,&my);
+			double rectTop = double(renderer->windowHeight - (renderer->presentY + renderer->presentHeight));   // cursor y runs top down
+			double fx = (mx - renderer->presentX) * double(renderer->width)  / double(std::max(renderer->presentWidth, 1));
+			double fy = (my - rectTop)            * double(renderer->height) / double(std::max(renderer->presentHeight, 1));
+			bool onFrame = fx >= 0.0 && fy >= 0.0 && fx < renderer->width && fy < renderer->height;
+			// torch: aim through the cursor while it is over the frame; T toggles
+			{
+				// the key's edge is tracked even while shots lock the input, so a
+				// T held as the lock lifts does not toggle either
+				static bool tWasDown = false;
+				bool tDown = glfwGetKey(renderer->window, GLFW_KEY_T) == GLFW_PRESS && !io.WantCaptureKeyboard;
+				if(tDown && !tWasDown && !GLRenderer::inputLocked) settings.torchOn = !settings.torchOn;
+				tWasDown = tDown;
+				Runtime::torchMode = settings.torchOn;
+				if(settings.torchOn && onFrame && !io.WantCaptureMouse && !GLRenderer::inputLocked){
+					// clamped: fy can come within a pixel of height when the frame
+					// is shown enlarged, and a negative y means "not aimed yet"
+					g_torchPx = std::min(float(fx), float(renderer->width - 1));
+					g_torchPy = std::max(0.0f, float(renderer->height - 1) - float(fy));
+				}
+			}
+			if(((altDown && leftDown && !g_leftWasDown) || (pKey && !g_pKeyWasDown)) && !io.WantCaptureMouse && onFrame && !GLRenderer::inputLocked){
+				g_pickReqX = int(fx);
+				g_pickReqY = renderer->height - 1 - int(fy);
 				g_pickSeq++;
 				g_pickSeenDone = 0;
 				g_pickWaiting = true;
@@ -2490,7 +3304,9 @@ int main(int argc, char** argv){
 		}
 		lastFrameTime = static_cast<float>(now());
 
-		renderer->view.framebuffer->setSize(renderer->width, renderer->height);
+		if(renderer->width > 0 && renderer->height > 0){   // 0 x 0 while minimised
+			renderer->view.framebuffer->setSize(renderer->width, renderer->height);
+		}
 
 		glBindFramebuffer(GL_FRAMEBUFFER, renderer->view.framebuffer->handle);
 
@@ -2509,8 +3325,112 @@ int main(int argc, char** argv){
 			if(wanted != appliedSwapInterval){ glfwSwapInterval(wanted); appliedSwapInterval = wanted; }
 		}
 
-		beginFrameState();
+		beginFrameState(renderer->width, renderer->height);
 		renderCUDA(renderer);
+
+		// ---- command-line screenshots (--shots, --screenshot) -------------
+		// After the load: move to each shot's camera, wait shotDelay for the
+		// occupancy grid, light and glow to settle, then save the frame just
+		// rendered. A camera set here takes effect from the next frame. The
+		// window still takes mouse and keys, so if the camera moves while a
+		// shot waits (anything but the controls' own adjustment on the first
+		// frame, such as pinning the radius in walk mode), the shot's camera
+		// is set again and the wait starts over.
+		if(exitAfterShots && shots.empty() && lastBatchFinishedDevice){
+			glfwSetWindowShouldClose(renderer->window, 1);
+		}
+		if(!shots.empty() && lastBatchFinishedDevice){
+			static size_t shotIndex = 0;
+			static int    shotPhase = 0;   // 0 set the camera, 1 note where it settled, 2 wait
+			static double shotStart = 0.0;
+			static double settled[6] = {0, 0, 0, 0, 0, 0};
+			static double startView[6] = {0, 0, 0, 0, 0, 0};
+			static bool   haveStartView = false;
+			struct BenchSample{ double t[7]; uint32_t drawn; };   // ms at each stage boundary
+			static vector<BenchSample> benchSamples;
+			static uint32_t benchLastFrame = ~0u;
+			auto& controls = renderer->controls;
+			double current[6] = {controls->yaw, controls->pitch, controls->radius,
+			                     controls->target.x, controls->target.y, controls->target.z};
+			// the camera after the load (the start camera, or --view): shots
+			// without a camera of their own (--screenshot) use it, even after
+			// --shots has moved the camera
+			if(!haveStartView){
+				std::copy(current, current + 6, startView);
+				haveStartView = true;
+			}
+			if(shotIndex < shots.size()){
+				const ShotRequest& shot = shots[shotIndex];
+				const double* view = shot.hasView ? shot.view : startView;
+				if(shotPhase == 2 && !std::equal(current, current + 6, settled)){
+					logLine("[shot] camera moved while waiting for %s; setting it again\n", shot.path.c_str());
+					shotPhase = 0;
+					benchSamples.clear();
+				}
+				if(shotPhase == 0){
+					controls->yaw    = view[0];
+					controls->pitch  = view[1];
+					controls->radius = view[2];
+					controls->target = { view[3], view[4], view[5] };
+					shotStart = now();
+					shotPhase = 1;
+				}else if(shotPhase == 1){
+					std::copy(current, current + 6, settled);
+					shotPhase = 2;
+				}else if(!g_frameDrawn){
+					// minimised, or nothing could be drawn: the frame texture is
+					// stale, so wait for shotDelay of frames that are drawn
+					shotStart = now();
+				}else if(now() - shotStart >= shotDelay && benchFrames > 0 && int(benchSamples.size()) < benchFrames){
+					// --bench: time benchFrames frames at this camera before the
+					// shot. The stage times come from kernel_render itself
+					// (Stats::stageNs, ns since kernel start at each stage); the
+					// readback lags, so each frame is taken once, by its frameID.
+					if(stats.frameID != benchLastFrame && stats.stageNs[6] > 0){
+						benchLastFrame = stats.frameID;
+						BenchSample b;
+						for(int k = 0; k < 7; k++) b.t[k] = double(stats.stageNs[k]) / 1e6;
+						b.drawn = stats.numDrawn;
+						benchSamples.push_back(b);
+					}
+				}else if(now() - shotStart >= shotDelay){
+					if(!benchSamples.empty()){
+						// medians, per stage: setup, points, extras, edl, volumetric, bloom, composite
+						auto median = [&](auto stageOf){
+							vector<double> v;
+							for(const BenchSample& b : benchSamples) v.push_back(stageOf(b));
+							std::sort(v.begin(), v.end());
+							return v[v.size() / 2];
+						};
+						double total = median([](const BenchSample& b){ return b.t[6]; });
+						double minTotal = 1e30;
+						for(const BenchSample& b : benchSamples) minTotal = std::min(minTotal, b.t[6]);
+						logLine("[bench] %s: render %.1f ms (min %.1f) | setup %.1f points %.1f extras %.1f edl %.1f volumetric %.1f bloom %.1f composite %.1f | drawn %.1f M | %d frames at %d x %d\n",
+							std::filesystem::path(shot.path).stem().string().c_str(), total, minTotal,
+							median([](const BenchSample& b){ return b.t[0]; }),
+							median([](const BenchSample& b){ return b.t[1] - b.t[0]; }),
+							median([](const BenchSample& b){ return b.t[2] - b.t[1]; }),
+							median([](const BenchSample& b){ return b.t[3] - b.t[2]; }),
+							median([](const BenchSample& b){ return b.t[4] - b.t[3]; }),
+							median([](const BenchSample& b){ return b.t[5] - b.t[4]; }),
+							median([](const BenchSample& b){ return b.t[6] - b.t[5]; }),
+							benchSamples.back().drawn / 1e6, int(benchSamples.size()), renderer->width, renderer->height);
+						benchSamples.clear();
+						benchLastFrame = ~0u;
+					}
+					bool ok = saveFrameBmp(*renderer, shot.path);
+					logLine("[shot] %s %s (%d x %d) camera %.3f %.3f %.3f  %.2f %.2f %.2f\n", ok ? "wrote" : "FAILED to write",
+						shot.path.c_str(), renderer->width, renderer->height,
+						current[0], current[1], current[2], current[3], current[4], current[5]);
+					shotIndex++;
+					shotPhase = 0;
+					if(shotIndex == shots.size()){
+						GLRenderer::inputLocked = false;   // shots done: the viewer is the user's again
+						if(exitAfterShots) glfwSetWindowShouldClose(renderer->window, 1);
+					}
+				}
+			}
+		}
 
 		if(!lastBatchFinishedDevice){
 			updateOctree(renderer);
@@ -2537,8 +3457,21 @@ int main(int argc, char** argv){
 			// seems to be fine to add the async copy to the main stream?
 			cuMemcpyDtoHAsync(h_stats_pinned, cptr_stats, sizeof(Stats), ((CUstream)CU_STREAM_DEFAULT));
 			memcpy(&stats, h_stats_pinned, sizeof(Stats));
+			batchesProcessedHost = stats.batchletIndex;
+			pointsProcessedHost  = stats.numPointsProcessed;
 
 			statsAge = static_cast<int>(renderer->frameCount) - stats.frameID;
+
+			if(!lastBatchFinishedDevice && numPointsTotal > 0){
+				logIfChanged("load", 2.0, "[load] %.1f s: %.1f M decoded, %.1f M uploaded, %.1f M of %.1f M inserted; octree pool %.0f of %.0f MB\n",
+					now() - double(loadStart), numPointsLoaded / 1e6, numPointsUploaded / 1e6,
+					stats.numPointsProcessed / 1e6, numPointsTotal / 1e6,
+					stats.allocatedBytes_persistent / 1e6, persistentBufferCapacity / 1e6);
+			}
+
+			if(stats.memCapacityReached && !loadStoppedAtCapacity && !lastBatchFinishedDevice){
+				stopLoadingAtCapacity();
+			}
 
 			static uint64_t previousNumPointsProcessed = 0;
 			uint64_t numPointsProcessed = stats.numPointsProcessed;
@@ -2549,6 +3482,15 @@ int main(int argc, char** argv){
 			// 	previousNumPointsProcessed = numPointsProcessed;
 			// }
 			
+
+			{   // batches a loader could not read (skipUnreadableBatch)
+				static uint64_t reportedUnreadable = 0;
+				uint64_t unreadable = g_pointsUnreadable.load();
+				if(unreadable != reportedUnreadable){
+					reportedUnreadable = unreadable;
+					if(unreadable > 0) notice("Could not read part of the input: %.2f M points skipped (see log)", double(unreadable) / 1e6);
+				}
+			}
 
 			bool newLastBatchFinishedDevice = stats.numPointsProcessed == uint64_t(numPointsTotal);
 			if(stats.memCapacityReached){
@@ -2561,13 +3503,15 @@ int main(int argc, char** argv){
 				printfmt("stats.numPointsProcessed = {} \n", stats.numPointsProcessed);
 				printfmt("numPointsTotal = {} \n", uint64_t(numPointsTotal));
 				printfmt("setting lastBatchFinishedDevice = {} \n", lastBatchFinishedDevice ? "true" : "false");
+
+				if(lastBatchFinishedDevice && numPointsTotal > 0) logLoadSummary();
 			}
 		}
 
 		if(Runtime::showGUI)
 		{ // RENDER IMGUI SETTINGS WINDOW
 
-			// ---- movable, collapsible windows (apply_windows.ps1) -------------
+			// ---- movable, collapsible windows ---------------------------------
 			// SetNextWindowPos/Size with no ImGuiCond default to Always, so the
 			// windows were re-pinned every frame and could not be moved or
 			// resized. FirstUseEver places them once and then leaves them alone.
@@ -2579,7 +3523,7 @@ int main(int argc, char** argv){
 								 bool& collapsedState, ImVec2& savedSize) -> bool {
 				ImGui::SetNextWindowPos(pos, ImGuiCond_FirstUseEver);
 				if(collapsedState){
-					float w = ImGui::CalcTextSize(title).x
+					float w = ImGui::CalcTextSize(title, nullptr, true).x
 							+ ImGui::GetStyle().WindowPadding.x * 2.0f
 							+ ImGui::GetFrameHeight()            // collapse arrow
 							+ ImGui::GetFontSize();              // close button
@@ -2590,7 +3534,12 @@ int main(int argc, char** argv){
 				}
 				bool open = ImGui::Begin(title);
 				bool nowCollapsed = ImGui::IsWindowCollapsed();
-				if(!nowCollapsed){
+				if(!nowCollapsed && collapsedState && savedSize.x > 0.0f){
+					// just expanded: ImGui applied the narrow collapsed width
+					// before expanding, so restore the saved size rather than
+					// record the narrow one over it (as GLRenderer's Performance)
+					ImGui::SetWindowSize(savedSize, ImGuiCond_Always);
+				}else if(!nowCollapsed){
 					ImVec2 s = ImGui::GetWindowSize();
 					if(s.x > 0.0f) savedSize = s;
 				}
@@ -2601,131 +3550,33 @@ int main(int argc, char** argv){
 			auto windowSize = ImVec2(490, 280);
 			static bool   settingsCollapsed = false;
 			static ImVec2 settingsSaved     = ImVec2(0, 0);
-			beginPanel("Settings", ImVec2(10, 300), windowSize, settingsCollapsed, settingsSaved);
+			// point count beside the title; ### keeps the window id fixed while it changes
+			char settingsTitle[96];
+			snprintf(settingsTitle, sizeof(settingsTitle), "Settings   %.1f M points loaded, %.1f M drawn###Settings",
+				double(stats.numPointsProcessed) / 1e6, double(stats.numDrawn) / 1e6);
+			// The 10-pixel menu font and tighter spacing give a slider row 16 pixels
+			// rather than 23, so 44% more rows fit on screen. Small menu text
+			// (Display and debug) turns it off.
+			bool smallText = g_smallMenuText && g_menuFont != nullptr;
+			if(smallText){
+				ImGui::PushFont(g_menuFont);
+				ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,     ImVec2(4.0f, 2.0f));
+				ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,      ImVec2(6.0f, 2.0f));
+				ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, ImVec2(4.0f, 2.0f));
+			}
+			beginPanel(settingsTitle, ImVec2(10, 300), windowSize, settingsCollapsed, settingsSaved);
 
 			// =====================================================================
-			// Settings, regrouped (apply_regroup.ps1). Eight sections. Look is open
-			// by default; the rest collapse. Every control appears exactly once.
+			// Settings, in the order the image is made: the camera, how points are
+			// drawn, the light on them, the air in front of them, then the grade.
+			// After those come what the scene holds (calls, insects, markers), then
+			// speed, clean-up of the scan, and debugging. Points, Sky and haze, and
+			// Colour are open by default. Every control appears exactly once.
 			// =====================================================================
-
-			// ---- LOOK ---------------------------------------------------------
-			if(ImGui::CollapsingHeader("Look", ImGuiTreeNodeFlags_DefaultOpen)){
-				ImGui::SliderFloat("Point size (m)",   &settings.pointWorldSize, 0.0f, 0.30f, "%.3f");
-				tipFor("Splat diameter in metres, projected by depth. Near points large, far ones small.");
-				ImGui::SliderFloat("Point shading",    &settings.pointShading,   0.0f, 1.0f);
-				tipFor("Shades each splat as a small sphere lit from the upper left. 0 is a flat disc.");
-				ImGui::SliderFloat("Near clip (m)",    &settings.nearClip,       0.0f, 10.0f, "%.2f");
-				tipFor("Points closer to the camera than this are not drawn, so foliage right at the lens does not fill the frame.");
-				ImGui::Separator();
-				ImGui::SliderFloat("Exposure",         &settings.exposure,       0.1f, 4.0f);
-				ImGui::SliderFloat("Saturation",       &settings.saturation,     0.0f, 2.5f);
-				ImGui::SliderFloat("Temperature",      &settings.temperature,   -1.0f, 1.0f);
-				tipFor("Negative is cool, positive warm.");
-				// A colour picker clamps to 0..1, so it could only ever REDUCE a
-				// channel. A mixer must boost as well. Three sliders, 1.0 neutral.
-				ImGui::SliderFloat("Mix red",          &settings.mixColour[0],   0.0f, 2.5f);
-				ImGui::SliderFloat("Mix green",        &settings.mixColour[1],   0.0f, 2.5f);
-				ImGui::SliderFloat("Mix blue",         &settings.mixColour[2],   0.0f, 2.5f);
-				ImGui::SameLine(0.0f);
-				if(ImGui::SmallButton("reset##mix")){ settings.mixColour[0] = settings.mixColour[1] = settings.mixColour[2] = 1.0f; }
-				tipFor("Per-channel gain in linear light. 1.0 is neutral. Below removes a cast, above adds one.");
-				ImGui::Separator();
-				ImGui::SliderFloat("Depth haze",       &settings.fogDensity,     0.0f, 0.08f, "%.3f");
-				tipFor("Distance blends toward the haze colour. The reference goes LIGHTER with distance, so keep the colour pale. The value is the haze's density per metre at and below the haze floor.");
-				if(settings.fogDensity <= 0.0f) settings.enableFog = false; else settings.enableFog = true;
-				ImGui::SliderFloat("Haze thins with height", &settings.fogHeightFalloff, 0.0f, 0.5f, "%.3f /m", ImGuiSliderFlags_Logarithmic);
-				tipFor("0 keeps the haze even. Above 0 the haze thins with height above the haze floor, halving every 0.69 / value metres: at 0.1 every 7 m, so it lies low among the trunks and clears toward the canopy.");
-				ImGui::SliderFloat("Haze floor (m)",   &settings.fogBase,        0.0f, boxSize.z > 0.0f ? boxSize.z : 40.0f, "%.1f");
-				tipFor("Height above the lowest point up to which the haze keeps its full density. It only thins above this, so it only matters when Haze thins with height is above 0.");
-				ImGui::Checkbox   ("Haze over sky",    &settings.fogSky);
-				tipFor("The haze also lies between the camera and the sky, so gaps between the trunks and the horizon show haze rather than sky. Use it with Haze thins with height: even haze has no top, so it covers the whole sky.");
-				{
-					float hc[3] = {settings.fogR, settings.fogG, settings.fogB};
-					if(ImGui::ColorEdit3("Haze colour", hc, ImGuiColorEditFlags_NoInputs)){
-						settings.fogR = hc[0]; settings.fogG = hc[1]; settings.fogB = hc[2];
-					}
-					tipFor("Picked like the sky colour, so the same values in both match. With the key light on, haze in shade darkens to the Ambient level, as points do, and Sunbeams (Light) adds the light that reaches it.");
-				}
-				ImGui::ColorEdit3 ("Sky colour",       settings.skyColour, ImGuiColorEditFlags_NoInputs);
-				ImGui::Separator();
-				ImGui::ColorEdit3 ("Below horizon",    settings.belowColour, ImGuiColorEditFlags_NoInputs);
-				tipFor("Colour of empty space when the camera looks downward, past the ground. Black, like the void under a game level. Points themselves keep their scanned colour. Set it to the SKY colour to remove the horizon entirely.");
-				ImGui::SameLine(0.0f);
-				if(ImGui::SmallButton("= sky")){
-					settings.belowColour[0] = settings.skyColour[0];
-					settings.belowColour[1] = settings.skyColour[1];
-					settings.belowColour[2] = settings.skyColour[2];
-				}
-				ImGui::SliderFloat("Horizon softness", &settings.horizonSoftness, 0.0f, 90.0f, "%.0f deg");
-				tipFor("Degrees the sky-to-void gradient spans. It was effectively 1 degree, which drew a hard line across the frame. 12 reads as atmosphere; 90 is a full gradient from zenith to nadir; 0 is a deliberate hard edge.");
-				ImGui::Separator();
-				ImGui::SliderFloat("Grain",            &settings.grain,          0.0f, 0.15f, "%.3f");
-				ImGui::SliderFloat("Vignette",         &settings.vignette,       0.0f, 1.0f);
-			}
-
-			// ---- LIGHT --------------------------------------------------------
-			if(ImGui::CollapsingHeader("Light")){
-				bool lm = false;
-				lm |= ImGui::Checkbox   ("Key light on",     &settings.lightOn);
-				tipFor("A directional light through the canopy, computed once per grid cell. Needs Use voxel grid on (under Advanced).");
-				lm |= ImGui::SliderFloat("Azimuth",          &settings.lightAzimuth,   0.0f, 360.0f);
-				lm |= ImGui::SliderFloat("Elevation",        &settings.lightElevation, 0.0f,  89.0f);
-				tipFor("Where the light comes FROM. The reference is backlit and high.");
-				lm |= ImGui::SliderFloat("Strength",         &settings.lightIntensity, 0.0f,   2.5f);
-				ImGui::ColorEdit3 ("Light colour",     settings.lightColour, ImGuiColorEditFlags_NoInputs);
-				ImGui::SliderFloat("Ambient",          &settings.ambient,        0.0f, 1.0f);
-				tipFor("Floor under the key light, so shadowed points keep some of their own colour. The haze in shade darkens to the same level.");
-				lm |= ImGui::SliderFloat("Canopy density",   &settings.lightAbsorb,    0.0f,   1.5f, "%.2f /m");
-				tipFor("Light lost per metre of occupied foliage, so it means the same at every grid resolution. 0.4 lets about a seventh through five metres of canopy; 1.0 almost none.");
-				if(lm) g_lightDirty = true;
-				ImGui::Separator();
-				ImGui::SliderFloat("Sunbeams",         &settings.sunbeams,       0.0f,   4.0f);
-				tipFor("The key light scattered by the haze where the canopy lets it through, so the light shows in the air between the trunks. Needs Depth haze above 0. At 0 the haze gets only the ambient light. Marched at quarter resolution with Medium steps and Medium reach (Advanced); more steps give smoother beams at more cost.");
-				ImGui::SliderFloat("Forward scatter",  &settings.sunAnisotropy,  0.0f,   0.9f);
-				tipFor("How much brighter the haze looks facing the light than with the light behind you (Henyey-Greenstein g). 0 scatters the same in every direction; at 0.5 the haze facing the light is 27 times brighter than facing away. Water droplets scatter strongly forward.");
-			}
-
-			// ---- CALLS --------------------------------------------------------
-			if(ImGui::CollapsingHeader("Calls")){
-				ImGui::ColorEdit3 ("Emission colour",  settings.emissionColour, ImGuiColorEditFlags_NoInputs);
-				ImGui::SameLine(0.0f);
-				ImGui::Checkbox   ("by frequency",     &settings.emissionByFrequency);
-				ImGui::SliderFloat("Emission gain",    &settings.emissionGain,   0.0f, 12.0f);
-				ImGui::SliderFloat("Event radius (m)", &g_eventRadius,           0.5f, std::max(40.0f, boxSize.x > 0.0f ? std::max(boxSize.x, boxSize.y) * 0.5f : 40.0f));
-				tipFor("How far a call reaches. Nothing outside this is lit at all.");
-				ImGui::SliderFloat("Falloff power",    &settings.falloffPower,   0.5f,  8.0f);
-				tipFor("1 is a broad ramp, 6 concentrates light at the centre with a long feathered tail.");
-				ImGui::SliderFloat("Core boost",       &settings.coreBoost,      0.0f,  8.0f);
-				ImGui::SliderFloat("Visual tail (s)",  &g_visualTail,            0.0f,  4.0f);
-				tipFor("Seconds the glow outlasts the call, decaying exponentially.");
-				ImGui::Separator();
-				ImGui::SliderFloat("Bloom strength",   &settings.bloomStrength,  0.0f, 4.0f);
-				ImGui::SliderFloat("Bloom spread",     &settings.bloomRadius,    0.0f, 5.0f);
-				settings.enableBloom = settings.bloomStrength > 0.0f;
-				ImGui::Separator();
-				if(ImGui::Button("Load calls.csv")){
-					const char* candidates[] = {
-						"calls.csv",
-						"../../../rotokare_test_kit/kit/data/calls.csv",
-						"../rotokare_test_kit/kit/data/calls.csv",
-						"S:/SimLodMod/rotokare_test_kit/kit/data/calls.csv",
-					};
-					for(const char* p : candidates){
-						if(std::filesystem::exists(p)){ loadCallSchedule(p); break; }
-					}
-					if(!g_callsLoaded) printf("[calls] no calls.csv found in any candidate location\n");
-					g_showClock = 0.0;
-				}
-				ImGui::SameLine(0.0f);
-				if(ImGui::Button(g_showPlaying ? "Pause" : "Play")){ g_showPlaying = !g_showPlaying; }
-				ImGui::SameLine(0.0f);
-				if(ImGui::Button("Restart")){ g_showClock = 0.0; }
-				ImGui::Text("clock %.1f s   active %d", g_showClock, g_activeEvents);
-				ImGui::Checkbox   ("Show event markers", &settings.showEventMarkers);
-			}
 
 			// ---- CAMERA -------------------------------------------------------
 			if(ImGui::CollapsingHeader("Camera")){
+				drawBirdsEye(renderer);
 				ImGui::TextDisabled("Lens");
 				ImGui::SameLine(0.0f);
 				if(ImGui::Button("Normal 60"))   { settings.lensMode = 0; settings.fovy = 60.0f; }
@@ -2741,7 +3592,14 @@ int main(int argc, char** argv){
 					tipFor("Angle spanned top to bottom of the frame. 180 puts the horizon at the frame edge with the camera looking straight up; wider sees below it. The sides of a 16:9 frame reach further still.");
 				}
 				ImGui::Separator();
-				ImGui::SliderFloat("Eye height (m)",   &settings.eyeHeight,      0.2f, 10.0f, "%.2f");
+				// It only set the height Go to centre used, so moving it changed
+				// nothing on screen. Now the camera rises or drops to it, keeping
+				// its place over the ground and where it looks.
+				if(ImGui::SliderFloat("Eye height (m)",   &settings.eyeHeight,      0.2f, 10.0f, "%.2f")){
+					glm::dvec3 pos = renderer->controls->getPosition();
+					renderer->controls->target.z += double(settings.eyeHeight) - pos.z;
+				}
+				tipFor("Height of the camera above the lowest point of the cloud. Moving the slider moves the camera up or down; Go to centre uses this height too.");
 				// live in both directions: dragging the slider tilts the camera now,
 				// and tilting the camera with the mouse moves the slider
 				if(ImGui::SliderFloat("Look up (deg)",    &settings.lookUpDeg,    -89.0f, 89.0f)){
@@ -2770,7 +3628,7 @@ int main(int argc, char** argv){
 					renderer->controls->pitch  = pitch;
 					renderer->controls->radius = r;
 					renderer->controls->target = glm::dvec3(double(cx) + dx * r, double(cyc) + dy * r, double(cz) + dz * r);
-					renderer->controls->walkMode = true;   // fix_walk_targets.ps1
+					renderer->controls->walkMode = true;
 				}
 				ImGui::SameLine(0.0f);
 				if(ImGui::Button("Copy camera")){
@@ -2792,99 +3650,186 @@ int main(int argc, char** argv){
 				ImGui::Checkbox   ("Auto-focus on load", &settings.autoFocusOnLoad);
 			}
 
-			// ---- DETAIL AND SPEED ---------------------------------------------
-			if(ImGui::CollapsingHeader("Detail and speed")){
-				{
-					auto withCommas = [](int64_t v){
-						std::string s = std::to_string(v < 0 ? -v : v);
-						int n = int(s.size()) - 3;
-						while(n > 0){ s.insert(n, ","); n -= 3; }
-						return (v < 0 ? "-" : "") + s;
-					};
-					int64_t total = int64_t(stats.numPoints);
-					ImGui::SetNextItemWidth(160.0f);
-					bool edited = ImGui::InputScalar("##targetPoints", ImGuiDataType_S64, &settings.targetPoints,
-													 nullptr, nullptr, "%lld", ImGuiInputTextFlags_EnterReturnsTrue);
-					if(edited){
-						if(settings.targetPoints < 1) settings.targetPoints = 1;
-						if(total > 0 && settings.targetPoints > total) settings.targetPoints = total;
-					}
-					ImGui::SameLine(0.0f);
-					ImGui::Text("/ %s loaded", withCommas(total).c_str());
-				}
-				if(ImGui::SliderFloat("Point density", &settings.pointDensity, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic)){
-					settings.targetPoints = int64_t(double(settings.pointDensity) * double(stats.numPoints) + 0.5);
-					if(settings.targetPoints < 1) settings.targetPoints = 1;
-				}
-				tipFor("Fraction of the cloud traversed. The skipped points are never read, so this scales the main cost directly.");
-				ImGui::Text("   %.2f M actually drawn this frame", stats.numDrawn / 1e6);
-				ImGui::SliderFloat("Detail",           &settings.minNodeSize,    8.0f, 256.0f);
-				tipFor("Level-of-detail threshold in pixels. Higher draws coarser summaries sooner and costs less.");
-				ImGui::Checkbox("Adaptive detail", &settings.adaptiveDetail);
-				tipFor("Coarsens the level of detail automatically while a frame takes longer than the budget, and refines it again when there is headroom. Keeps the view responsive on smaller GPUs and over Remote Desktop.");
-				if(settings.adaptiveDetail){
-					ImGui::SameLine(0.0f);
-					ImGui::SetNextItemWidth(110.0f);
-					ImGui::SliderFloat("Budget ms", &settings.frameBudgetMs, 10.0f, 100.0f, "%.0f");
-					tipFor("Render time to aim for. 33 ms is 30 frames a second; raise it for more detail, lower it for smoother motion.");
-					ImGui::Text("   reduced %.0f%%: detail %.0f px, splat cap %d px", 100.0f * g_adaptReduce, effectiveMinNodeSize(), effectiveMaxSplatPx());
-				}
-				ImGui::Checkbox("VSync", &settings.vsync);
-				tipFor("Caps the frame rate at the display refresh. Saves GPU power and heat, which matters on a laptop GPU; turn it off only to measure raw speed.");
-				ImGui::SliderInt  ("Max splat px",     &settings.maxSplatPx,     2, 64);
-				tipFor("Cap on how large a near point may be drawn. Lower if the frame rate drops when the camera is close to foliage.");
-			}
-
-			// ---- CLEANUP ------------------------------------------------------
-			if(ImGui::CollapsingHeader("Cleanup")){
-				ImGui::SliderInt  ("Min neighbours",   &settings.minNeighbours, 0, 60);
-				tipFor("Removes points whose grid cell holds fewer than this many. 0 is off. Scanner noise sits alone; leaves do not.");
-				ImGui::SliderInt  ("Cull reach",       &settings.cullReach,     0, 1);
-				tipFor("0 counts the point's own cell. 1 adds the six neighbours, which spares thin surfaces on a cell boundary.");
-				ImGui::Checkbox   ("Show culled only", &settings.showCulledOnly);
-				tipFor("Shows ONLY what would be removed. Raise Min neighbours until this is noise and nothing you want.");
+			// ---- POINTS -------------------------------------------------------
+			if(ImGui::CollapsingHeader("Points", ImGuiTreeNodeFlags_DefaultOpen)){
+				ImGui::SliderFloat("Point size (m)",   &settings.pointWorldSize, 0.0f, 0.30f, "%.3f");
+				tipFor("Splat diameter in metres, projected by depth. Near points large, far ones small.");
+				ImGui::SliderFloat("Point shading",    &settings.pointShading,   0.0f, 1.0f);
+				tipFor("Shades each splat as a small sphere lit from the upper left. 0 is a flat disc.");
+				ImGui::SliderFloat("Near clip (m)",    &settings.nearClip,       0.0f, 10.0f, "%.2f");
+				tipFor("Points closer to the camera than this are not drawn, so foliage right at the lens does not fill the frame.");
+				ImGui::Checkbox   ("Round splats",      &settings.roundSplats);
+				ImGui::Checkbox   ("High quality shading", &settings.useHighQualityShading);
+				tipFor("Blends the colours of all points within 1% of the nearest depth at each pixel, which smooths the speckle where points overlap. Draws every point twice, a depth pass and a colour pass, so it costs more than the standard path.");
 				ImGui::Separator();
-				// Edit a copy and apply it on release: every applied value frees and
-				// reallocates the grid (an implicit device sync) and zeroes the counts,
-				// which happened on every frame of a drag.
-				static int pendingGridRes = g_gridResolution;
-				if(!ImGui::IsAnyItemActive()) pendingGridRes = g_gridResolution;   // follow fallbacks
-				ImGui::SliderInt  ("Grid resolution",  &pendingGridRes, 64, 512);
-				if(ImGui::IsItemDeactivatedAfterEdit()) g_gridResolution = pendingGridRes;
-				tipFor("Cells along the cloud's longest side. Applied when you release the slider. Memory grows with the cube: 256 is ~20 MB, 512 ~156 MB.");
-				{
-					float longest = std::max(boxSize.x, std::max(boxSize.y, boxSize.z));
-					if(longest > 0.0f){
-						int R = pendingGridRes;
-						float cell = longest / float(R);
-						int px = std::min(R, int(boxSize.x / cell) + 1);
-						int py = std::min(R, int(boxSize.y / cell) + 1);
-						int pz = std::min(R, int(boxSize.z / cell) + 1);
-						double mb = double(px) * double(py) * double(pz) * 4.0 / 1e6;
-						ImGui::Text("   %d x %d x %d @ %.3f m = %.0f MB", px, py, pz, cell, mb);
-					}
-					if(g_gridRefill) ImGui::Text("   counts are stale - rebuilding on the next frame");
-				}
-				if(ImGui::Button("Rebuild grid counts")){ g_gridRefill = true; }
+				ImGui::Checkbox   ("Eye dome lighting", &settings.enableEDL);
+				ImGui::SliderFloat("EDL strength",      &settings.edlStrength, 0.0f, 3.0f);
 			}
 
-			// ---- MARKERS ------------------------------------------------------
-			if(ImGui::CollapsingHeader("Markers")){
-				ImGui::Checkbox("Find targets", &settings.findTargets);
-				tipFor("Highlights points that are ACHROMATIC - red, green and blue nearly equal. A survey checkerboard is black, grey and white; foliage is strongly green and bark red-brown. This finds a board in shadow, which a brightness test cannot.");
+			// ---- LIGHT --------------------------------------------------------
+			if(ImGui::CollapsingHeader("Light")){
+				bool lm = false;
+				lm |= ImGui::Checkbox   ("Key light on",     &settings.lightOn);
+				tipFor("A directional light through the canopy, computed once per cell of the occupancy grid (Grid resolution, under Scan clean-up).");
+				lm |= ImGui::SliderFloat("Azimuth",          &settings.lightAzimuth,   0.0f, 360.0f);
+				lm |= ImGui::SliderFloat("Elevation",        &settings.lightElevation, 0.0f,  89.0f);
+				tipFor("Where the light comes FROM. The reference is backlit and high.");
+				lm |= ImGui::SliderFloat("Strength",         &settings.lightIntensity, 0.0f,   6.0f);
+				ImGui::ColorEdit3 ("Light colour",     settings.lightColour, ImGuiColorEditFlags_NoInputs);
+				ImGui::SliderFloat("Ambient",          &settings.ambient,        0.0f, 1.0f);
+				tipFor("Floor under the key light, so shadowed points keep some of their own colour. The haze in shade darkens to the same level.");
+				lm |= ImGui::SliderFloat("Canopy density",   &settings.lightAbsorb,    0.0f,   1.5f, "%.2f /m");
+				tipFor("Light lost per metre of occupied foliage, so it means the same at every grid resolution. 0.4 lets about a seventh through five metres of canopy; 1.0 almost none.");
+				if(lm) g_lightDirty = true;
+				ImGui::Separator();
+				ImGui::Checkbox   ("Torch (T)",        &settings.torchOn);
+				tipFor("A torch held at the camera. While it is on, moving the mouse over the forest aims the beam and does not turn the camera; walk with W/A/S/D and the wheel. T toggles it.");
+				ImGui::SliderFloat("Torch strength",   &settings.torchIntensity, 0.0f, 20.0f, "%.1f");
+				ImGui::SliderFloat("Torch beam (deg)", &settings.torchAngle,     2.0f, 60.0f, "%.0f");
+				ImGui::SliderFloat("Torch reach (m)",  &settings.torchRange,     1.0f, 60.0f, "%.0f");
+				tipFor("Distance at which the beam has fallen to half strength.");
+			}
+
+			// ---- SKY AND HAZE -------------------------------------------------
+			if(ImGui::CollapsingHeader("Sky and haze", ImGuiTreeNodeFlags_DefaultOpen)){
+				ImGui::ColorEdit3 ("Sky colour",       settings.skyColour, ImGuiColorEditFlags_NoInputs);
+				ImGui::ColorEdit3 ("Below horizon",    settings.belowColour, ImGuiColorEditFlags_NoInputs);
+				tipFor("Colour of empty space when the camera looks downward, past the ground. Black, like the void under a game level. Points themselves keep their scanned colour. Set it to the SKY colour to remove the horizon entirely.");
 				ImGui::SameLine(0.0f);
-				ImGui::Checkbox("Isolate", &settings.findIsolate);
-				tipFor("Hides everything that is NOT a match. The fastest way to find the boards: tick this, and whatever is left on screen is what the test is catching.");
-				ImGui::SliderFloat("Greyness", &settings.findGrey, 2.0f, 90.0f, "%.0f");
-				tipFor("How far apart the three channels may be and still count as grey. Start at 30. Raise it until the boards appear; lower it until the foliage goes.");
-				ImGui::SliderFloat("Min brightness", &settings.findThreshold, 0.0f, 250.0f, "%.0f");
-				tipFor("Floor, so near-black noise is not counted as grey. Drop it to about 40 to catch the dark squares of a board as well as the white ones.");
-				ImGui::SliderInt("Boost size (px)", &settings.findBoost, 0, 20);
-				tipFor("Draws matches larger. A 15 cm board at 30 m is under a pixel, so without this the targets are there but invisible.");
-				ImGui::Text("   %u points match this frame", stats.numTargets);
+				if(ImGui::SmallButton("= sky")){
+					settings.belowColour[0] = settings.skyColour[0];
+					settings.belowColour[1] = settings.skyColour[1];
+					settings.belowColour[2] = settings.skyColour[2];
+				}
+				ImGui::SliderFloat("Horizon softness", &settings.horizonSoftness, 0.0f, 90.0f, "%.0f deg");
+				tipFor("Degrees the sky-to-void gradient spans. It was effectively 1 degree, which drew a hard line across the frame. 12 reads as atmosphere; 90 is a full gradient from zenith to nadir; 0 is a deliberate hard edge.");
+				ImGui::Separator();
+				ImGui::SliderFloat("Depth haze",       &settings.fogDensity,     0.0f, 0.08f, "%.5f",
+						ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
+				tipFor("Distance blends toward the haze colour. The reference goes LIGHTER with distance, so keep the colour pale. The value is the haze's density per metre at and below the haze floor.");
+				if(settings.fogDensity <= 0.0f) settings.enableFog = false; else settings.enableFog = true;
+				ImGui::SliderFloat("Haze thins with height", &settings.fogHeightFalloff, 0.0f, 0.5f, "%.3f /m", ImGuiSliderFlags_Logarithmic);
+				tipFor("0 keeps the haze even. Above 0 the haze thins with height above the haze floor, halving every 0.69 / value metres: at 0.1 every 7 m, so it lies low among the trunks and clears toward the canopy.");
+				ImGui::SliderFloat("Haze floor (m)",   &settings.fogBase,        0.0f, boxSize.z > 0.0f ? boxSize.z : 40.0f, "%.1f");
+				tipFor("Height above the lowest point up to which the haze keeps its full density. It only thins above this, so it only matters when Haze thins with height is above 0.");
+				ImGui::Checkbox   ("Haze over sky",    &settings.fogSky);
+				tipFor("The haze also lies between the camera and the sky, so gaps between the trunks and the horizon show haze rather than sky. Use it with Haze thins with height: even haze has no top, so it covers the whole sky.");
+				{
+					float hc[3] = {settings.fogR, settings.fogG, settings.fogB};
+					if(ImGui::ColorEdit3("Haze colour", hc, ImGuiColorEditFlags_NoInputs)){
+						settings.fogR = hc[0]; settings.fogG = hc[1]; settings.fogB = hc[2];
+					}
+					tipFor("Picked like the sky colour, so the same values in both match. With the key light on, haze in shade darkens to the Ambient level (Light), as points do, and Sunbeams, below, adds the light that reaches it.");
+				}
+				ImGui::Separator();
+				ImGui::SliderFloat("Sunbeams",         &settings.sunbeams,       0.0f,   4.0f);
+				tipFor("The key light (Light) scattered by the haze where the canopy lets it through, so the light shows in the air between the trunks. Needs Depth haze above 0 and the key light on; in front of the sky and below the horizon, Haze over sky as well. At 0 the haze gets only the ambient light. Marched at quarter resolution with Volume steps and Volume reach, below; more steps give smoother beams at more cost.");
+				ImGui::SliderFloat("Forward scatter",  &settings.sunAnisotropy,  0.0f,   0.9f);
+				tipFor("How much brighter the haze looks facing the light than with the light behind you (Henyey-Greenstein g). 0 scatters the same in every direction; at 0.5 the haze facing the light is 27 times brighter than facing away. Water droplets scatter strongly forward.");
+				ImGui::SliderInt  ("Volume steps",      &settings.volSteps,         8,     128);
+				tipFor("Samples along each quarter-resolution ray, for the sunbeams and for the calls' medium (Calls). More steps resolve narrower beams and cost proportionally more.");
+				ImGui::SliderFloat("Volume reach (m)",  &settings.volMaxDist,      20.0f, std::max(400.0f, boxSize.x > 0.0f ? 2.0f * std::sqrt(boxSize.x*boxSize.x + boxSize.y*boxSize.y + boxSize.z*boxSize.z) : 400.0f));
+				tipFor("How far each volumetric ray is marched. Haze beyond it is lit by the key light without canopy shade, so keep it past the far side of the cloud (it is set to 1.5 x the cloud's diagonal on load).");
+			}
+
+			// ---- COLOUR -------------------------------------------------------
+			if(ImGui::CollapsingHeader("Colour", ImGuiTreeNodeFlags_DefaultOpen)){
+				ImGui::SliderFloat("Exposure",         &settings.exposure,       0.1f, 16.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+				tipFor("Overall brightness. Logarithmic: up to 16x, for scans whose colour was darkened to tame the sunlit canopy.");
+				ImGui::SliderFloat("Saturation",       &settings.saturation,     0.0f, 2.5f);
+				ImGui::SliderFloat("Temperature",      &settings.temperature,   -1.0f, 1.0f);
+				tipFor("Negative is cool, positive warm.");
+				// A colour picker clamps to 0..1, so it could only ever REDUCE a
+				// channel. A mixer must boost as well. Three sliders, 1.0 neutral.
+				ImGui::SliderFloat("Mix red",          &settings.mixColour[0],   0.0f, 2.5f);
+				ImGui::SliderFloat("Mix green",        &settings.mixColour[1],   0.0f, 2.5f);
+				ImGui::SliderFloat("Mix blue",         &settings.mixColour[2],   0.0f, 2.5f);
+				ImGui::SameLine(0.0f);
+				if(ImGui::SmallButton("reset##mix")){ settings.mixColour[0] = settings.mixColour[1] = settings.mixColour[2] = 1.0f; }
+				tipFor("Per-channel gain in linear light. 1.0 is neutral. Below removes a cast, above adds one.");
+				ImGui::Separator();
+				ImGui::ColorEdit3 ("Tint colour",       settings.tintColour, ImGuiColorEditFlags_NoInputs);
+				ImGui::SliderFloat("Tint mix",          &settings.tintMix,     0.0f,  1.0f);
+				ImGui::Separator();
+				ImGui::SliderFloat("Grain",            &settings.grain,          0.0f, 0.15f, "%.3f");
+				ImGui::SliderFloat("Vignette",         &settings.vignette,       0.0f, 1.0f);
+			}
+
+			// ---- CALLS --------------------------------------------------------
+			if(ImGui::CollapsingHeader("Calls")){
+				if(ImGui::Button("Load calls.csv")){
+					const char* candidates[] = {
+						"calls.csv",
+						"../../../rotokare_test_kit/kit/data/calls.csv",
+						"../rotokare_test_kit/kit/data/calls.csv",
+						"S:/SimLodMod/rotokare_test_kit/kit/data/calls.csv",
+					};
+					for(const char* p : candidates){
+						if(std::filesystem::exists(p)){ loadCallSchedule(p); break; }
+					}
+					if(!g_callsLoaded) printf("[calls] no calls.csv found in any candidate location\n");
+					g_showClock = 0.0;
+				}
+				ImGui::SameLine(0.0f);
+				if(ImGui::Button(g_showPlaying ? "Pause" : "Play")){ g_showPlaying = !g_showPlaying; }
+				ImGui::SameLine(0.0f);
+				if(ImGui::Button("Restart")){ g_showClock = 0.0; }
+				ImGui::Text("clock %.1f s   active %d", g_showClock, g_activeEvents);
+				ImGui::Checkbox   ("Show event markers", &settings.showEventMarkers);
+				ImGui::Separator();
+				ImGui::ColorEdit3 ("Emission colour",  settings.emissionColour, ImGuiColorEditFlags_NoInputs);
+				ImGui::SameLine(0.0f);
+				ImGui::Checkbox   ("by frequency",     &settings.emissionByFrequency);
+				ImGui::SliderFloat("Emission gain",    &settings.emissionGain,   0.0f, 12.0f);
+				ImGui::SliderFloat("Event radius (m)", &g_eventRadius,           0.1f, std::max(40.0f, boxSize.x > 0.0f ? std::max(boxSize.x, boxSize.y) * 0.5f : 40.0f));
+				tipFor("How far a call reaches. Nothing outside this is lit at all.");
+				ImGui::SliderFloat("Falloff power",    &settings.falloffPower,   0.5f,  8.0f);
+				tipFor("1 is a broad ramp, 6 concentrates light at the centre with a long feathered tail.");
+				ImGui::SliderFloat("Core boost",       &settings.coreBoost,      0.0f,  8.0f);
+				ImGui::SliderFloat("Visual tail (s)",  &g_visualTail,            0.0f,  4.0f);
+				tipFor("Seconds the glow outlasts the call, decaying exponentially.");
+				ImGui::Separator();
+				ImGui::SliderFloat("Bloom strength",   &settings.bloomStrength,  0.0f, 4.0f);
+				ImGui::SliderFloat("Bloom spread",     &settings.bloomRadius,    0.0f, 5.0f);
+				settings.enableBloom = settings.bloomStrength > 0.0f;
+				ImGui::Separator();
+				ImGui::TextDisabled("Volumetric medium (expensive, not in the reference)");
+				ImGui::Checkbox   ("Volumetric medium", &settings.enableVolumetric);
+				tipFor("Air that the calls light, so each call shows as a glow in the space around it. Trunks and canopy block it and cast shafts. Marched at quarter resolution with Volume steps and Volume reach (Sky and haze).");
+				ImGui::SliderFloat("Medium density",    &settings.volDensity,       0.0f,  0.12f);
+				ImGui::SliderFloat("Medium scatter",    &settings.volScatter,       0.0f,  6.0f);
+				ImGui::SliderFloat("Medium pools low",  &settings.volHeightFalloff, 0.0f,  0.05f);
+				ImGui::SliderFloat("Medium occlusion",  &settings.volOcclusion,     0.0f,  3.0f);
+				ImGui::SliderInt  ("Medium shadow steps", &settings.volShadowSteps, 0,    16);
+				ImGui::Separator();
+				ImGui::TextDisabled("Test source");
+				ImGui::Checkbox   ("Test source on",    &settings.testSourceOn);
+				{
+					float fxMin = std::isfinite(boxMin.x) ? boxMin.x : -50.0f, fxMax = std::isfinite(boxMin.x) ? boxMin.x + boxSize.x : 50.0f;
+					float fyMin = std::isfinite(boxMin.y) ? boxMin.y : -50.0f, fyMax = std::isfinite(boxMin.y) ? boxMin.y + boxSize.y : 50.0f;
+					float fzMin = std::isfinite(boxMin.z) ? boxMin.z :   0.0f, fzMax = std::isfinite(boxMin.z) ? boxMin.z + boxSize.z : 40.0f;
+					ImGui::SliderFloat("Test X", &settings.testX, fxMin, fxMax);
+					ImGui::SliderFloat("Test Y", &settings.testY, fyMin, fyMax);
+					ImGui::SliderFloat("Test Z", &settings.testZ, fzMin, fzMax);
+				}
+				ImGui::SliderFloat("Test intensity",    &settings.testIntensity, 0.0f, 3.0f);
+				ImGui::SliderFloat("Test Hz",           &settings.testHz, 200.0f, 400.0f);
+			}
+
+			// ---- INSECTS ------------------------------------------------------
+			if(ImGui::CollapsingHeader("Insects")){
+				ImGui::SliderInt  ("Count",            &settings.numInsects,   0, 30000);
+				ImGui::SliderInt  ("Size (px)",        &settings.insectSize,   1,     4);
+				ImGui::SliderFloat("Glow",             &settings.insectGlow,   0.0f, 6.0f);
+				ImGui::SliderFloat("Speed",            &settings.insectSpeed,  0.0f, 2.0f);
+				ImGui::SliderInt  ("Placement",        &settings.insectPlacement, 0, 1);
+				tipFor("1 keeps only insects in air near foliage, using the grid. 0 scatters them anywhere.");
+			}
+
+			// ---- MARKERS AND SURVEY -------------------------------------------
+			if(ImGui::CollapsingHeader("Markers and survey")){
 				ImGui::SliderFloat("Marker size (m)", &settings.markerScale, 0.05f, 1.0f, "%.2f");
 				ImGui::Separator();
-				// ---- apply_markers2.ps1 ------------------------------------------
 				ImGui::Checkbox("Show markers", &settings.showMarkers);
 				ImGui::SameLine(0.0f);
 				ImGui::Checkbox("Markers only", &settings.markersOnly);
@@ -2949,59 +3894,115 @@ int main(int argc, char** argv){
 				tipFor("On: call positions are converted from the survey frame into the file frame when calls.csv is loaded, using the fit above. Off: calls.csv is taken to be in file (LAS) coordinates already.");
 			}
 
-			// ---- INSECTS ------------------------------------------------------
-			if(ImGui::CollapsingHeader("Insects")){
-				ImGui::SliderInt  ("Count",            &settings.numInsects,   0, 30000);
-				ImGui::SliderInt  ("Size (px)",        &settings.insectSize,   1,     4);
-				ImGui::SliderFloat("Glow",             &settings.insectGlow,   0.0f, 6.0f);
-				ImGui::SliderFloat("Speed",            &settings.insectSpeed,  0.0f, 2.0f);
-				ImGui::SliderInt  ("Placement",        &settings.insectPlacement, 0, 1);
-				tipFor("1 keeps only insects in air near foliage, using the grid. 0 scatters them anywhere.");
+			// ---- DETAIL AND SPEED ---------------------------------------------
+			if(ImGui::CollapsingHeader("Detail and speed")){
+				{
+					auto withCommas = [](int64_t v){
+						std::string s = std::to_string(v < 0 ? -v : v);
+						int n = int(s.size()) - 3;
+						while(n > 0){ s.insert(n, ","); n -= 3; }
+						return (v < 0 ? "-" : "") + s;
+					};
+					int64_t total = int64_t(stats.numPoints);
+					ImGui::SetNextItemWidth(160.0f);
+					bool edited = ImGui::InputScalar("##targetPoints", ImGuiDataType_S64, &settings.targetPoints,
+													 nullptr, nullptr, "%lld", ImGuiInputTextFlags_EnterReturnsTrue);
+					if(edited){
+						if(settings.targetPoints < 1) settings.targetPoints = 1;
+						if(total > 0 && settings.targetPoints > total) settings.targetPoints = total;
+					}
+					ImGui::SameLine(0.0f);
+					ImGui::Text("/ %s loaded", withCommas(total).c_str());
+				}
+				if(ImGui::SliderFloat("Point density", &settings.pointDensity, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic)){
+					settings.targetPoints = int64_t(double(settings.pointDensity) * double(stats.numPoints) + 0.5);
+					if(settings.targetPoints < 1) settings.targetPoints = 1;
+				}
+				tipFor("Fraction of the cloud traversed. The skipped points are never read, so this scales the main cost directly.");
+				ImGui::Text("   %.2f M actually drawn this frame", stats.numDrawn / 1e6);
+				ImGui::SliderFloat("Detail",           &settings.minNodeSize,    8.0f, 256.0f);
+				tipFor("Level-of-detail threshold in pixels. Higher draws coarser summaries sooner and costs less.");
+				ImGui::Checkbox("Adaptive detail", &settings.adaptiveDetail);
+				tipFor("Coarsens the level of detail automatically while a frame takes longer than the budget, and refines it again when there is headroom. Keeps the view responsive on smaller GPUs and over Remote Desktop.");
+				if(settings.adaptiveDetail){
+					ImGui::SameLine(0.0f);
+					ImGui::SetNextItemWidth(110.0f);
+					ImGui::SliderFloat("Budget ms", &settings.frameBudgetMs, 10.0f, 100.0f, "%.0f");
+					tipFor("Render time to aim for. 33 ms is 30 frames a second; raise it for more detail, lower it for smoother motion.");
+					ImGui::Text("   reduced %.0f%%: detail %.0f px, splat cap %d px", 100.0f * g_adaptReduce, effectiveMinNodeSize(), effectiveMaxSplatPx());
+				}
+				ImGui::Checkbox("VSync", &settings.vsync);
+				tipFor("Caps the frame rate at the display refresh. Saves GPU power and heat, which matters on a laptop GPU; turn it off only to measure raw speed.");
+				ImGui::SliderInt  ("Max splat px",     &settings.maxSplatPx,     2, 64);
+				tipFor("Cap on how large a near point may be drawn. Lower if the frame rate drops when the camera is close to foliage.");
 			}
 
-			// ---- ADVANCED -----------------------------------------------------
-			if(ImGui::CollapsingHeader("Advanced")){
-				ImGui::TextDisabled("Volumetric medium (expensive, not in the reference)");
-				ImGui::Checkbox   ("Volumetric medium", &settings.enableVolumetric);
-				ImGui::SliderFloat("Medium density",    &settings.volDensity,       0.0f,  0.12f);
-				ImGui::SliderFloat("Medium scatter",    &settings.volScatter,       0.0f,  6.0f);
-				ImGui::SliderFloat("Medium pools low",  &settings.volHeightFalloff, 0.0f,  0.05f);
-				ImGui::SliderFloat("Medium occlusion",  &settings.volOcclusion,     0.0f,  3.0f);
-				ImGui::SliderInt  ("Medium steps",      &settings.volSteps,         8,     128);
-				tipFor("Samples along each quarter-resolution ray, for the calls' medium and for the sunbeams (Light). More steps resolve narrower beams and cost proportionally more.");
-				ImGui::SliderInt  ("Medium shadow steps", &settings.volShadowSteps, 0,    16);
-				ImGui::SliderFloat("Medium reach (m)",  &settings.volMaxDist,      20.0f, std::max(400.0f, boxSize.x > 0.0f ? 2.0f * std::sqrt(boxSize.x*boxSize.x + boxSize.y*boxSize.y + boxSize.z*boxSize.z) : 400.0f));
-				tipFor("How far each volumetric ray is marched. Haze beyond it is lit by the key light without canopy shade, so keep it past the far side of the cloud (it is set to 1.5 x the cloud's diagonal on load).");
+			// ---- SCAN CLEAN-UP ------------------------------------------------
+			if(ImGui::CollapsingHeader("Scan clean-up")){
+				ImGui::SliderInt  ("Min neighbours",   &settings.minNeighbours, 0, 60);
+				tipFor("Removes points whose grid cell holds fewer than this many. 0 is off. Scanner noise sits alone; leaves do not.");
+				ImGui::SliderInt  ("Cull reach",       &settings.cullReach,     0, 1);
+				tipFor("0 counts the point's own cell. 1 adds the six neighbours, which spares thin surfaces on a cell boundary.");
+				ImGui::Checkbox   ("Show culled only", &settings.showCulledOnly);
+				tipFor("Shows ONLY what would be removed. Raise Min neighbours until this is noise and nothing you want.");
 				ImGui::Separator();
-				ImGui::TextDisabled("Test source");
-				ImGui::Checkbox   ("Test source on",    &settings.testSourceOn);
 				{
-					float fxMin = std::isfinite(boxMin.x) ? boxMin.x : -50.0f, fxMax = std::isfinite(boxMin.x) ? boxMin.x + boxSize.x : 50.0f;
-					float fyMin = std::isfinite(boxMin.y) ? boxMin.y : -50.0f, fyMax = std::isfinite(boxMin.y) ? boxMin.y + boxSize.y : 50.0f;
-					float fzMin = std::isfinite(boxMin.z) ? boxMin.z :   0.0f, fzMax = std::isfinite(boxMin.z) ? boxMin.z + boxSize.z : 40.0f;
-					ImGui::SliderFloat("Test X", &settings.testX, fxMin, fxMax);
-					ImGui::SliderFloat("Test Y", &settings.testY, fyMin, fyMax);
-					ImGui::SliderFloat("Test Z", &settings.testZ, fzMin, fzMax);
+					// The sliders rebuild the colour grid when let go, not on every
+					// frame of a drag: a rebuild recounts every point and relights.
+					bool wf = ImGui::Checkbox("Fix blown-out canopy", &settings.whiteFix);
+					tipFor("The scanner's camera saturates in the sunlit canopy, so leaves and branches there come out white. This recolours those points from the nearest well-exposed points around them: green from foliage, brown from bark.");
+					ImGui::SliderFloat("White level",   &settings.whiteLevel,  100.0f, 250.0f, "%.0f");
+					wf |= ImGui::IsItemDeactivatedAfterEdit();
+					tipFor("A point counts as blown out when its darkest channel is at least this. Lower it to catch pale grey as well as white.");
+					ImGui::SliderFloat("White spread",  &settings.whiteSpread,   5.0f, 120.0f, "%.0f");
+					wf |= ImGui::IsItemDeactivatedAfterEdit();
+					tipFor("... and its three channels are within this of each other. Raise it to catch pale tints (lavender, pale green).");
+					ImGui::SliderFloat("Sky cast",      &settings.tintMargin,    0.0f, 60.0f, "%.0f");
+					wf |= ImGui::IsItemDeactivatedAfterEdit();
+					tipFor("Also repairs lilac, pink and blue points: blue higher than green by more than this. Bark and leaves never are. 0 turns it off; raise it if real blue things (signs, tape) get recoloured.");
+					ImGui::SliderInt  ("Colour reach",  &settings.whiteReach,       1, 8, "%d cells");
+					wf |= ImGui::IsItemDeactivatedAfterEdit();
+					tipFor("How far a blown-out cell looks for a colour. Each cell is the occupancy grid's cell size.");
+					if(wf) g_gridRefill = true;   // the colour grid is rebuilt with the counts
+					if(settings.whiteFix && g_colourGrid == 0 && g_voxelGrid != 0) ImGui::Text("   not enough GPU memory for the colour grid");
 				}
-				ImGui::SliderFloat("Test intensity",    &settings.testIntensity, 0.0f, 3.0f);
-				ImGui::SliderFloat("Test Hz",           &settings.testHz, 200.0f, 400.0f);
 				ImGui::Separator();
-				ImGui::TextDisabled("Grading extras");
-				ImGui::ColorEdit3 ("Tint colour",       settings.tintColour, ImGuiColorEditFlags_NoInputs);
-				ImGui::SliderFloat("Tint mix",          &settings.tintMix,     0.0f,  1.0f);
-				ImGui::Separator();
-				ImGui::TextDisabled("Rendering");
-				ImGui::Checkbox   ("Eye dome lighting", &settings.enableEDL);
-				ImGui::SliderFloat("EDL strength",      &settings.edlStrength, 0.0f, 3.0f);
-				ImGui::Checkbox   ("Round splats",      &settings.roundSplats);
-				ImGui::Checkbox   ("High quality shading", &settings.useHighQualityShading);
-				ImGui::Separator();
-				ImGui::TextDisabled("Grid and debug");
+				// Edit a copy and apply it on release: every applied value frees and
+				// reallocates the grid (an implicit device sync) and zeroes the counts,
+				// which happened on every frame of a drag.
+				static int pendingGridRes = g_gridResolution;
+				if(!ImGui::IsAnyItemActive()) pendingGridRes = g_gridResolution;   // follow fallbacks
+				ImGui::SliderInt  ("Grid resolution",  &pendingGridRes, 64, 512);
+				if(ImGui::IsItemDeactivatedAfterEdit()) g_gridResolution = pendingGridRes;
+				tipFor("Cells along the cloud's longest side. Applied when you release the slider. Memory grows with the cube: 256 is ~20 MB, 512 ~156 MB.");
+				{
+					float longest = std::max(boxSize.x, std::max(boxSize.y, boxSize.z));
+					if(longest > 0.0f){
+						int R = pendingGridRes;
+						float cell = longest / float(R);
+						int px = std::min(R, int(boxSize.x / cell) + 1);
+						int py = std::min(R, int(boxSize.y / cell) + 1);
+						int pz = std::min(R, int(boxSize.z / cell) + 1);
+						double mb = double(px) * double(py) * double(pz) * 4.0 / 1e6;
+						ImGui::Text("   %d x %d x %d @ %.3f m = %.0f MB", px, py, pz, cell, mb);
+					}
+					if(g_gridRefill) ImGui::Text("   counts are stale - rebuilding on the next frame");
+				}
+				if(ImGui::Button("Rebuild grid counts")){ g_gridRefill = true; }
 				ImGui::Checkbox   ("Use voxel grid",    &settings.useVoxelGrid);
-				ImGui::Checkbox   ("Show voxel grid",   &settings.showVoxelGrid);
-				ImGui::Checkbox   ("Show bounding box", &settings.showBoundingBox);
-				ImGui::Checkbox   ("Update visibility", &settings.doUpdateVisibility);
+				tipFor("Off stops the stray-point cull, insect placement near foliage, the grid view and the calls' medium from using the occupancy grid. The grid is still built, and the key light's canopy shade and the canopy colour repair are not affected.");
+			}
+
+			// ---- DISPLAY AND DEBUG --------------------------------------------
+			if(ImGui::CollapsingHeader("Display and debug")){
+				ImGui::Checkbox   ("Small menu text",   &g_smallMenuText);
+				tipFor("Draws this window in a 10-pixel font with tighter spacing, so more of it fits on screen. Off returns to the 13-pixel font.");
+				ImGui::Separator();
 				ImGui::Checkbox   ("Show points",       &settings.showPoints);
+				ImGui::Checkbox   ("Show bounding box", &settings.showBoundingBox);
+				ImGui::Checkbox   ("Show voxel grid",   &settings.showVoxelGrid);
+				ImGui::Checkbox   ("Update visibility", &settings.doUpdateVisibility);
+				tipFor("Off freezes the level of detail and the culling at the current view, so you can move away and see which parts of the octree that view selected.");
 				ImGui::Checkbox   ("Colour by node",    &settings.colorByNode);
 				ImGui::Checkbox   ("Colour by LOD",     &settings.colorByLOD);
 			}
@@ -3011,6 +4012,10 @@ int main(int argc, char** argv){
 			// }
 
 			ImGui::End();
+			if(smallText){
+				ImGui::PopStyleVar(3);
+				ImGui::PopFont();
+			}
 		}
 		
 		if(Runtime::showGUI)
@@ -3032,7 +4037,12 @@ int main(int argc, char** argv){
 			ImGui::Begin("Stats");
 			{
 				bool nc = ImGui::IsWindowCollapsed();
-				if(!nc){ ImVec2 s = ImGui::GetWindowSize(); if(s.x > 0.0f) statsSaved = s; }
+				if(!nc && statsCollapsed && statsSaved.x > 0.0f){
+					ImGui::SetWindowSize(statsSaved, ImGuiCond_Always);   // just expanded, as beginPanel
+				}else if(!nc){
+					ImVec2 s = ImGui::GetWindowSize();
+					if(s.x > 0.0f) statsSaved = s;
+				}
 				statsCollapsed = nc;
 			}
 
