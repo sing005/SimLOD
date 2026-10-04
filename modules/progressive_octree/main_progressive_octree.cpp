@@ -28,6 +28,7 @@ using namespace fmt;
 #include "laszip_api.h"
 
 #include "HostDeviceInterface.h"
+#include "ProggyTinyFont.h"
 #include "CrashHandler.h"
 
 // Uniforms is passed to the kernels by value, and CUDA caps kernel parameters
@@ -141,10 +142,8 @@ struct {
 	bool markersOnly                 = false;   // apply_markers2.ps1: hide forest and insects
 	bool colorByNode                 = false;
 	bool colorByLOD                  = false;
-	bool colorWhite                  = false;
 	bool autoFocusOnLoad             = true;
 	bool benchmarkRendering          = false;
-	float LOD                        = 0.2f;
 	float minNodeSize                = 64.0f;
 	bool  adaptiveDetail             = true;    // coarsen LOD when frames exceed the budget
 	float frameBudgetMs              = 33.0f;   // render-kernel time to aim for (30 fps)
@@ -168,7 +167,6 @@ struct {
 	float fogBase                    = 0.0f;    // metres above the lowest point
 	bool  fogSky                     = false;   // haze between the camera and the sky as well
 	bool  enableBloom                = false;
-	float bloomThreshold             = 0.55f;
 	float bloomStrength              = 1.2f;
 	float bloomRadius                = 3.0f;   // now a mip level count, 0-5
 	float exposure                   = 4.0f;   // low-key, as the reference
@@ -234,19 +232,16 @@ struct {
 	float sunbeams                   = 1.0f;    // key light in the haze; 0 = haze lit by ambient only
 	float sunAnisotropy              = 0.5f;    // forward scattering of the haze (Henyey-Greenstein g)
 
-	// regroup (apply_regroup.ps1)
-	bool  lightOn                    = true;   // off until you switch it on
+	// key light switch, near clip, mixer, camera, lens, horizon, markers
+	bool  lightOn                    = true;   // key light switch
 	float nearClip                   = 0.81f;
-	bool  groundOn                   = true;
-	float groundHeight               = 0.35f;
-	float groundColour[3]            = {0.0f, 0.0f, 0.0f};
 	float mixColour[3]               = {1.075f, 1.267f, 1.495f};
 	float eyeHeight                  = 3.37f;    // metres above the lowest point
 	float lookUpDeg                  = 17.05f;
 	int   lensMode                   = 0;       // 0 perspective, 1 fisheye
 	float fisheyeFov                 = 180.0f;
 	float belowColour[3]             = {0.0f, 0.0f, 0.0f};   // void under the ground
-	float markerScale                = 0.20f;   // apply_markers2.ps1: metres, ball diameter
+	float markerScale                = 0.20f;   // metres, ball diameter
 	float horizonSoftness            = 0.0f;    // degrees
 
 	// blown-out colour repair (render.cu): the scanner's camera whites out the
@@ -264,7 +259,6 @@ struct {
 	float torchRange                 = 12.0f;   // metres to half strength
 	float emissionColour[3]          = {1.0f, 0.45f, 0.85f};   // the reference pink
 	bool  emissionByFrequency        = false;
-	bool  fitToCloudDone             = false;
 } settings;
 
 struct PinnedMemPool{
@@ -933,6 +927,8 @@ static bool   g_pKeyWasDown = false;          // P key state last frame (pick sh
 static bool   g_leftWasDown = false;
 // g_nextMic moved up to the marker block (fix_nextmic.ps1)
 static float  g_walkSpeed = 3.0f;                 // metres per second, W/A/S/D
+static ImFont* g_menuFont = nullptr;              // 10-pixel ProggyTiny for the Settings window
+static bool   g_smallMenuText = true;             // Settings window in g_menuFont, with tighter spacing
 static bool        g_lightDirty = true;
 static bool        g_gridRefill = false;     // apply_grid_refill.ps1: counts need rebuilding
 static int         g_gridX = 0, g_gridY = 0, g_gridZ = 0;
@@ -1469,12 +1465,9 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.boxMax                   = boxSize;
 	uniforms.frameCounter             = frameCounter;
 	uniforms.showBoundingBox          = settings.showBoundingBox;
-	uniforms.doUpdateVisibility       = settings.doUpdateVisibility;
 	uniforms.showPoints               = settings.showPoints;
 	uniforms.colorByNode              = settings.colorByNode;
 	uniforms.colorByLOD               = settings.colorByLOD;
-	uniforms.colorWhite               = settings.colorWhite;
-	uniforms.LOD                      = settings.LOD;
 	uniforms.minNodeSize              = effectiveMinNodeSize();
 	uniforms.pointSize                = settings.pointSize;
 	uniforms.useHighQualityShading    = settings.useHighQualityShading;
@@ -1494,7 +1487,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.fogBase                  = settings.fogBase;
 	uniforms.fogSky                   = settings.fogSky ? 1 : 0;
 	uniforms.enableBloom              = settings.enableBloom;
-	uniforms.bloomThreshold           = settings.bloomThreshold;
 	uniforms.bloomStrength            = settings.bloomStrength;
 	uniforms.bloomRadius              = settings.bloomRadius;
 	uniforms.exposure                 = settings.exposure;
@@ -1568,7 +1560,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 
 			g_eventRadius        = g_eventRadiusArg > 0.0f ? g_eventRadiusArg : longest * 0.12f;    // 12% of the longest side
 			settings.volMaxDist  = diag * 1.5f;        // rays can cross the whole cloud
-			settings.fitToCloudDone = true;
 			logLine("[host] fitted to cloud: extent %.1f x %.1f x %.1f m, test source (%.1f, %.1f, %.1f), radius %.1f m, reach %.0f m\n",
 				boxSize.x, boxSize.y, boxSize.z, settings.testX, settings.testY, settings.testZ, g_eventRadius, settings.volMaxDist);
 		}
@@ -1671,11 +1662,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	}
 	uniforms.lightOn        = settings.lightOn ? 1 : 0;
 	uniforms.nearClip       = settings.nearClip;
-	uniforms.groundOn       = settings.groundOn ? 1 : 0;
-	uniforms.groundHeight   = settings.groundHeight;
-	uniforms.groundR        = settings.groundColour[0];
-	uniforms.groundG        = settings.groundColour[1];
-	uniforms.groundB        = settings.groundColour[2];
 	uniforms.mixR           = settings.mixColour[0];
 	uniforms.mixG           = settings.mixColour[1];
 	uniforms.mixB           = settings.mixColour[2];
@@ -2852,6 +2838,21 @@ int main(int argc, char** argv){
 	}
 
 	auto renderer = make_shared<GLRenderer>();
+
+	// Fonts, before the first frame builds the atlas. The default font goes in
+	// first so it stays the default for every other window. ProggyTiny gets
+	// the settings AddFontDefault uses for ProggyClean, by the same designer:
+	// no oversampling, glyphs snapped to whole pixels, one pixel lower.
+	{
+		ImGuiIO& io = ImGui::GetIO();
+		io.Fonts->AddFontDefault();
+		ImFontConfig cfg;
+		cfg.OversampleH   = 1;
+		cfg.OversampleV   = 1;
+		cfg.PixelSnapH    = true;
+		cfg.GlyphOffset.y = 1.0f;
+		g_menuFont = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ProggyTiny_compressed_data_base85, 10.0f, &cfg);
+	}
 	auto cpu = getCpuData();
 	// One loader per hardware thread (was two). LAZ decoding is capped lower,
 	// leaving cores for the render loop, the uploader and the OS.
@@ -2994,7 +2995,7 @@ int main(int argc, char** argv){
 			else if(key == "light")     settings.lightOn               = v != 0.0;
 			else if(key == "sunbeams")  settings.sunbeams              = float(v);
 			else if(key == "whitefix")  settings.whiteFix              = v != 0.0;
-			else if(key == "skycast")   settings.tintMargin            = float(v);   // Look > Sky cast
+			else if(key == "skycast")   settings.tintMargin            = float(v);   // Scan clean-up > Sky cast
 			else if(key == "torch")     settings.torchOn               = v != 0.0;   // aims at the frame centre
 			else if(key == "radius")  { g_eventRadiusArg = float(v); if(v > 0.0) g_eventRadius = float(v); }
 			else if(key == "exposure")  settings.exposure              = float(v);
@@ -3409,7 +3410,7 @@ int main(int argc, char** argv){
 		if(Runtime::showGUI)
 		{ // RENDER IMGUI SETTINGS WINDOW
 
-			// ---- movable, collapsible windows (apply_windows.ps1) -------------
+			// ---- movable, collapsible windows ---------------------------------
 			// SetNextWindowPos/Size with no ImGuiCond default to Always, so the
 			// windows were re-pinned every frame and could not be moved or
 			// resized. FirstUseEver places them once and then leaves them alone.
@@ -3447,158 +3448,25 @@ int main(int argc, char** argv){
 			char settingsTitle[96];
 			snprintf(settingsTitle, sizeof(settingsTitle), "Settings   %.1f M points loaded, %.1f M drawn###Settings",
 				double(stats.numPointsProcessed) / 1e6, double(stats.numDrawn) / 1e6);
+			// The 10-pixel menu font and tighter spacing give a slider row 16 pixels
+			// rather than 23, so 44% more rows fit on screen. Small menu text
+			// (Display and debug) turns it off.
+			bool smallText = g_smallMenuText && g_menuFont != nullptr;
+			if(smallText){
+				ImGui::PushFont(g_menuFont);
+				ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,     ImVec2(4.0f, 2.0f));
+				ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,      ImVec2(6.0f, 2.0f));
+				ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, ImVec2(4.0f, 2.0f));
+			}
 			beginPanel(settingsTitle, ImVec2(10, 300), windowSize, settingsCollapsed, settingsSaved);
 
 			// =====================================================================
-			// Settings, regrouped (apply_regroup.ps1). Eight sections. Look is open
-			// by default; the rest collapse. Every control appears exactly once.
+			// Settings, in the order the image is made: the camera, how points are
+			// drawn, the light on them, the air in front of them, then the grade.
+			// After those come what the scene holds (calls, insects, markers), then
+			// speed, clean-up of the scan, and debugging. Points, Sky and haze, and
+			// Colour are open by default. Every control appears exactly once.
 			// =====================================================================
-
-			// ---- LOOK ---------------------------------------------------------
-			if(ImGui::CollapsingHeader("Look", ImGuiTreeNodeFlags_DefaultOpen)){
-				ImGui::SliderFloat("Point size (m)",   &settings.pointWorldSize, 0.0f, 0.30f, "%.3f");
-				tipFor("Splat diameter in metres, projected by depth. Near points large, far ones small.");
-				ImGui::SliderFloat("Point shading",    &settings.pointShading,   0.0f, 1.0f);
-				tipFor("Shades each splat as a small sphere lit from the upper left. 0 is a flat disc.");
-				ImGui::SliderFloat("Near clip (m)",    &settings.nearClip,       0.0f, 10.0f, "%.2f");
-				tipFor("Points closer to the camera than this are not drawn, so foliage right at the lens does not fill the frame.");
-				ImGui::Separator();
-				ImGui::SliderFloat("Exposure",         &settings.exposure,       0.1f, 16.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-				tipFor("Overall brightness. Logarithmic: up to 16x, for scans whose colour was darkened to tame the sunlit canopy.");
-				ImGui::SliderFloat("Saturation",       &settings.saturation,     0.0f, 2.5f);
-				ImGui::SliderFloat("Temperature",      &settings.temperature,   -1.0f, 1.0f);
-				tipFor("Negative is cool, positive warm.");
-				// A colour picker clamps to 0..1, so it could only ever REDUCE a
-				// channel. A mixer must boost as well. Three sliders, 1.0 neutral.
-				ImGui::SliderFloat("Mix red",          &settings.mixColour[0],   0.0f, 2.5f);
-				ImGui::SliderFloat("Mix green",        &settings.mixColour[1],   0.0f, 2.5f);
-				ImGui::SliderFloat("Mix blue",         &settings.mixColour[2],   0.0f, 2.5f);
-				ImGui::SameLine(0.0f);
-				if(ImGui::SmallButton("reset##mix")){ settings.mixColour[0] = settings.mixColour[1] = settings.mixColour[2] = 1.0f; }
-				tipFor("Per-channel gain in linear light. 1.0 is neutral. Below removes a cast, above adds one.");
-				ImGui::Separator();
-				ImGui::SliderFloat("Depth haze",       &settings.fogDensity,     0.0f, 0.08f, "%.5f",
-						ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
-				tipFor("Distance blends toward the haze colour. The reference goes LIGHTER with distance, so keep the colour pale. The value is the haze's density per metre at and below the haze floor.");
-				if(settings.fogDensity <= 0.0f) settings.enableFog = false; else settings.enableFog = true;
-				ImGui::SliderFloat("Haze thins with height", &settings.fogHeightFalloff, 0.0f, 0.5f, "%.3f /m", ImGuiSliderFlags_Logarithmic);
-				tipFor("0 keeps the haze even. Above 0 the haze thins with height above the haze floor, halving every 0.69 / value metres: at 0.1 every 7 m, so it lies low among the trunks and clears toward the canopy.");
-				ImGui::SliderFloat("Haze floor (m)",   &settings.fogBase,        0.0f, boxSize.z > 0.0f ? boxSize.z : 40.0f, "%.1f");
-				tipFor("Height above the lowest point up to which the haze keeps its full density. It only thins above this, so it only matters when Haze thins with height is above 0.");
-				ImGui::Checkbox   ("Haze over sky",    &settings.fogSky);
-				tipFor("The haze also lies between the camera and the sky, so gaps between the trunks and the horizon show haze rather than sky. Use it with Haze thins with height: even haze has no top, so it covers the whole sky.");
-				{
-					float hc[3] = {settings.fogR, settings.fogG, settings.fogB};
-					if(ImGui::ColorEdit3("Haze colour", hc, ImGuiColorEditFlags_NoInputs)){
-						settings.fogR = hc[0]; settings.fogG = hc[1]; settings.fogB = hc[2];
-					}
-					tipFor("Picked like the sky colour, so the same values in both match. With the key light on, haze in shade darkens to the Ambient level, as points do, and Sunbeams (Light) adds the light that reaches it.");
-				}
-				ImGui::ColorEdit3 ("Sky colour",       settings.skyColour, ImGuiColorEditFlags_NoInputs);
-				ImGui::Separator();
-				ImGui::ColorEdit3 ("Below horizon",    settings.belowColour, ImGuiColorEditFlags_NoInputs);
-				tipFor("Colour of empty space when the camera looks downward, past the ground. Black, like the void under a game level. Points themselves keep their scanned colour. Set it to the SKY colour to remove the horizon entirely.");
-				ImGui::SameLine(0.0f);
-				if(ImGui::SmallButton("= sky")){
-					settings.belowColour[0] = settings.skyColour[0];
-					settings.belowColour[1] = settings.skyColour[1];
-					settings.belowColour[2] = settings.skyColour[2];
-				}
-				ImGui::SliderFloat("Horizon softness", &settings.horizonSoftness, 0.0f, 90.0f, "%.0f deg");
-				tipFor("Degrees the sky-to-void gradient spans. It was effectively 1 degree, which drew a hard line across the frame. 12 reads as atmosphere; 90 is a full gradient from zenith to nadir; 0 is a deliberate hard edge.");
-				ImGui::Separator();
-				ImGui::SliderFloat("Grain",            &settings.grain,          0.0f, 0.15f, "%.3f");
-				ImGui::SliderFloat("Vignette",         &settings.vignette,       0.0f, 1.0f);
-				ImGui::Separator();
-				{
-					// The sliders rebuild the colour grid when let go, not on every
-					// frame of a drag: a rebuild recounts every point and relights.
-					bool wf = ImGui::Checkbox("Fix blown-out canopy", &settings.whiteFix);
-					tipFor("The scanner's camera saturates in the sunlit canopy, so leaves and branches there come out white. This recolours those points from the nearest well-exposed points around them: green from foliage, brown from bark.");
-					ImGui::SliderFloat("White level",   &settings.whiteLevel,  100.0f, 250.0f, "%.0f");
-					wf |= ImGui::IsItemDeactivatedAfterEdit();
-					tipFor("A point counts as blown out when its darkest channel is at least this. Lower it to catch pale grey as well as white.");
-					ImGui::SliderFloat("White spread",  &settings.whiteSpread,   5.0f, 120.0f, "%.0f");
-					wf |= ImGui::IsItemDeactivatedAfterEdit();
-					tipFor("... and its three channels are within this of each other. Raise it to catch pale tints (lavender, pale green).");
-					ImGui::SliderFloat("Sky cast",      &settings.tintMargin,    0.0f, 60.0f, "%.0f");
-					wf |= ImGui::IsItemDeactivatedAfterEdit();
-					tipFor("Also repairs lilac, pink and blue points: blue higher than green by more than this. Bark and leaves never are. 0 turns it off; raise it if real blue things (signs, tape) get recoloured.");
-					ImGui::SliderInt  ("Colour reach",  &settings.whiteReach,       1, 8, "%d cells");
-					wf |= ImGui::IsItemDeactivatedAfterEdit();
-					tipFor("How far a blown-out cell looks for a colour. Each cell is the occupancy grid's cell size.");
-					if(wf) g_gridRefill = true;   // the colour grid is rebuilt with the counts
-					if(settings.whiteFix && g_colourGrid == 0 && g_voxelGrid != 0) ImGui::Text("   not enough GPU memory for the colour grid");
-				}
-			}
-
-			// ---- LIGHT --------------------------------------------------------
-			if(ImGui::CollapsingHeader("Light")){
-				bool lm = false;
-				lm |= ImGui::Checkbox   ("Key light on",     &settings.lightOn);
-				tipFor("A directional light through the canopy, computed once per grid cell. Needs Use voxel grid on (under Advanced).");
-				lm |= ImGui::SliderFloat("Azimuth",          &settings.lightAzimuth,   0.0f, 360.0f);
-				lm |= ImGui::SliderFloat("Elevation",        &settings.lightElevation, 0.0f,  89.0f);
-				tipFor("Where the light comes FROM. The reference is backlit and high.");
-				lm |= ImGui::SliderFloat("Strength",         &settings.lightIntensity, 0.0f,   6.0f);
-				ImGui::ColorEdit3 ("Light colour",     settings.lightColour, ImGuiColorEditFlags_NoInputs);
-				ImGui::SliderFloat("Ambient",          &settings.ambient,        0.0f, 1.0f);
-				tipFor("Floor under the key light, so shadowed points keep some of their own colour. The haze in shade darkens to the same level.");
-				lm |= ImGui::SliderFloat("Canopy density",   &settings.lightAbsorb,    0.0f,   1.5f, "%.2f /m");
-				tipFor("Light lost per metre of occupied foliage, so it means the same at every grid resolution. 0.4 lets about a seventh through five metres of canopy; 1.0 almost none.");
-				if(lm) g_lightDirty = true;
-				ImGui::Separator();
-				ImGui::SliderFloat("Sunbeams",         &settings.sunbeams,       0.0f,   4.0f);
-				tipFor("The key light scattered by the haze where the canopy lets it through, so the light shows in the air between the trunks. Needs Depth haze above 0. At 0 the haze gets only the ambient light. Marched at quarter resolution with Medium steps and Medium reach (Advanced); more steps give smoother beams at more cost.");
-				ImGui::SliderFloat("Forward scatter",  &settings.sunAnisotropy,  0.0f,   0.9f);
-				tipFor("How much brighter the haze looks facing the light than with the light behind you (Henyey-Greenstein g). 0 scatters the same in every direction; at 0.5 the haze facing the light is 27 times brighter than facing away. Water droplets scatter strongly forward.");
-				ImGui::Separator();
-				ImGui::Checkbox   ("Torch (T)",        &settings.torchOn);
-				tipFor("A torch held at the camera. While it is on, moving the mouse over the forest aims the beam and does not turn the camera; walk with W/A/S/D and the wheel. T toggles it.");
-				ImGui::SliderFloat("Torch strength",   &settings.torchIntensity, 0.0f, 20.0f, "%.1f");
-				ImGui::SliderFloat("Torch beam (deg)", &settings.torchAngle,     2.0f, 60.0f, "%.0f");
-				ImGui::SliderFloat("Torch reach (m)",  &settings.torchRange,     1.0f, 60.0f, "%.0f");
-				tipFor("Distance at which the beam has fallen to half strength.");
-			}
-
-			// ---- CALLS --------------------------------------------------------
-			if(ImGui::CollapsingHeader("Calls")){
-				ImGui::ColorEdit3 ("Emission colour",  settings.emissionColour, ImGuiColorEditFlags_NoInputs);
-				ImGui::SameLine(0.0f);
-				ImGui::Checkbox   ("by frequency",     &settings.emissionByFrequency);
-				ImGui::SliderFloat("Emission gain",    &settings.emissionGain,   0.0f, 12.0f);
-				ImGui::SliderFloat("Event radius (m)", &g_eventRadius,           0.1f, std::max(40.0f, boxSize.x > 0.0f ? std::max(boxSize.x, boxSize.y) * 0.5f : 40.0f));
-				tipFor("How far a call reaches. Nothing outside this is lit at all.");
-				ImGui::SliderFloat("Falloff power",    &settings.falloffPower,   0.5f,  8.0f);
-				tipFor("1 is a broad ramp, 6 concentrates light at the centre with a long feathered tail.");
-				ImGui::SliderFloat("Core boost",       &settings.coreBoost,      0.0f,  8.0f);
-				ImGui::SliderFloat("Visual tail (s)",  &g_visualTail,            0.0f,  4.0f);
-				tipFor("Seconds the glow outlasts the call, decaying exponentially.");
-				ImGui::Separator();
-				ImGui::SliderFloat("Bloom strength",   &settings.bloomStrength,  0.0f, 4.0f);
-				ImGui::SliderFloat("Bloom spread",     &settings.bloomRadius,    0.0f, 5.0f);
-				settings.enableBloom = settings.bloomStrength > 0.0f;
-				ImGui::Separator();
-				if(ImGui::Button("Load calls.csv")){
-					const char* candidates[] = {
-						"calls.csv",
-						"../../../rotokare_test_kit/kit/data/calls.csv",
-						"../rotokare_test_kit/kit/data/calls.csv",
-						"S:/SimLodMod/rotokare_test_kit/kit/data/calls.csv",
-					};
-					for(const char* p : candidates){
-						if(std::filesystem::exists(p)){ loadCallSchedule(p); break; }
-					}
-					if(!g_callsLoaded) printf("[calls] no calls.csv found in any candidate location\n");
-					g_showClock = 0.0;
-				}
-				ImGui::SameLine(0.0f);
-				if(ImGui::Button(g_showPlaying ? "Pause" : "Play")){ g_showPlaying = !g_showPlaying; }
-				ImGui::SameLine(0.0f);
-				if(ImGui::Button("Restart")){ g_showClock = 0.0; }
-				ImGui::Text("clock %.1f s   active %d", g_showClock, g_activeEvents);
-				ImGui::Checkbox   ("Show event markers", &settings.showEventMarkers);
-			}
 
 			// ---- CAMERA -------------------------------------------------------
 			if(ImGui::CollapsingHeader("Camera")){
@@ -3647,7 +3515,7 @@ int main(int argc, char** argv){
 					renderer->controls->pitch  = pitch;
 					renderer->controls->radius = r;
 					renderer->controls->target = glm::dvec3(double(cx) + dx * r, double(cyc) + dy * r, double(cz) + dz * r);
-					renderer->controls->walkMode = true;   // fix_walk_targets.ps1
+					renderer->controls->walkMode = true;
 				}
 				ImGui::SameLine(0.0f);
 				if(ImGui::Button("Copy camera")){
@@ -3669,87 +3537,186 @@ int main(int argc, char** argv){
 				ImGui::Checkbox   ("Auto-focus on load", &settings.autoFocusOnLoad);
 			}
 
-			// ---- DETAIL AND SPEED ---------------------------------------------
-			if(ImGui::CollapsingHeader("Detail and speed")){
-				{
-					auto withCommas = [](int64_t v){
-						std::string s = std::to_string(v < 0 ? -v : v);
-						int n = int(s.size()) - 3;
-						while(n > 0){ s.insert(n, ","); n -= 3; }
-						return (v < 0 ? "-" : "") + s;
-					};
-					int64_t total = int64_t(stats.numPoints);
-					ImGui::SetNextItemWidth(160.0f);
-					bool edited = ImGui::InputScalar("##targetPoints", ImGuiDataType_S64, &settings.targetPoints,
-													 nullptr, nullptr, "%lld", ImGuiInputTextFlags_EnterReturnsTrue);
-					if(edited){
-						if(settings.targetPoints < 1) settings.targetPoints = 1;
-						if(total > 0 && settings.targetPoints > total) settings.targetPoints = total;
-					}
-					ImGui::SameLine(0.0f);
-					ImGui::Text("/ %s loaded", withCommas(total).c_str());
-				}
-				if(ImGui::SliderFloat("Point density", &settings.pointDensity, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic)){
-					settings.targetPoints = int64_t(double(settings.pointDensity) * double(stats.numPoints) + 0.5);
-					if(settings.targetPoints < 1) settings.targetPoints = 1;
-				}
-				tipFor("Fraction of the cloud traversed. The skipped points are never read, so this scales the main cost directly.");
-				ImGui::Text("   %.2f M actually drawn this frame", stats.numDrawn / 1e6);
-				ImGui::SliderFloat("Detail",           &settings.minNodeSize,    8.0f, 256.0f);
-				tipFor("Level-of-detail threshold in pixels. Higher draws coarser summaries sooner and costs less.");
-				ImGui::Checkbox("Adaptive detail", &settings.adaptiveDetail);
-				tipFor("Coarsens the level of detail automatically while a frame takes longer than the budget, and refines it again when there is headroom. Keeps the view responsive on smaller GPUs and over Remote Desktop.");
-				if(settings.adaptiveDetail){
-					ImGui::SameLine(0.0f);
-					ImGui::SetNextItemWidth(110.0f);
-					ImGui::SliderFloat("Budget ms", &settings.frameBudgetMs, 10.0f, 100.0f, "%.0f");
-					tipFor("Render time to aim for. 33 ms is 30 frames a second; raise it for more detail, lower it for smoother motion.");
-					ImGui::Text("   reduced %.0f%%: detail %.0f px, splat cap %d px", 100.0f * g_adaptReduce, effectiveMinNodeSize(), effectiveMaxSplatPx());
-				}
-				ImGui::Checkbox("VSync", &settings.vsync);
-				tipFor("Caps the frame rate at the display refresh. Saves GPU power and heat, which matters on a laptop GPU; turn it off only to measure raw speed.");
-				ImGui::SliderInt  ("Max splat px",     &settings.maxSplatPx,     2, 64);
-				tipFor("Cap on how large a near point may be drawn. Lower if the frame rate drops when the camera is close to foliage.");
-			}
-
-			// ---- CLEANUP ------------------------------------------------------
-			if(ImGui::CollapsingHeader("Cleanup")){
-				ImGui::SliderInt  ("Min neighbours",   &settings.minNeighbours, 0, 60);
-				tipFor("Removes points whose grid cell holds fewer than this many. 0 is off. Scanner noise sits alone; leaves do not.");
-				ImGui::SliderInt  ("Cull reach",       &settings.cullReach,     0, 1);
-				tipFor("0 counts the point's own cell. 1 adds the six neighbours, which spares thin surfaces on a cell boundary.");
-				ImGui::Checkbox   ("Show culled only", &settings.showCulledOnly);
-				tipFor("Shows ONLY what would be removed. Raise Min neighbours until this is noise and nothing you want.");
+			// ---- POINTS -------------------------------------------------------
+			if(ImGui::CollapsingHeader("Points", ImGuiTreeNodeFlags_DefaultOpen)){
+				ImGui::SliderFloat("Point size (m)",   &settings.pointWorldSize, 0.0f, 0.30f, "%.3f");
+				tipFor("Splat diameter in metres, projected by depth. Near points large, far ones small.");
+				ImGui::SliderFloat("Point shading",    &settings.pointShading,   0.0f, 1.0f);
+				tipFor("Shades each splat as a small sphere lit from the upper left. 0 is a flat disc.");
+				ImGui::SliderFloat("Near clip (m)",    &settings.nearClip,       0.0f, 10.0f, "%.2f");
+				tipFor("Points closer to the camera than this are not drawn, so foliage right at the lens does not fill the frame.");
+				ImGui::Checkbox   ("Round splats",      &settings.roundSplats);
+				ImGui::Checkbox   ("High quality shading", &settings.useHighQualityShading);
+				tipFor("Blends the colours of all points within 1% of the nearest depth at each pixel, which smooths the speckle where points overlap. Draws every point twice, a depth pass and a colour pass, so it costs more than the standard path.");
 				ImGui::Separator();
-				// Edit a copy and apply it on release: every applied value frees and
-				// reallocates the grid (an implicit device sync) and zeroes the counts,
-				// which happened on every frame of a drag.
-				static int pendingGridRes = g_gridResolution;
-				if(!ImGui::IsAnyItemActive()) pendingGridRes = g_gridResolution;   // follow fallbacks
-				ImGui::SliderInt  ("Grid resolution",  &pendingGridRes, 64, 512);
-				if(ImGui::IsItemDeactivatedAfterEdit()) g_gridResolution = pendingGridRes;
-				tipFor("Cells along the cloud's longest side. Applied when you release the slider. Memory grows with the cube: 256 is ~20 MB, 512 ~156 MB.");
-				{
-					float longest = std::max(boxSize.x, std::max(boxSize.y, boxSize.z));
-					if(longest > 0.0f){
-						int R = pendingGridRes;
-						float cell = longest / float(R);
-						int px = std::min(R, int(boxSize.x / cell) + 1);
-						int py = std::min(R, int(boxSize.y / cell) + 1);
-						int pz = std::min(R, int(boxSize.z / cell) + 1);
-						double mb = double(px) * double(py) * double(pz) * 4.0 / 1e6;
-						ImGui::Text("   %d x %d x %d @ %.3f m = %.0f MB", px, py, pz, cell, mb);
-					}
-					if(g_gridRefill) ImGui::Text("   counts are stale - rebuilding on the next frame");
-				}
-				if(ImGui::Button("Rebuild grid counts")){ g_gridRefill = true; }
+				ImGui::Checkbox   ("Eye dome lighting", &settings.enableEDL);
+				ImGui::SliderFloat("EDL strength",      &settings.edlStrength, 0.0f, 3.0f);
 			}
 
-			// ---- MARKERS ------------------------------------------------------
-			if(ImGui::CollapsingHeader("Markers")){
+			// ---- LIGHT --------------------------------------------------------
+			if(ImGui::CollapsingHeader("Light")){
+				bool lm = false;
+				lm |= ImGui::Checkbox   ("Key light on",     &settings.lightOn);
+				tipFor("A directional light through the canopy, computed once per cell of the occupancy grid (Grid resolution, under Scan clean-up).");
+				lm |= ImGui::SliderFloat("Azimuth",          &settings.lightAzimuth,   0.0f, 360.0f);
+				lm |= ImGui::SliderFloat("Elevation",        &settings.lightElevation, 0.0f,  89.0f);
+				tipFor("Where the light comes FROM. The reference is backlit and high.");
+				lm |= ImGui::SliderFloat("Strength",         &settings.lightIntensity, 0.0f,   6.0f);
+				ImGui::ColorEdit3 ("Light colour",     settings.lightColour, ImGuiColorEditFlags_NoInputs);
+				ImGui::SliderFloat("Ambient",          &settings.ambient,        0.0f, 1.0f);
+				tipFor("Floor under the key light, so shadowed points keep some of their own colour. The haze in shade darkens to the same level.");
+				lm |= ImGui::SliderFloat("Canopy density",   &settings.lightAbsorb,    0.0f,   1.5f, "%.2f /m");
+				tipFor("Light lost per metre of occupied foliage, so it means the same at every grid resolution. 0.4 lets about a seventh through five metres of canopy; 1.0 almost none.");
+				if(lm) g_lightDirty = true;
+				ImGui::Separator();
+				ImGui::Checkbox   ("Torch (T)",        &settings.torchOn);
+				tipFor("A torch held at the camera. While it is on, moving the mouse over the forest aims the beam and does not turn the camera; walk with W/A/S/D and the wheel. T toggles it.");
+				ImGui::SliderFloat("Torch strength",   &settings.torchIntensity, 0.0f, 20.0f, "%.1f");
+				ImGui::SliderFloat("Torch beam (deg)", &settings.torchAngle,     2.0f, 60.0f, "%.0f");
+				ImGui::SliderFloat("Torch reach (m)",  &settings.torchRange,     1.0f, 60.0f, "%.0f");
+				tipFor("Distance at which the beam has fallen to half strength.");
+			}
+
+			// ---- SKY AND HAZE -------------------------------------------------
+			if(ImGui::CollapsingHeader("Sky and haze", ImGuiTreeNodeFlags_DefaultOpen)){
+				ImGui::ColorEdit3 ("Sky colour",       settings.skyColour, ImGuiColorEditFlags_NoInputs);
+				ImGui::ColorEdit3 ("Below horizon",    settings.belowColour, ImGuiColorEditFlags_NoInputs);
+				tipFor("Colour of empty space when the camera looks downward, past the ground. Black, like the void under a game level. Points themselves keep their scanned colour. Set it to the SKY colour to remove the horizon entirely.");
+				ImGui::SameLine(0.0f);
+				if(ImGui::SmallButton("= sky")){
+					settings.belowColour[0] = settings.skyColour[0];
+					settings.belowColour[1] = settings.skyColour[1];
+					settings.belowColour[2] = settings.skyColour[2];
+				}
+				ImGui::SliderFloat("Horizon softness", &settings.horizonSoftness, 0.0f, 90.0f, "%.0f deg");
+				tipFor("Degrees the sky-to-void gradient spans. It was effectively 1 degree, which drew a hard line across the frame. 12 reads as atmosphere; 90 is a full gradient from zenith to nadir; 0 is a deliberate hard edge.");
+				ImGui::Separator();
+				ImGui::SliderFloat("Depth haze",       &settings.fogDensity,     0.0f, 0.08f, "%.5f",
+						ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
+				tipFor("Distance blends toward the haze colour. The reference goes LIGHTER with distance, so keep the colour pale. The value is the haze's density per metre at and below the haze floor.");
+				if(settings.fogDensity <= 0.0f) settings.enableFog = false; else settings.enableFog = true;
+				ImGui::SliderFloat("Haze thins with height", &settings.fogHeightFalloff, 0.0f, 0.5f, "%.3f /m", ImGuiSliderFlags_Logarithmic);
+				tipFor("0 keeps the haze even. Above 0 the haze thins with height above the haze floor, halving every 0.69 / value metres: at 0.1 every 7 m, so it lies low among the trunks and clears toward the canopy.");
+				ImGui::SliderFloat("Haze floor (m)",   &settings.fogBase,        0.0f, boxSize.z > 0.0f ? boxSize.z : 40.0f, "%.1f");
+				tipFor("Height above the lowest point up to which the haze keeps its full density. It only thins above this, so it only matters when Haze thins with height is above 0.");
+				ImGui::Checkbox   ("Haze over sky",    &settings.fogSky);
+				tipFor("The haze also lies between the camera and the sky, so gaps between the trunks and the horizon show haze rather than sky. Use it with Haze thins with height: even haze has no top, so it covers the whole sky.");
+				{
+					float hc[3] = {settings.fogR, settings.fogG, settings.fogB};
+					if(ImGui::ColorEdit3("Haze colour", hc, ImGuiColorEditFlags_NoInputs)){
+						settings.fogR = hc[0]; settings.fogG = hc[1]; settings.fogB = hc[2];
+					}
+					tipFor("Picked like the sky colour, so the same values in both match. With the key light on, haze in shade darkens to the Ambient level (Light), as points do, and Sunbeams, below, adds the light that reaches it.");
+				}
+				ImGui::Separator();
+				ImGui::SliderFloat("Sunbeams",         &settings.sunbeams,       0.0f,   4.0f);
+				tipFor("The key light (Light) scattered by the haze where the canopy lets it through, so the light shows in the air between the trunks. Needs Depth haze above 0 and the key light on. At 0 the haze gets only the ambient light. Marched at quarter resolution with Volume steps and Volume reach, below; more steps give smoother beams at more cost.");
+				ImGui::SliderFloat("Forward scatter",  &settings.sunAnisotropy,  0.0f,   0.9f);
+				tipFor("How much brighter the haze looks facing the light than with the light behind you (Henyey-Greenstein g). 0 scatters the same in every direction; at 0.5 the haze facing the light is 27 times brighter than facing away. Water droplets scatter strongly forward.");
+				ImGui::SliderInt  ("Volume steps",      &settings.volSteps,         8,     128);
+				tipFor("Samples along each quarter-resolution ray, for the sunbeams and for the calls' medium (Calls). More steps resolve narrower beams and cost proportionally more.");
+				ImGui::SliderFloat("Volume reach (m)",  &settings.volMaxDist,      20.0f, std::max(400.0f, boxSize.x > 0.0f ? 2.0f * std::sqrt(boxSize.x*boxSize.x + boxSize.y*boxSize.y + boxSize.z*boxSize.z) : 400.0f));
+				tipFor("How far each volumetric ray is marched. Haze beyond it is lit by the key light without canopy shade, so keep it past the far side of the cloud (it is set to 1.5 x the cloud's diagonal on load).");
+			}
+
+			// ---- COLOUR -------------------------------------------------------
+			if(ImGui::CollapsingHeader("Colour", ImGuiTreeNodeFlags_DefaultOpen)){
+				ImGui::SliderFloat("Exposure",         &settings.exposure,       0.1f, 16.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+				tipFor("Overall brightness. Logarithmic: up to 16x, for scans whose colour was darkened to tame the sunlit canopy.");
+				ImGui::SliderFloat("Saturation",       &settings.saturation,     0.0f, 2.5f);
+				ImGui::SliderFloat("Temperature",      &settings.temperature,   -1.0f, 1.0f);
+				tipFor("Negative is cool, positive warm.");
+				// A colour picker clamps to 0..1, so it could only ever REDUCE a
+				// channel. A mixer must boost as well. Three sliders, 1.0 neutral.
+				ImGui::SliderFloat("Mix red",          &settings.mixColour[0],   0.0f, 2.5f);
+				ImGui::SliderFloat("Mix green",        &settings.mixColour[1],   0.0f, 2.5f);
+				ImGui::SliderFloat("Mix blue",         &settings.mixColour[2],   0.0f, 2.5f);
+				ImGui::SameLine(0.0f);
+				if(ImGui::SmallButton("reset##mix")){ settings.mixColour[0] = settings.mixColour[1] = settings.mixColour[2] = 1.0f; }
+				tipFor("Per-channel gain in linear light. 1.0 is neutral. Below removes a cast, above adds one.");
+				ImGui::Separator();
+				ImGui::ColorEdit3 ("Tint colour",       settings.tintColour, ImGuiColorEditFlags_NoInputs);
+				ImGui::SliderFloat("Tint mix",          &settings.tintMix,     0.0f,  1.0f);
+				ImGui::Separator();
+				ImGui::SliderFloat("Grain",            &settings.grain,          0.0f, 0.15f, "%.3f");
+				ImGui::SliderFloat("Vignette",         &settings.vignette,       0.0f, 1.0f);
+			}
+
+			// ---- CALLS --------------------------------------------------------
+			if(ImGui::CollapsingHeader("Calls")){
+				if(ImGui::Button("Load calls.csv")){
+					const char* candidates[] = {
+						"calls.csv",
+						"../../../rotokare_test_kit/kit/data/calls.csv",
+						"../rotokare_test_kit/kit/data/calls.csv",
+						"S:/SimLodMod/rotokare_test_kit/kit/data/calls.csv",
+					};
+					for(const char* p : candidates){
+						if(std::filesystem::exists(p)){ loadCallSchedule(p); break; }
+					}
+					if(!g_callsLoaded) printf("[calls] no calls.csv found in any candidate location\n");
+					g_showClock = 0.0;
+				}
+				ImGui::SameLine(0.0f);
+				if(ImGui::Button(g_showPlaying ? "Pause" : "Play")){ g_showPlaying = !g_showPlaying; }
+				ImGui::SameLine(0.0f);
+				if(ImGui::Button("Restart")){ g_showClock = 0.0; }
+				ImGui::Text("clock %.1f s   active %d", g_showClock, g_activeEvents);
+				ImGui::Checkbox   ("Show event markers", &settings.showEventMarkers);
+				ImGui::Separator();
+				ImGui::ColorEdit3 ("Emission colour",  settings.emissionColour, ImGuiColorEditFlags_NoInputs);
+				ImGui::SameLine(0.0f);
+				ImGui::Checkbox   ("by frequency",     &settings.emissionByFrequency);
+				ImGui::SliderFloat("Emission gain",    &settings.emissionGain,   0.0f, 12.0f);
+				ImGui::SliderFloat("Event radius (m)", &g_eventRadius,           0.1f, std::max(40.0f, boxSize.x > 0.0f ? std::max(boxSize.x, boxSize.y) * 0.5f : 40.0f));
+				tipFor("How far a call reaches. Nothing outside this is lit at all.");
+				ImGui::SliderFloat("Falloff power",    &settings.falloffPower,   0.5f,  8.0f);
+				tipFor("1 is a broad ramp, 6 concentrates light at the centre with a long feathered tail.");
+				ImGui::SliderFloat("Core boost",       &settings.coreBoost,      0.0f,  8.0f);
+				ImGui::SliderFloat("Visual tail (s)",  &g_visualTail,            0.0f,  4.0f);
+				tipFor("Seconds the glow outlasts the call, decaying exponentially.");
+				ImGui::Separator();
+				ImGui::SliderFloat("Bloom strength",   &settings.bloomStrength,  0.0f, 4.0f);
+				ImGui::SliderFloat("Bloom spread",     &settings.bloomRadius,    0.0f, 5.0f);
+				settings.enableBloom = settings.bloomStrength > 0.0f;
+				ImGui::Separator();
+				ImGui::TextDisabled("Volumetric medium (expensive, not in the reference)");
+				ImGui::Checkbox   ("Volumetric medium", &settings.enableVolumetric);
+				tipFor("Air that the calls light, so each call shows as a glow in the space around it. Trunks and canopy block it and cast shafts. Marched at quarter resolution with Volume steps and Volume reach (Sky and haze).");
+				ImGui::SliderFloat("Medium density",    &settings.volDensity,       0.0f,  0.12f);
+				ImGui::SliderFloat("Medium scatter",    &settings.volScatter,       0.0f,  6.0f);
+				ImGui::SliderFloat("Medium pools low",  &settings.volHeightFalloff, 0.0f,  0.05f);
+				ImGui::SliderFloat("Medium occlusion",  &settings.volOcclusion,     0.0f,  3.0f);
+				ImGui::SliderInt  ("Medium shadow steps", &settings.volShadowSteps, 0,    16);
+				ImGui::Separator();
+				ImGui::TextDisabled("Test source");
+				ImGui::Checkbox   ("Test source on",    &settings.testSourceOn);
+				{
+					float fxMin = std::isfinite(boxMin.x) ? boxMin.x : -50.0f, fxMax = std::isfinite(boxMin.x) ? boxMin.x + boxSize.x : 50.0f;
+					float fyMin = std::isfinite(boxMin.y) ? boxMin.y : -50.0f, fyMax = std::isfinite(boxMin.y) ? boxMin.y + boxSize.y : 50.0f;
+					float fzMin = std::isfinite(boxMin.z) ? boxMin.z :   0.0f, fzMax = std::isfinite(boxMin.z) ? boxMin.z + boxSize.z : 40.0f;
+					ImGui::SliderFloat("Test X", &settings.testX, fxMin, fxMax);
+					ImGui::SliderFloat("Test Y", &settings.testY, fyMin, fyMax);
+					ImGui::SliderFloat("Test Z", &settings.testZ, fzMin, fzMax);
+				}
+				ImGui::SliderFloat("Test intensity",    &settings.testIntensity, 0.0f, 3.0f);
+				ImGui::SliderFloat("Test Hz",           &settings.testHz, 200.0f, 400.0f);
+			}
+
+			// ---- INSECTS ------------------------------------------------------
+			if(ImGui::CollapsingHeader("Insects")){
+				ImGui::SliderInt  ("Count",            &settings.numInsects,   0, 30000);
+				ImGui::SliderInt  ("Size (px)",        &settings.insectSize,   1,     4);
+				ImGui::SliderFloat("Glow",             &settings.insectGlow,   0.0f, 6.0f);
+				ImGui::SliderFloat("Speed",            &settings.insectSpeed,  0.0f, 2.0f);
+				ImGui::SliderInt  ("Placement",        &settings.insectPlacement, 0, 1);
+				tipFor("1 keeps only insects in air near foliage, using the grid. 0 scatters them anywhere.");
+			}
+
+			// ---- MARKERS AND SURVEY -------------------------------------------
+			if(ImGui::CollapsingHeader("Markers and survey")){
 				ImGui::SliderFloat("Marker size (m)", &settings.markerScale, 0.05f, 1.0f, "%.2f");
 				ImGui::Separator();
-				// ---- apply_markers2.ps1 ------------------------------------------
 				ImGui::Checkbox("Show markers", &settings.showMarkers);
 				ImGui::SameLine(0.0f);
 				ImGui::Checkbox("Markers only", &settings.markersOnly);
@@ -3814,59 +3781,115 @@ int main(int argc, char** argv){
 				tipFor("On: call positions are converted from the survey frame into the file frame when calls.csv is loaded, using the fit above. Off: calls.csv is taken to be in file (LAS) coordinates already.");
 			}
 
-			// ---- INSECTS ------------------------------------------------------
-			if(ImGui::CollapsingHeader("Insects")){
-				ImGui::SliderInt  ("Count",            &settings.numInsects,   0, 30000);
-				ImGui::SliderInt  ("Size (px)",        &settings.insectSize,   1,     4);
-				ImGui::SliderFloat("Glow",             &settings.insectGlow,   0.0f, 6.0f);
-				ImGui::SliderFloat("Speed",            &settings.insectSpeed,  0.0f, 2.0f);
-				ImGui::SliderInt  ("Placement",        &settings.insectPlacement, 0, 1);
-				tipFor("1 keeps only insects in air near foliage, using the grid. 0 scatters them anywhere.");
+			// ---- DETAIL AND SPEED ---------------------------------------------
+			if(ImGui::CollapsingHeader("Detail and speed")){
+				{
+					auto withCommas = [](int64_t v){
+						std::string s = std::to_string(v < 0 ? -v : v);
+						int n = int(s.size()) - 3;
+						while(n > 0){ s.insert(n, ","); n -= 3; }
+						return (v < 0 ? "-" : "") + s;
+					};
+					int64_t total = int64_t(stats.numPoints);
+					ImGui::SetNextItemWidth(160.0f);
+					bool edited = ImGui::InputScalar("##targetPoints", ImGuiDataType_S64, &settings.targetPoints,
+													 nullptr, nullptr, "%lld", ImGuiInputTextFlags_EnterReturnsTrue);
+					if(edited){
+						if(settings.targetPoints < 1) settings.targetPoints = 1;
+						if(total > 0 && settings.targetPoints > total) settings.targetPoints = total;
+					}
+					ImGui::SameLine(0.0f);
+					ImGui::Text("/ %s loaded", withCommas(total).c_str());
+				}
+				if(ImGui::SliderFloat("Point density", &settings.pointDensity, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic)){
+					settings.targetPoints = int64_t(double(settings.pointDensity) * double(stats.numPoints) + 0.5);
+					if(settings.targetPoints < 1) settings.targetPoints = 1;
+				}
+				tipFor("Fraction of the cloud traversed. The skipped points are never read, so this scales the main cost directly.");
+				ImGui::Text("   %.2f M actually drawn this frame", stats.numDrawn / 1e6);
+				ImGui::SliderFloat("Detail",           &settings.minNodeSize,    8.0f, 256.0f);
+				tipFor("Level-of-detail threshold in pixels. Higher draws coarser summaries sooner and costs less.");
+				ImGui::Checkbox("Adaptive detail", &settings.adaptiveDetail);
+				tipFor("Coarsens the level of detail automatically while a frame takes longer than the budget, and refines it again when there is headroom. Keeps the view responsive on smaller GPUs and over Remote Desktop.");
+				if(settings.adaptiveDetail){
+					ImGui::SameLine(0.0f);
+					ImGui::SetNextItemWidth(110.0f);
+					ImGui::SliderFloat("Budget ms", &settings.frameBudgetMs, 10.0f, 100.0f, "%.0f");
+					tipFor("Render time to aim for. 33 ms is 30 frames a second; raise it for more detail, lower it for smoother motion.");
+					ImGui::Text("   reduced %.0f%%: detail %.0f px, splat cap %d px", 100.0f * g_adaptReduce, effectiveMinNodeSize(), effectiveMaxSplatPx());
+				}
+				ImGui::Checkbox("VSync", &settings.vsync);
+				tipFor("Caps the frame rate at the display refresh. Saves GPU power and heat, which matters on a laptop GPU; turn it off only to measure raw speed.");
+				ImGui::SliderInt  ("Max splat px",     &settings.maxSplatPx,     2, 64);
+				tipFor("Cap on how large a near point may be drawn. Lower if the frame rate drops when the camera is close to foliage.");
 			}
 
-			// ---- ADVANCED -----------------------------------------------------
-			if(ImGui::CollapsingHeader("Advanced")){
-				ImGui::TextDisabled("Volumetric medium (expensive, not in the reference)");
-				ImGui::Checkbox   ("Volumetric medium", &settings.enableVolumetric);
-				ImGui::SliderFloat("Medium density",    &settings.volDensity,       0.0f,  0.12f);
-				ImGui::SliderFloat("Medium scatter",    &settings.volScatter,       0.0f,  6.0f);
-				ImGui::SliderFloat("Medium pools low",  &settings.volHeightFalloff, 0.0f,  0.05f);
-				ImGui::SliderFloat("Medium occlusion",  &settings.volOcclusion,     0.0f,  3.0f);
-				ImGui::SliderInt  ("Medium steps",      &settings.volSteps,         8,     128);
-				tipFor("Samples along each quarter-resolution ray, for the calls' medium and for the sunbeams (Light). More steps resolve narrower beams and cost proportionally more.");
-				ImGui::SliderInt  ("Medium shadow steps", &settings.volShadowSteps, 0,    16);
-				ImGui::SliderFloat("Medium reach (m)",  &settings.volMaxDist,      20.0f, std::max(400.0f, boxSize.x > 0.0f ? 2.0f * std::sqrt(boxSize.x*boxSize.x + boxSize.y*boxSize.y + boxSize.z*boxSize.z) : 400.0f));
-				tipFor("How far each volumetric ray is marched. Haze beyond it is lit by the key light without canopy shade, so keep it past the far side of the cloud (it is set to 1.5 x the cloud's diagonal on load).");
+			// ---- SCAN CLEAN-UP ------------------------------------------------
+			if(ImGui::CollapsingHeader("Scan clean-up")){
+				ImGui::SliderInt  ("Min neighbours",   &settings.minNeighbours, 0, 60);
+				tipFor("Removes points whose grid cell holds fewer than this many. 0 is off. Scanner noise sits alone; leaves do not.");
+				ImGui::SliderInt  ("Cull reach",       &settings.cullReach,     0, 1);
+				tipFor("0 counts the point's own cell. 1 adds the six neighbours, which spares thin surfaces on a cell boundary.");
+				ImGui::Checkbox   ("Show culled only", &settings.showCulledOnly);
+				tipFor("Shows ONLY what would be removed. Raise Min neighbours until this is noise and nothing you want.");
 				ImGui::Separator();
-				ImGui::TextDisabled("Test source");
-				ImGui::Checkbox   ("Test source on",    &settings.testSourceOn);
 				{
-					float fxMin = std::isfinite(boxMin.x) ? boxMin.x : -50.0f, fxMax = std::isfinite(boxMin.x) ? boxMin.x + boxSize.x : 50.0f;
-					float fyMin = std::isfinite(boxMin.y) ? boxMin.y : -50.0f, fyMax = std::isfinite(boxMin.y) ? boxMin.y + boxSize.y : 50.0f;
-					float fzMin = std::isfinite(boxMin.z) ? boxMin.z :   0.0f, fzMax = std::isfinite(boxMin.z) ? boxMin.z + boxSize.z : 40.0f;
-					ImGui::SliderFloat("Test X", &settings.testX, fxMin, fxMax);
-					ImGui::SliderFloat("Test Y", &settings.testY, fyMin, fyMax);
-					ImGui::SliderFloat("Test Z", &settings.testZ, fzMin, fzMax);
+					// The sliders rebuild the colour grid when let go, not on every
+					// frame of a drag: a rebuild recounts every point and relights.
+					bool wf = ImGui::Checkbox("Fix blown-out canopy", &settings.whiteFix);
+					tipFor("The scanner's camera saturates in the sunlit canopy, so leaves and branches there come out white. This recolours those points from the nearest well-exposed points around them: green from foliage, brown from bark.");
+					ImGui::SliderFloat("White level",   &settings.whiteLevel,  100.0f, 250.0f, "%.0f");
+					wf |= ImGui::IsItemDeactivatedAfterEdit();
+					tipFor("A point counts as blown out when its darkest channel is at least this. Lower it to catch pale grey as well as white.");
+					ImGui::SliderFloat("White spread",  &settings.whiteSpread,   5.0f, 120.0f, "%.0f");
+					wf |= ImGui::IsItemDeactivatedAfterEdit();
+					tipFor("... and its three channels are within this of each other. Raise it to catch pale tints (lavender, pale green).");
+					ImGui::SliderFloat("Sky cast",      &settings.tintMargin,    0.0f, 60.0f, "%.0f");
+					wf |= ImGui::IsItemDeactivatedAfterEdit();
+					tipFor("Also repairs lilac, pink and blue points: blue higher than green by more than this. Bark and leaves never are. 0 turns it off; raise it if real blue things (signs, tape) get recoloured.");
+					ImGui::SliderInt  ("Colour reach",  &settings.whiteReach,       1, 8, "%d cells");
+					wf |= ImGui::IsItemDeactivatedAfterEdit();
+					tipFor("How far a blown-out cell looks for a colour. Each cell is the occupancy grid's cell size.");
+					if(wf) g_gridRefill = true;   // the colour grid is rebuilt with the counts
+					if(settings.whiteFix && g_colourGrid == 0 && g_voxelGrid != 0) ImGui::Text("   not enough GPU memory for the colour grid");
 				}
-				ImGui::SliderFloat("Test intensity",    &settings.testIntensity, 0.0f, 3.0f);
-				ImGui::SliderFloat("Test Hz",           &settings.testHz, 200.0f, 400.0f);
 				ImGui::Separator();
-				ImGui::TextDisabled("Grading extras");
-				ImGui::ColorEdit3 ("Tint colour",       settings.tintColour, ImGuiColorEditFlags_NoInputs);
-				ImGui::SliderFloat("Tint mix",          &settings.tintMix,     0.0f,  1.0f);
-				ImGui::Separator();
-				ImGui::TextDisabled("Rendering");
-				ImGui::Checkbox   ("Eye dome lighting", &settings.enableEDL);
-				ImGui::SliderFloat("EDL strength",      &settings.edlStrength, 0.0f, 3.0f);
-				ImGui::Checkbox   ("Round splats",      &settings.roundSplats);
-				ImGui::Checkbox   ("High quality shading", &settings.useHighQualityShading);
-				ImGui::Separator();
-				ImGui::TextDisabled("Grid and debug");
+				// Edit a copy and apply it on release: every applied value frees and
+				// reallocates the grid (an implicit device sync) and zeroes the counts,
+				// which happened on every frame of a drag.
+				static int pendingGridRes = g_gridResolution;
+				if(!ImGui::IsAnyItemActive()) pendingGridRes = g_gridResolution;   // follow fallbacks
+				ImGui::SliderInt  ("Grid resolution",  &pendingGridRes, 64, 512);
+				if(ImGui::IsItemDeactivatedAfterEdit()) g_gridResolution = pendingGridRes;
+				tipFor("Cells along the cloud's longest side. Applied when you release the slider. Memory grows with the cube: 256 is ~20 MB, 512 ~156 MB.");
+				{
+					float longest = std::max(boxSize.x, std::max(boxSize.y, boxSize.z));
+					if(longest > 0.0f){
+						int R = pendingGridRes;
+						float cell = longest / float(R);
+						int px = std::min(R, int(boxSize.x / cell) + 1);
+						int py = std::min(R, int(boxSize.y / cell) + 1);
+						int pz = std::min(R, int(boxSize.z / cell) + 1);
+						double mb = double(px) * double(py) * double(pz) * 4.0 / 1e6;
+						ImGui::Text("   %d x %d x %d @ %.3f m = %.0f MB", px, py, pz, cell, mb);
+					}
+					if(g_gridRefill) ImGui::Text("   counts are stale - rebuilding on the next frame");
+				}
+				if(ImGui::Button("Rebuild grid counts")){ g_gridRefill = true; }
 				ImGui::Checkbox   ("Use voxel grid",    &settings.useVoxelGrid);
-				ImGui::Checkbox   ("Show voxel grid",   &settings.showVoxelGrid);
-				ImGui::Checkbox   ("Show bounding box", &settings.showBoundingBox);
-				ImGui::Checkbox   ("Update visibility", &settings.doUpdateVisibility);
+				tipFor("Off stops the stray-point cull, insect placement near foliage, the grid view and the calls' medium from using the occupancy grid. The grid is still built, and the key light's canopy shade and the canopy colour repair are not affected.");
+			}
+
+			// ---- DISPLAY AND DEBUG --------------------------------------------
+			if(ImGui::CollapsingHeader("Display and debug")){
+				ImGui::Checkbox   ("Small menu text",   &g_smallMenuText);
+				tipFor("Draws this window in a 10-pixel font with tighter spacing, so more of it fits on screen. Off returns to the 13-pixel font.");
+				ImGui::Separator();
 				ImGui::Checkbox   ("Show points",       &settings.showPoints);
+				ImGui::Checkbox   ("Show bounding box", &settings.showBoundingBox);
+				ImGui::Checkbox   ("Show voxel grid",   &settings.showVoxelGrid);
+				ImGui::Checkbox   ("Update visibility", &settings.doUpdateVisibility);
+				tipFor("Off freezes the level of detail and the culling at the current view, so you can move away and see which parts of the octree that view selected.");
 				ImGui::Checkbox   ("Colour by node",    &settings.colorByNode);
 				ImGui::Checkbox   ("Colour by LOD",     &settings.colorByLOD);
 			}
@@ -3876,6 +3899,10 @@ int main(int argc, char** argv){
 			// }
 
 			ImGui::End();
+			if(smallText){
+				ImGui::PopStyleVar(3);
+				ImGui::PopFont();
+			}
 		}
 		
 		if(Runtime::showGUI)

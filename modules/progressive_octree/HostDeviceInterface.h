@@ -70,14 +70,9 @@ struct Uniforms{
 	bool showPoints;
 	bool colorByNode;
 	bool colorByLOD;
-	bool colorWhite;
-	bool doUpdateVisibility;
-	bool doProgressive;
-	float LOD;
 	bool useHighQualityShading;
 	float minNodeSize;
 	int pointSize;
-	bool updateStats;
 	bool enableEDL;
 	float edlStrength;
 
@@ -92,7 +87,6 @@ struct Uniforms{
 	float fogBase;           // metres above the lowest point: full density at and below
 	int   fogSky;            // 1 = the haze also lies between the camera and the sky
 	bool  enableBloom;
-	float bloomThreshold;
 	float bloomStrength;
 	float bloomRadius;
 
@@ -120,7 +114,7 @@ struct Uniforms{
 	int      gridRefill;        // 1 = rebuild the occupancy counts from the octree
 	int      numNodesTotal;     // nodes in the octree, for the refill walk
 	bool     showEventMarkers;
-	bool     useVoxelGrid;      // master switch: gates every use, not the counting
+	bool     useVoxelGrid;      // gates the cull, insect placement, grid view and medium; not the counting
 	float    pointDensity;      // fraction of scanned points drawn, 0..1
 
 	// volumetric medium (apply_volumetric.ps1)
@@ -194,14 +188,9 @@ struct Uniforms{
 	float    torchCosOuter;     // cos of the half-angle where the beam ends
 	float    torchRange;        // metres at which the light has fallen to half
 
-	// regroup (apply_regroup.ps1)
+	// key light switch, near clip, channel gains
 	int      lightOn;           // key light switch
 	float    nearClip;          // metres: points nearer than this are not drawn
-	int      groundOn;          // paint the ground band
-	float    groundHeight;      // metres above the lowest point
-	float    groundR;           // ground colour, sRGB 0..1
-	float    groundG;
-	float    groundB;
 	float    mixR;              // channel gains, applied in the composite
 	float    mixG;
 	float    mixB;
