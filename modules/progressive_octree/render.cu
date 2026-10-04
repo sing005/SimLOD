@@ -391,6 +391,15 @@ inline float lightAt(float px, float py, float pz){
 	return c0 * (1.0f - tz) + c1 * tz;
 }
 
+// ---- native colour -----------------------------------------------------
+// Each point in the colour stored in the file. Every step that changes a
+// point's colour on the way to the screen checks this: the blown-out repair,
+// the key light, the torch, splat shading, eye dome lighting, and in the
+// composite haze, sunbeams, bloom, the grade, exposure and the tone map.
+inline bool nativeColour(){
+	return uniforms.nativeColour != 0;
+}
+
 // ---- torch -------------------------------------------------------------
 // A spotlight held at the camera and aimed through the mouse pixel. It adds
 // light in proportion to a point's own (repaired) colour, so a lit leaf stays
@@ -400,7 +409,7 @@ float3 _torchDir   = {0.0f, 0.0f, 1.0f};   // set once per frame by thread 0
 int    _torchValid = 0;
 
 inline uint32_t applyTorch(uint32_t lit, uint32_t base, float px, float py, float pz){
-	if(uniforms.torchOn == 0 || _torchValid == 0) return lit;
+	if(nativeColour() || uniforms.torchOn == 0 || _torchValid == 0) return lit;
 	float vx = px - uniforms.camPos.x, vy = py - uniforms.camPos.y, vz = pz - uniforms.camPos.z;
 	float d2 = vx*vx + vy*vy + vz*vz;
 	if(d2 < 1e-6f) return lit;
@@ -531,7 +540,7 @@ void finishColourGrid(){
 // Colour for a blown-out point at this position, or the point's own colour
 // if the grid has nothing nearby. Trilinear over the cells that have colour.
 inline uint32_t repairColour(uint32_t c, float px, float py, float pz){
-	if(uniforms.colourGridPtr == 0 || !isBlownOut(c)) return c;
+	if(nativeColour() || uniforms.colourGridPtr == 0 || !isBlownOut(c)) return c;
 	const uint64_t* g = (const uint64_t*)uniforms.colourGridPtr;
 	float cs = uniforms.cellSize;
 	float fx = px / cs - 0.5f, fy = py / cs - 0.5f, fz = pz / cs - 0.5f;
@@ -565,7 +574,7 @@ inline uint32_t repairColour(uint32_t c, float px, float py, float pz){
 // Combine the key light with an ambient floor. Backlit foliage goes toward the
 // light colour; shadowed points keep their own colour at ambient strength.
 inline uint32_t applyKeyLight(uint32_t c, float trans){
-	if(uniforms.lightOn == 0 || uniforms.lightIntensity <= 0.0f) return c;
+	if(nativeColour() || uniforms.lightOn == 0 || uniforms.lightIntensity <= 0.0f) return c;
 	// ambient floors the shadow; intensity scales the lit side. Capped so the
 	// brightest fully-lit point cannot exceed 2x its own colour, which is
 	// plenty and stops strength 4 turning foliage into flat yellow.
@@ -608,7 +617,7 @@ constexpr float SKY_DISTANCE = 1.0e7f;
 // The key light changes nothing unless it is on with some strength; the same
 // test applyKeyLight makes.
 inline bool keyLightActive(){
-	return uniforms.lightOn != 0 && uniforms.lightIntensity > 0.0f;
+	return !nativeColour() && uniforms.lightOn != 0 && uniforms.lightIntensity > 0.0f;
 }
 
 inline float hazeDensityAt(float z){
@@ -802,7 +811,7 @@ inline float voxelSplatMetres(float nodeSize){
 // (ox,oy) is the pixel's offset within the R x R splat. Returns a multiplier;
 // 1.0 everywhere when shading is off or the splat is too small to show it.
 inline float splatShade(int ox, int oy, int R, float half){
-	if(uniforms.pointShading <= 0.0f || R < 3) return 1.0f;
+	if(nativeColour() || uniforms.pointShading <= 0.0f || R < 3) return 1.0f;
 	float rr = float(R) * 0.5f;
 	float u  = (float(ox) - half) / rr;
 	float v  = (float(oy) - half) / rr;
@@ -858,7 +867,7 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 		}else{
 			color = repairColour(color, point.x, point.y, point.z);   // blown-out canopy
 			uint32_t base = color;
-			if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated: no grid read while off
+			if(keyLightActive()) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated: no grid read while off
 			color = applyTorch(color, base, point.x, point.y, point.z);
 		}
 
@@ -1428,7 +1437,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 					if(!uniforms.colorByNode && !uniforms.colorByLOD){   // debug colours stay unlit, as in drawPoint
 						color = repairColour(color, point.x, point.y, point.z);   // blown-out canopy
 						uint32_t base = color;
-						if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
+						if(keyLightActive()) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
 						color = applyTorch(color, base, point.x, point.y, point.z);
 					}
 					uint8_t* rgba = (uint8_t*)&color;
@@ -1540,7 +1549,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 					if(!uniforms.colorByNode && !uniforms.colorByLOD){   // debug colours stay unlit, as in drawPoint
 						color = repairColour(color, point.x, point.y, point.z);   // blown-out canopy
 						uint32_t base = color;
-						if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
+						if(keyLightActive()) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
 						color = applyTorch(color, base, point.x, point.y, point.z);
 					}
 					uint8_t* rgba = (uint8_t*)&color;
@@ -2606,7 +2615,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	if(grid.thread_rank() == 0) stats->stageNs[2] = nanotime() - tStart;   // apply_stage_timers.ps1
 	// Skip the whole pass when EDL is off or its strength is zero. It reads
 	// four neighbouring pixels per pixel and was running regardless.
-	if(uniforms.enableEDL && uniforms.edlStrength > 0.0f)
+	if(uniforms.enableEDL && uniforms.edlStrength > 0.0f && !nativeColour())
 	{ // tile-based EDL
 
 		struct Pixel{
@@ -2711,7 +2720,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	// of whatever lies behind it are applied in closed form in the composite;
 	// only the part that changes along the ray with the canopy's shade is
 	// marched here.
-	bool volEvents = uniforms.enableVolumetric && uniforms.numEvents > 0;
+	bool volEvents = !nativeColour() && uniforms.enableVolumetric && uniforms.numEvents > 0;
 	bool volSun    = sunbeamsOn();
 	if(volEvents || volSun){
 
@@ -2946,7 +2955,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			}
 		}
 
-		if(uniforms.enableBloom){
+		if(uniforms.enableBloom && !nativeColour()){
 
 			// level 0: 2x2 box from the emission buffer. Reads emission, not a
 			// luminance threshold, so only actual sources bloom.
@@ -3095,6 +3104,24 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 					kg = kg * (1.0f - f) + srgbToLinear(uniforms.belowG * 255.0f) * f;
 					kb = kb * (1.0f - f) + srgbToLinear(uniforms.belowB * 255.0f) * f;
 				}
+			}
+
+			// ---- native colour -----------------------------------------
+			// A point's pixel keeps the colour stored in the file, byte for
+			// byte, and the backdrop the colour it was given: none of the haze,
+			// light, bloom, grade, exposure or tone map below.
+			if(nativeColour()){
+				uint32_t out;
+				if(isGeometry){
+					out = (p.color & 0x00ffffffu) | (255u << 24);
+				}else{
+					uint32_t R = uint32_t(linearToSrgb(kr) * 255.0f + 0.5f);
+					uint32_t G = uint32_t(linearToSrgb(kg) * 255.0f + 0.5f);
+					uint32_t B = uint32_t(linearToSrgb(kb) * 255.0f + 0.5f);
+					out = R | (G << 8) | (B << 16) | (255u << 24);
+				}
+				surf2Dwrite(out, gl_colorbuffer, x * 4, y);
+				return;
 			}
 
 			// ---- haze -------------------------------------------------

@@ -169,6 +169,7 @@ struct {
 	bool  enableBloom                = false;
 	float bloomStrength              = 1.2f;
 	float bloomRadius                = 3.0f;   // now a mip level count, 0-5
+	bool  nativeColour               = true;   // each point in its stored colour; off for the look below
 	float exposure                   = 4.0f;   // low-key, as the reference
 	float emissionGain               = 3.0f;
 	int   numInsects                 = 12273;
@@ -1728,6 +1729,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.maxSplatPx       = effectiveMaxSplatPx();
 	uniforms.grain            = settings.grain;
 	uniforms.vignette         = settings.vignette;
+	uniforms.nativeColour     = settings.nativeColour ? 1 : 0;
 	{
 		double az = settings.lightAzimuth   * 3.14159265358979 / 180.0;
 		double el = settings.lightElevation * 3.14159265358979 / 180.0;
@@ -3091,8 +3093,9 @@ int main(int argc, char** argv){
 			else if(key == "torch")     settings.torchOn               = v != 0.0;   // aims at the frame centre
 			else if(key == "radius")  { g_eventRadiusArg = float(v); if(v > 0.0) g_eventRadius = float(v); }
 			else if(key == "exposure")  settings.exposure              = float(v);
+			else if(key == "native")    settings.nativeColour          = v != 0.0;   // 0 = the look
 			else if(key == "keep")      loadKeepPer10k = uint32_t(std::clamp(v, 0.01, 1.0) * 10000.0 + 0.5);   // fraction of each file loaded
-			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze, hazefall, hazefloor, hazesky, light, sunbeams, whitefix, skycast, torch, radius, exposure, keep)\n", key);
+			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze, hazefall, hazefloor, hazesky, light, sunbeams, whitefix, skycast, torch, radius, exposure, native, keep)\n", key);
 		}else if(iEndsWith(arg, "las") || iEndsWith(arg, "laz") || iEndsWith(arg, "simlod")){
 			std::error_code ec;
 			auto absolute = std::filesystem::absolute(arg, ec);   // dropped files are absolute too
@@ -3573,6 +3576,12 @@ int main(int argc, char** argv){
 			// speed, clean-up of the scan, and debugging. Points, Sky and haze, and
 			// Colour are open by default. Every control appears exactly once.
 			// =====================================================================
+
+			// ---- NATIVE COLOUR --------------------------------------------------
+			ImGui::Checkbox("Native colour", &settings.nativeColour);
+			tipFor("Each point in the colour stored in the file. While this is on, the key light, torch, point shading, "
+				   "Fix blown-out canopy, eye dome lighting, haze, sunbeams, bloom and the whole Colour section are skipped. "
+				   "Turn it off for the look.");
 
 			// ---- CAMERA -------------------------------------------------------
 			if(ImGui::CollapsingHeader("Camera")){

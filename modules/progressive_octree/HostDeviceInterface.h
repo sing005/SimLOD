@@ -154,6 +154,7 @@ struct Uniforms{
 	int      maxSplatPx;        // cap on projected splat size
 	float    grain;             // film grain amplitude
 	float    vignette;          // corner darkening 0..1
+	int      nativeColour;      // 1 = each point in its stored colour: no light, shading, repair, haze or grade
 
 	// directional key light
 	uint64_t lightGridPtr;      // per-cell transmittance toward the light, 0..1

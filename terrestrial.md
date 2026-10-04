@@ -36,6 +36,7 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 - Files load as if dropped on the window.
 - `--view` places the camera. The target is in the renderer frame, i.e. relative to the cloud's minimum corner.
 - `--set` accepts `hqs`, `splat`, `detail`, `adaptive`, `budget` and `vsync`, and for the haze and key light `haze`, `hazefall`, `hazefloor`, `hazesky`, `light` and `sunbeams`.
+- `--set native=0` starts with the look. By default SimLOD starts in Native colour: each point in the colour stored in the file, with the key light, torch, point shading, Fix blown-out canopy, eye dome lighting, haze, sunbeams, bloom, the grade, exposure and the tone map all skipped (`nativeColour()` in `render.cu`). The checkbox is at the top of the settings panel.
 - Timings go to the run log as `[host] stage ms:` lines. Measure only after loading finishes: frame cost changes a lot while the octree is still being built.
 - Kill with `timeout N`. Stdout is buffered and lost on kill, but the log file is flushed every line.
 - `.laz` decompresses slowly (about 4 min for 54 M points). Convert to `.las` with `laspy` for repeated runs.
@@ -133,4 +134,4 @@ The docstring gives the method. In order, the steps are:
   - A quick test on a full scan: `--crop 8 -4 12 0`, about 3.4 M points. A patch around the scanner such as `--crop -10 -10 10 10` holds half the scan.
   - `--workers N` processes tiles in parallel and gives identical output.
   - This version has not been run on a full scan. The samples take about a minute each with one worker in a 4-core cloud session; the previous version took about 15 minutes for a full scan on the 20-thread laptop.
-- Judge the results in SimLOD at 4K, with Scan clean-up > "Fix blown-out canopy" off. That checkbox is a separate, on-the-fly repair inside the viewer.
+- Judge the results in SimLOD at 4K in Native colour, its default. The look's light, haze and grade change every colour, and Fix blown-out canopy is a separate, on-the-fly repair inside the viewer.
