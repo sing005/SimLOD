@@ -97,4 +97,13 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 - Changes to `Uniforms` or `Stats` must be made in `HostDeviceInterface.h` only, with matching host fill code in `getUniforms()`.
 - Point filtering exists twice in `render.cu`: in `drawPoint` for the standard path, and in `hqsAcceptPoint` for both high-quality passes. A change to which points are drawn must go into both.
 - Files under `modules/` and `include/` use CRLF line endings. `sed -i` in Git Bash rewrites them as LF, so use the Edit tool, or restore CRLF before committing.
-- Point-cloud data (`*.las`, `*.laz`) is never committed. Test data lives outside the repo in `../Laspy/` and `../rotokare_test_kit/`.
+- Point-cloud data (`*.las`, `*.laz`) is never committed. Test data lives outside the repo in `../Laspy/` and `../rotokare_test_kit/`. The one exception is `data/samples/`: small cuts of a scan, each under 50 MB, kept in git so the canopy recolour can be developed in Claude Code cloud sessions. Those sessions cannot fetch Git LFS files.
+
+## Canopy recolour (`tools/recolour_canopy.py`)
+
+An offline Python tool, separate from the viewer. It rewrites the colour of the points the scanner's camera blew out in the sunlit canopy (white, pale grey, or sky-cast lilac and blue), and leaves every other point and attribute unchanged.
+
+- Install with `pip install -r tools/requirements-recolour.txt` (laspy with lazrs, numpy, scipy).
+- Develop on `data/samples/`; its README describes the files, their coordinates and the colour encoding. For example: `python tools/recolour_canopy.py data/samples/every100.laz out.laz`.
+- The full scans (3–4 GB, 346–455 M points) live only on the local machine. The tool streams them through 16 m ground tiles with a 0.6 m halo, so memory stays bounded. A full run takes about 15 minutes on the 20-thread laptop.
+- Judge the results in SimLOD at 4K, with Look > "Fix blown-out canopy" off. That checkbox is a separate, on-the-fly repair inside the viewer.
