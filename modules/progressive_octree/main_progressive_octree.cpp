@@ -148,13 +148,19 @@ struct {
 	bool enableEDL                   = false;   // reference has no outlines (apply_look.ps1)
 	float edlStrength                = 0.8f;
 
-	// tier 1 shading (inserted by apply_tier1_shading.ps1)
+	// tier 1 shading
 	bool  roundSplats                = true;
-	bool  enableFog                  = true;    // distance goes LIGHTER (apply_look.ps1)
+	bool  enableFog                  = true;    // distance goes LIGHTER
 	float fogDensity                 = 0.018f;
-	float fogR                       = 0.72f;   // pale green haze
-	float fogG                       = 0.82f;
-	float fogB                       = 0.70f;
+	// Pale green haze, in sRGB like the other colour pickers. The renderer used
+	// to take these numbers as linear (0.72, 0.82, 0.70); these are the same
+	// colour encoded, so the default haze renders exactly as before.
+	float fogR                       = 0.865f;
+	float fogG                       = 0.916f;
+	float fogB                       = 0.854f;
+	float fogHeightFalloff           = 0.0f;    // per metre; 0 keeps the haze even with height
+	float fogBase                    = 0.0f;    // metres above the lowest point
+	bool  fogSky                     = false;   // haze between the camera and the sky as well
 	bool  enableBloom                = false;
 	float bloomThreshold             = 0.55f;
 	float bloomStrength              = 1.2f;
@@ -201,7 +207,7 @@ struct {
 	float temperature                = -0.10f;  // blue-shifted blacks
 	float tintColour[3]              = {0.55f, 0.75f, 0.60f};
 	float tintMix                    = 0.0f;
-	float skyColour[3]               = {0.72f, 0.82f, 0.70f};   // pale green, matching the haze
+	float skyColour[3]               = {0.72f, 0.82f, 0.70f};   // pale green: the haze's hue, darker
 
 	// look refinement (apply_look.ps1)
 	float pointWorldSize             = 0.06f;   // metres; 0 falls back to pointSize pixels
@@ -210,8 +216,8 @@ struct {
 	float grain                      = 0.04f;
 	float vignette                   = 0.35f;
 
-	// directional key light (apply_keylight.ps1). Defaults: high and behind,
-	// as in the reference, warm-green light through the canopy.
+	// directional key light. Defaults: high and behind, as in the reference,
+	// warm-green light through the canopy.
 	float lightAzimuth               = 205.0f;  // degrees
 	float lightElevation             = 62.0f;   // degrees above horizon
 	float lightColour[3]             = {0.98f, 1.00f, 0.90f};   // near white, faintly warm
@@ -219,6 +225,8 @@ struct {
 	float ambient                    = 0.35f;   // shadowed points keep a third of their colour
 	float lightAbsorb                = 0.40f;   // per metre: 5 m of canopy passes ~14%
 	int   lightSteps                 = 40;
+	float sunbeams                   = 1.0f;    // key light in the haze; 0 = haze lit by ambient only
+	float sunAnisotropy              = 0.5f;    // forward scattering of the haze (Henyey-Greenstein g)
 
 	// regroup (apply_regroup.ps1)
 	bool  lightOn                    = false;   // off until you switch it on
@@ -1088,6 +1096,13 @@ void initCuda(){
 	cuDeviceGetAttribute(&numSMs, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
 }
 
+// A colour picker value (sRGB, 0..1) in linear light, by the same curve as
+// srgbToLinear in render.cu.
+static float srgbToLinear01(float c){
+	c = std::clamp(c, 0.0f, 1.0f);
+	return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
 Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	Uniforms uniforms;
 
@@ -1183,9 +1198,12 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.roundSplats              = settings.roundSplats;
 	uniforms.enableFog                = settings.enableFog;
 	uniforms.fogDensity               = settings.fogDensity;
-	uniforms.fogR                     = settings.fogR;
-	uniforms.fogG                     = settings.fogG;
-	uniforms.fogB                     = settings.fogB;
+	uniforms.fogR                     = srgbToLinear01(settings.fogR);   // the composite works in linear light
+	uniforms.fogG                     = srgbToLinear01(settings.fogG);
+	uniforms.fogB                     = srgbToLinear01(settings.fogB);
+	uniforms.fogHeightFalloff         = settings.fogHeightFalloff;
+	uniforms.fogBase                  = settings.fogBase;
+	uniforms.fogSky                   = settings.fogSky ? 1 : 0;
 	uniforms.enableBloom              = settings.enableBloom;
 	uniforms.bloomThreshold           = settings.bloomThreshold;
 	uniforms.bloomStrength            = settings.bloomStrength;
@@ -1343,6 +1361,8 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.lightAbsorb    = settings.lightAbsorb;
 		uniforms.lightSteps     = settings.lightSteps;
 		uniforms.lightDirty     = g_frameLightDirty ? 1 : 0;   // decided once per frame in beginFrameState
+		uniforms.sunbeams       = settings.sunbeams;
+		uniforms.sunAnisotropy  = std::clamp(settings.sunAnisotropy, -0.95f, 0.95f);   // g = 1 is a spike
 	}
 	uniforms.lightOn        = settings.lightOn ? 1 : 0;
 	uniforms.nearClip       = settings.nearClip;
@@ -1432,6 +1452,10 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 			renderer->controls->pitch * 57.2958, renderer->controls->radius, effectiveMinNodeSize(), effectiveMaxSplatPx());
 		logIfChanged("events", 5.0, "[host] numEvents=%d  gain=%.3f  calls=%d  density=%.3f\n",
 			uniforms.numEvents, uniforms.emissionGain, (int)g_calls.size(), settings.pointDensity);
+		logIfChanged("haze", 5.0, "[host] haze=%.3f/m thins=%.3f/m floor=%.1fm sky=%d | light=%d strength=%.2f ambient=%.2f sunbeams=%.2f g=%.2f | medium steps=%d reach=%.0fm\n",
+			settings.enableFog ? settings.fogDensity : 0.0f, settings.fogHeightFalloff, settings.fogBase, settings.fogSky ? 1 : 0,
+			settings.lightOn ? 1 : 0, settings.lightIntensity, settings.ambient, settings.sunbeams, settings.sunAnisotropy,
+			settings.volSteps, settings.volMaxDist);
 		logIfChanged("box", 0.0, "[host] box min=(%.2f %.2f %.2f) max=(%.2f %.2f %.2f), load offset (subtracted from every point) = (%.2f %.2f %.2f)\n",
 			uniforms.boxMin.x, uniforms.boxMin.y, uniforms.boxMin.z,
 			uniforms.boxMax.x, uniforms.boxMax.y, uniforms.boxMax.z,
@@ -1614,7 +1638,7 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	cuEventRecord(ce_render_start, 0);
 
 	float time = static_cast<float>(now());
-	int workgroupSize = 256;
+	int workgroupSize = 256;   // kernel_render's __launch_bounds__ in render.cu assumes 256
 	
 	int maxActiveBlocksPerSM;
 	cuOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocksPerSM, 
@@ -2293,7 +2317,13 @@ int main(int argc, char** argv){
 			else if(key == "adaptive") settings.adaptiveDetail        = v != 0.0;
 			else if(key == "budget")   settings.frameBudgetMs         = float(v);
 			else if(key == "vsync")    settings.vsync                 = v != 0.0;
-			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync)\n", key);
+			else if(key == "light")    settings.lightOn               = v != 0.0;
+			else if(key == "sunbeams") settings.sunbeams              = float(v);
+			else if(key == "haze"){    settings.fogDensity            = float(v); settings.enableFog = v > 0.0; }
+			else if(key == "hazefall") settings.fogHeightFalloff      = float(v);
+			else if(key == "hazefloor") settings.fogBase              = float(v);
+			else if(key == "hazesky")  settings.fogSky                = v != 0.0;
+			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, light, sunbeams, haze, hazefall, hazefloor, hazesky)\n", key);
 		}else if(iEndsWith(arg, "las") || iEndsWith(arg, "laz") || iEndsWith(arg, "simlod")){
 			std::error_code ec;
 			auto absolute = std::filesystem::absolute(arg, ec);   // dropped files are absolute too
@@ -2601,13 +2631,20 @@ int main(int argc, char** argv){
 				tipFor("Per-channel gain in linear light. 1.0 is neutral. Below removes a cast, above adds one.");
 				ImGui::Separator();
 				ImGui::SliderFloat("Depth haze",       &settings.fogDensity,     0.0f, 0.08f, "%.3f");
-				tipFor("Distance blends toward the haze colour. The reference goes LIGHTER with distance, so keep the colour pale.");
+				tipFor("Distance blends toward the haze colour. The reference goes LIGHTER with distance, so keep the colour pale. The value is the haze's density per metre at and below the haze floor.");
 				if(settings.fogDensity <= 0.0f) settings.enableFog = false; else settings.enableFog = true;
+				ImGui::SliderFloat("Haze thins with height", &settings.fogHeightFalloff, 0.0f, 0.5f, "%.3f /m", ImGuiSliderFlags_Logarithmic);
+				tipFor("0 keeps the haze even. Above 0 the haze thins with height above the haze floor, halving every 0.69 / value metres: at 0.1 every 7 m, so it lies low among the trunks and clears toward the canopy.");
+				ImGui::SliderFloat("Haze floor (m)",   &settings.fogBase,        0.0f, boxSize.z > 0.0f ? boxSize.z : 40.0f, "%.1f");
+				tipFor("Height above the lowest point up to which the haze keeps its full density. It only thins above this, so it only matters when Haze thins with height is above 0.");
+				ImGui::Checkbox   ("Haze over sky",    &settings.fogSky);
+				tipFor("The haze also lies between the camera and the sky, so gaps between the trunks and the horizon show haze rather than sky. Use it with Haze thins with height: even haze has no top, so it covers the whole sky.");
 				{
 					float hc[3] = {settings.fogR, settings.fogG, settings.fogB};
 					if(ImGui::ColorEdit3("Haze colour", hc, ImGuiColorEditFlags_NoInputs)){
 						settings.fogR = hc[0]; settings.fogG = hc[1]; settings.fogB = hc[2];
 					}
+					tipFor("Picked like the sky colour, so the same values in both match. With the key light on, haze in shade darkens to the Ambient level, as points do, and Sunbeams (Light) adds the light that reaches it.");
 				}
 				ImGui::ColorEdit3 ("Sky colour",       settings.skyColour, ImGuiColorEditFlags_NoInputs);
 				ImGui::Separator();
@@ -2637,10 +2674,15 @@ int main(int argc, char** argv){
 				lm |= ImGui::SliderFloat("Strength",         &settings.lightIntensity, 0.0f,   2.5f);
 				ImGui::ColorEdit3 ("Light colour",     settings.lightColour, ImGuiColorEditFlags_NoInputs);
 				ImGui::SliderFloat("Ambient",          &settings.ambient,        0.0f, 1.0f);
-				tipFor("Floor under the key light, so shadowed points keep some of their own colour.");
+				tipFor("Floor under the key light, so shadowed points keep some of their own colour. The haze in shade darkens to the same level.");
 				lm |= ImGui::SliderFloat("Canopy density",   &settings.lightAbsorb,    0.0f,   1.5f, "%.2f /m");
 				tipFor("Light lost per metre of occupied foliage, so it means the same at every grid resolution. 0.4 lets about a seventh through five metres of canopy; 1.0 almost none.");
 				if(lm) g_lightDirty = true;
+				ImGui::Separator();
+				ImGui::SliderFloat("Sunbeams",         &settings.sunbeams,       0.0f,   4.0f);
+				tipFor("The key light scattered by the haze where the canopy lets it through, so the light shows in the air between the trunks. Needs Depth haze above 0. At 0 the haze gets only the ambient light. Marched at quarter resolution with Medium steps and Medium reach (Advanced); more steps give smoother beams at more cost.");
+				ImGui::SliderFloat("Forward scatter",  &settings.sunAnisotropy,  0.0f,   0.9f);
+				tipFor("How much brighter the haze looks facing the light than with the light behind you (Henyey-Greenstein g). 0 scatters the same in every direction; at 0.5 the haze facing the light is 27 times brighter than facing away. Water droplets scatter strongly forward.");
 			}
 
 			// ---- CALLS --------------------------------------------------------
@@ -2926,8 +2968,10 @@ int main(int argc, char** argv){
 				ImGui::SliderFloat("Medium pools low",  &settings.volHeightFalloff, 0.0f,  0.05f);
 				ImGui::SliderFloat("Medium occlusion",  &settings.volOcclusion,     0.0f,  3.0f);
 				ImGui::SliderInt  ("Medium steps",      &settings.volSteps,         8,     128);
+				tipFor("Samples along each quarter-resolution ray, for the calls' medium and for the sunbeams (Light). More steps resolve narrower beams and cost proportionally more.");
 				ImGui::SliderInt  ("Medium shadow steps", &settings.volShadowSteps, 0,    16);
 				ImGui::SliderFloat("Medium reach (m)",  &settings.volMaxDist,      20.0f, std::max(400.0f, boxSize.x > 0.0f ? 2.0f * std::sqrt(boxSize.x*boxSize.x + boxSize.y*boxSize.y + boxSize.z*boxSize.z) : 400.0f));
+				tipFor("How far each volumetric ray is marched. Haze beyond it is lit by the key light without canopy shade, so keep it past the far side of the cloud (it is set to 1.5 x the cloud's diagonal on load).");
 				ImGui::Separator();
 				ImGui::TextDisabled("Test source");
 				ImGui::Checkbox   ("Test source on",    &settings.testSourceOn);
