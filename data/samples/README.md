@@ -67,23 +67,34 @@ A quick test on the full scan: `--crop 8 -4 12 0` recolours a 4 × 4 m patch, ab
 
 ## What the samples showed
 
-These measurements, made on `column_3m.laz`, set the defaults. `python tools/recolour_eval.py data/samples/column_3m.laz --blowout 0.15` reproduces them; item 6 also needs `--tool` (see the script's docstring). Colour differences are CIEDE2000; the code passes the 34 published test pairs of Sharma, Wu & Dalal (2005).
+These measurements, made on `column_3m.laz`, set the defaults. `python tools/recolour_eval.py data/samples/column_3m.laz --blowout 0.15` reproduces them; item 7 also needs `--tool` (see the script's docstring). Colour differences are CIEDE2000; the code passes the 34 published test pairs of Sharma, Wu & Dalal (2005).
 
 1. **The forest's own colours are olive to green.** 80 % of well-exposed points have a CIELAB hue between 102° and 123°; only 1.2 % are brown. The previous tool's fixed brown "wood" palette therefore did not belong to this forest; it was the orange speckle in the crowns.
 2. **Greying is a gradient with height.** The darkest channel, in linear light, has a median of 0.04 in the lowest quarter of points (below 0.3 m) and 0.27 above 5.8 m. Once that white is subtracted, greyed points keep the forest's hue (item 0 of the script's report gives both medians).
 3. **Laser intensity does not follow visible lightness.** The median correlation within 10 cm neighbourhoods is 0.009, and intensity does not separate green from brown points. It is not used for colour or for structure.
 4. **Borrowing works at short range only.** The error rises from 3.2 at 1 cm from the nearest well-exposed point to 4.4 at 4 cm and 5.8 at 24 cm. At 77 cm it is 7.7, worse than the scan's median colour (7.0); the noise floor between neighbouring well-exposed points is 1.5.
 5. **Greyed points still hold their colour.** Pairs of a greyed point and a well-exposed point of the same surface, under 1 cm apart and imaged at another time, give 500,000 examples. On held-out pairs the regression lowers the error from 7.0 (left unchanged) to 4.2. It improves every veil band, most of all the palest (from 24.6 to 7.0).
-6. **Compared with the previous tool**, on well-exposed points hidden under a simulated blowout (turned white), with their true colours known:
+6. **Lightly greyed points need more correction than their weight gave them.** A greyed point used to take the share w of the estimate, where w is its greyed weight, rising from 0 to 1. On held-out pairs, points with w up to 0.5 came out 2.8–5.1 L* lighter than the well-exposed point of the same surface: they stayed washed out. The share with the smallest error, chosen on one half of the pairs and checked on the other, is much larger than w for lightly greyed points:
+
+   | Greyed weight w (median) | Best share, column / thinned sample | Error on the other half: share w → best share, column | thinned sample |
+   |---|---|---|---|
+   | 0.03 | 0.40 / 0.50 | 3.21 → 2.24 | 5.40 → 3.59 |
+   | 0.16 | 0.60 / 0.65 | 4.25 → 2.98 | 6.39 → 4.23 |
+   | 0.37 | 0.75 / 0.75 | 4.54 → 3.48 | 6.26 → 4.57 |
+   | 0.63 | 0.80 / 0.80 | 4.28 → 3.91 | 5.42 → 4.86 |
+   | 0.91 | 0.90 / 0.85 | 4.38 → 4.34 | 5.38 → 5.33 |
+
+   The tool now gives each greyed point the share interpolated from these (`_SHARE_W`, `_SHARE_K`). Item 3 of the script's report repeats the measurement. In the column, greyed points with w up to 0.5 now sit 3 L* darker at 2–12 m.
+7. **Compared with the previous tool**, on well-exposed points hidden under a simulated blowout (turned white), with their true colours known:
 
    | Simulated blowout | Previous tool | This version |
    |---|---|---|
-   | 15 cm cubes, 760,000 points | 15.9 (3.3 % under 5) | 5.77 (43.8 % under 5) |
-   | 40 cm cubes, 769,000 points | 16.3 (2.2 % under 5) | 7.16 (33.8 % under 5) |
+   | 15 cm cubes, 760,000 points | 15.9 (3.3 % under 5) | 5.08 (49.2 % under 5) |
+   | 40 cm cubes, 769,000 points | 16.3 (2.2 % under 5) | 6.19 (39.7 % under 5) |
 
-   The previous tool's 24 nearest neighbours all lie inside a blown region, so it falls back to its fixed palette; this version borrows from up to 30 cm away.
+   The previous tool's 24 nearest neighbours all lie inside a blown region, so it falls back to its fixed palette; this version borrows from up to 30 cm away. Before the correction share of item 6, this version scored 5.77 and 7.16: blown points borrow from repaired greyed points, so repairing those better also fills blown points better.
 
-   After a run, by the tool's own tests, 0.00 % of the column's points are still blown out and 0.03 % greyed.
+   After a run, by the tool's own tests, 0.00 % of the column's points are still blown out and 0.02 % greyed. In the files' own colours, above 2 m, points with more blue than green fall from 2–10 % to 0.01–0.26 %, near-grey points (C* below 5) from 6–57 % to 0.03–0.25 %, and white points (L* above 80, C* below 10) from 1–60 % to 0.00 %, in both samples.
 
 ## Where the colours come from
 
@@ -100,8 +111,8 @@ The result in `every100.laz`, by height above ground (`recolour_eval.py --output
 |---|---|---|---|---|
 | Well-exposed, below 4 m | 36.1 | 14.6 | 17.8 | 113° |
 | Well-exposed, 8–12 m (17,883 points) | 46.2 | 11.4 | 23.3 | 118° |
-| Recoloured, 8–12 m | 44.3 | 6.0 | 22.7 | 116° |
-| Recoloured, above 12 m | 44.3 | 7.4 | 23.2 | 116° |
+| Recoloured, 8–12 m | 44.2 | 5.8 | 22.7 | 116° |
+| Recoloured, above 12 m | 44.2 | 7.2 | 23.2 | 116° |
 
 The recoloured canopy is lighter and more saturated than the near-ground forest. Its median is close to that of the few canopy points the camera did expose well. Its lightness varies about half as much as real foliage does, because both the regression and the borrowing average. The column gives the same picture:
 
@@ -109,13 +120,13 @@ The recoloured canopy is lighter and more saturated than the near-ground forest.
 |---|---|---|---|
 | Well-exposed, near the ground | 35.3 | 13.6 | 17.1 |
 | Well-exposed, 8–12 m | 48.1 | 10.5 | 26.5 |
-| Recoloured, 8–12 m | 48.3 | 6.9 | 25.8 |
+| Recoloured, 8–12 m | 48.2 | 6.8 | 25.9 |
 
 After a run, 0.02 % of `every100.laz` still counts as blown out. That is the white paper of the two protected pages.
 
 ## The texture option
 
-Without it, the recoloured canopy varies much less than well-exposed foliage at the same height. The shortfall is greatest between near neighbours: between points under 2 cm apart, recoloured points keep 9–24 % of the variation, and at 16–64 cm about half. The regression pulls towards the mean, and borrowing takes averages of neighbours.
+Without it, the recoloured canopy varies much less than well-exposed foliage at the same height. The shortfall is greatest between near neighbours: between points under 2 cm apart, recoloured points keep 8–21 % of the variation, and at 16–64 cm 38–48 %. The regression pulls towards the mean, and borrowing takes averages of neighbours.
 
 `--texture 1` adds variation back, measured on each run:
 
@@ -131,13 +142,13 @@ Measured with `recolour_eval.py --output` and `--blowout`:
 
 | | `column_3m.laz` | `every100.laz` |
 |---|---|---|
-| Lightness spread (IQR) at 8–12 m: default / `--texture 1` / well-exposed | 6.9 / 9.4 / 10.5 | 6.0 / 10.1 / 11.4 |
-| Canopy variation by distance, as a share of well-exposed foliage: default | 9–51 % | 16–48 % |
-| Same, with `--texture 1` | 69–128 % | 80–112 % |
-| Still greyed after a run (tool's own test): default / `--texture 1` | 0.03 % / 0.02 % | 0.04 % / 0.04 % |
-| Simulated blowout, 15 cm cubes, median error: default / `--texture 1` | 5.77 / 6.90 | |
-| Simulated blowout, 40 cm cubes, median error: default / `--texture 1` | 7.16 / 7.78 | |
-| Run time, column with 2 workers and thinned sample with 3: default / `--texture 1` | 0.7 / 1.5 min | 0.5 / 0.9 min |
+| Lightness spread (IQR) at 8–12 m: default / `--texture 1` / well-exposed | 6.8 / 9.4 / 10.5 | 5.8 / 10.2 / 11.4 |
+| Canopy variation by distance, as a share of well-exposed foliage: default | 8–48 % | 14–42 % |
+| Same, with `--texture 1` | 68–131 % | 82–112 % |
+| Still greyed after a run (tool's own test): default / `--texture 1` | 0.02 % / 0.01 % | 0.03 % / 0.03 % |
+| Simulated blowout, 15 cm cubes, median error: default / `--texture 1` | 5.08 / 6.48 | |
+| Simulated blowout, 40 cm cubes, median error: default / `--texture 1` | 6.19 / 7.13 | |
+| Run time, column with 2 workers and thinned sample with 3: default / `--texture 1` | 0.7 / 1.4 min | 0.5 / 0.9 min |
 
 The added variation is not predicted from the scan, so each point's colour is less accurate. The cost on the simulated blowouts is the difference shown; the previous tool's errors there were 15.9 and 16.3.
 

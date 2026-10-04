@@ -275,6 +275,24 @@ def part3(xyz, rgb, t, a, hag):
         m = (dcp >= lo) & (dcp < hi)
         if m.sum() >= 200:
             print(f'   {lo:.2f}-{hi:.2f} (median {np.median(dcp[m]):.3f}) {m.sum():8,d}   {np.median(de_0[m]):6.2f}      {np.median(de_r[m]):6.2f}')
+    # How much of the estimate a point should take, against its greyed weight w: the share k in
+    # (1 - k) own + k regression with the smallest error, chosen on half of the held-out pairs and
+    # checked on the other half (the tool's _SHARE_W, _SHARE_K). Borrowed colour is left out here,
+    # since the well-exposed partner itself would be among the points borrowed from.
+    wp = w[P[te]]; half = (np.arange(te.sum()) % 2) == 0
+    ks = np.linspace(0, 1, 21)
+    print('   greyed weight band   n      best share  error on the other half: ramp w   tool share   best share')
+    for lo, hi in ((0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 0.999)):
+        m = (wp > lo) & (wp <= hi)
+        if m.sum() < 400:
+            continue
+        mA, mB = m & half, m & ~half
+        errs = [np.median(rc.ciede2000((1 - k) * lab_p[mA] + k * pred[mA], Y[te][mA])) for k in ks]
+        kb = ks[int(np.argmin(errs))]
+        blend = lambda s: rc.ciede2000((1 - s) * lab_p[mB] + s * pred[mB], Y[te][mB])
+        print(f'   {lo:.2f}-{hi:.2f} (median {np.median(wp[m]):.2f}) {m.sum():8,d}   {kb:.2f}         '
+              f'{np.median(blend(wp[mB][:, None])):6.2f}      {np.median(blend(rc.correction_share(wp[mB])[:, None])):6.2f}       '
+              f'{np.median(blend(kb)):6.2f}')
 
 
 def part4(xyz, rgb, out_path, a, hag):
