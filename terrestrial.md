@@ -109,7 +109,7 @@ The docstring gives the method. In order, the steps are:
 1. Detect blown-out and greyed points.
 2. Keep printed survey pages unchanged.
 3. Repair greyed points with a regression learnt per run.
-4. Classify structure around blown points (line, i.e. trunk or branch, against cluster).
+4. Classify structure around blown points: a line of points is trunk or branch, a less linear cluster is leaf material.
 5. Borrow colour from points within 15 cm.
 6. Fill the rest with patches of real nearby colours.
 
@@ -122,7 +122,7 @@ The docstring gives the method. In order, the steps are:
   - It scores the whole tool on a simulated blowout. Use `--tool` to score another version.
   - The error tables `_BORROW_A`, `_BORROW_B` and `_REG_ERR` in the tool come from its output.
 - Diagnostics:
-  - `--show classes` writes the structure classes as false colour: orange trunk/branch, green cluster, magenta pages.
+  - `--show classes` writes the structure classes as false colour: orange trunk/branch, green leaf, magenta pages.
   - `--show paths` shows which step coloured each point.
   - Detected page centres go to `OUT_pages.csv`, in the viewer's `markers.csv` format.
 - The full scans (3–4 GB, 346–455 M points) live only on the local machine.

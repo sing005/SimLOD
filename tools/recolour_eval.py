@@ -23,9 +23,12 @@ these parts:
      pairs. The regression is fitted on half of them (alternate 0.5 m
      blocks, so no surface is in both halves) and tested on the other half,
      by dark-channel band. The tool's regression_error() table comes from
-     these numbers.
+     these numbers. Also: how high above the ground the pairs' well-exposed
+     points lie, which is where the regression learns its colours.
   4. With --output: the share of points that are still blown or greyed by the
-     tool's own tests, before and after.
+     tool's own tests, before and after; and, by height above ground, the
+     median colour of the recoloured points against that of well-exposed
+     points near the ground and at the same height.
   5. With --blowout CUBE: well-exposed points inside random cubes of that
      size are turned white, the tool (or --tool SCRIPT) is run on the result,
      and its colours for those points are scored against the true ones.
@@ -93,6 +96,28 @@ def load(path, with_intensity=False):
     if with_intensity:
         return xyz, rgb, t, np.asarray(las.intensity).astype(np.float64)
     return xyz, rgb, t
+
+
+def height_above_ground(xyz, cell=2.0):
+    """Height above a simple ground model: the 2nd-percentile z of each 2 m cell (empty cells take the nearest)."""
+    x, y, z = (xyz[:, i].astype(np.float64) for i in range(3))
+    ix = np.floor(x / cell).astype(np.int64); iy = np.floor(y / cell).astype(np.int64)
+    key = (ix - ix.min()) * 1_000_003 + (iy - iy.min())
+    order = np.lexsort((z, key)); ks = key[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(ks)) + 1]; ends = np.r_[starts[1:], len(ks)]
+    gz = z[order][starts + ((ends - starts) * 0.02).astype(int)]
+    cxy = np.stack([(ix[order][starts] + 0.5) * cell, (iy[order][starts] + 0.5) * cell], 1)
+    _, j = cKDTree(cxy).query(np.stack([x, y], 1), k=1, workers=-1)
+    return z - gz[j]
+
+
+HAG_BANDS = [(-1.0, 2.0), (2.0, 4.0), (4.0, 8.0), (8.0, 12.0), (12.0, 60.0)]
+
+
+def lab_summary(lab):
+    C = np.hypot(lab[:, 1], lab[:, 2]); h = np.degrees(np.arctan2(lab[:, 2], lab[:, 1])) % 360
+    q75, q25 = np.percentile(lab[:, 0], [75, 25])
+    return f'L* {np.median(lab[:, 0]):5.1f} (IQR {q75 - q25:4.1f}), C* {np.median(C):5.1f}, hue {np.median(h):4.0f}'
 
 
 def part0(xyz, rgb, inten, a):
@@ -223,7 +248,7 @@ def part2(xyz, rgb, a, seed=1):
     print(f'   fit: borrow_error(d) = {A:.2f} + {Bc:.2f} sqrt(d)   (the tool uses {rc._BORROW_A} + {rc._BORROW_B} sqrt(d))')
 
 
-def part3(xyz, rgb, t, a):
+def part3(xyz, rgb, t, a, hag):
     X, Y = rc.collect_pairs(xyz, rgb, t, a, cap=10 ** 9)
     if len(X) < 1000:
         print(f'3. Greyed points: only {len(X)} pairs; skipped')
@@ -236,7 +261,8 @@ def part3(xyz, rgb, t, a):
     ok = np.isfinite(d); ii = np.where(ok, ii, 0)
     if t is not None:
         ok &= np.abs(t[t_idx[ii]] - t[p_idx][:, None]) > 1.0
-    P = p_idx[ok.any(1)]
+    has = ok.any(1)
+    P = p_idx[has]; Q = t_idx[ii[has, np.argmax(ok, 1)[has]]]
     assert len(P) == len(X)
     blk = (np.floor(xyz[P] / 0.5).astype(int).sum(1)) % 2
     tr, te = blk == 0, blk == 1
@@ -247,6 +273,9 @@ def part3(xyz, rgb, t, a):
     de_c = rc.ciede2000(np.broadcast_to(np.median(Y[tr], 0), Y[te].shape), Y[te])
     print(f'3. Greyed points: {len(X):,} pairs within {r * 100:.1f} cm. Held out {te.sum():,}: median error unchanged {np.median(de_0):.2f}, '
           f'one colour for all {np.median(de_c):.2f}, regression {np.median(de_r):.2f}')
+    hq = hag[Q]
+    print(f'   the pairs\' well-exposed points lie {np.median(hq):.1f} m above ground (median); 90th percentile {np.percentile(hq, 90):.1f} m; '
+          f'{100 * np.mean(hq < 4):.0f}% below 4 m, {100 * np.mean(hq >= 8):.1f}% above 8 m')
     dcp = dc[P[te]]
     print('   dark channel band   n        unchanged   regression')
     edges = [0.0, 0.10, 0.14, 0.18, 0.25, 0.32, 1.0]
@@ -256,7 +285,7 @@ def part3(xyz, rgb, t, a):
             print(f'   {lo:.2f}-{hi:.2f} (median {np.median(dcp[m]):.3f}) {m.sum():8,d}   {np.median(de_0[m]):6.2f}      {np.median(de_r[m]):6.2f}')
 
 
-def part4(xyz, rgb, out_path, a):
+def part4(xyz, rgb, out_path, a, hag):
     xo, ro, _ = load(out_path)
     # match points: the output is written tile by tile
     d, idx = cKDTree(xo).query(xyz, k=1, workers=-1)
@@ -267,6 +296,20 @@ def part4(xyz, rgb, out_path, a):
     b1, _, w1, _ = rc.colour_state(ro[idx], a)
     print(f'4. Before: {100 * b0.mean():.2f}% blown, {100 * (~b0 & (w0 > 0.5)).mean():.2f}% greyed (weight > 0.5). '
           f'After: {100 * b1.mean():.2f}% blown, {100 * (~b1 & (w1 > 0.5)).mean():.2f}% greyed.')
+    _, _, _, trusted = rc.colour_state(rgb, a)
+    lab0 = rc.srgb_to_lab(rgb); lab1 = rc.srgb_to_lab(ro[idx])
+    ref = trusted & (hag < 4)
+    print(f'   well-exposed points below 4 m above ground:   {lab_summary(lab0[ref])}  (n={ref.sum():,})')
+    changed = b0 | (w0 > 0.5)
+    for lo, hi in HAG_BANDS:
+        band = (hag >= lo) & (hag < hi)
+        m = band & changed; mt = band & trusted
+        if m.sum() < 500:
+            continue
+        line = f'   {lo:3.0f} to {hi:<3.0f} m, recoloured:              {lab_summary(lab1[m])}  (n={m.sum():,})'
+        if mt.sum() >= 500:
+            line += f'\n              well-exposed, same height:  {lab_summary(lab0[mt])}  (n={mt.sum():,})'
+        print(line)
 
 
 def main():
@@ -282,9 +325,10 @@ def main():
     part0(xyz, rgb, inten, a)
     part1()
     part2(xyz, rgb, a)
-    part3(xyz, rgb, t, a)
+    hag = height_above_ground(xyz)
+    part3(xyz, rgb, t, a, hag)
     if e.output:
-        part4(xyz, rgb, e.output, a)
+        part4(xyz, rgb, e.output, a, hag)
     if e.blowout:
         part5(e.input, e.blowout, e.tool, a)
 
