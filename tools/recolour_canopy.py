@@ -73,6 +73,7 @@ Usage:
 """
 import argparse
 import concurrent.futures
+import copy
 import multiprocessing
 import os
 import shutil
@@ -1210,6 +1211,11 @@ def main():
             raise SystemExit('--reuse-scratch: the scratch directory was written by an older version; run without it')
         log('reusing the tiles already in scratch')
     else:
+        # The split appends to tile files, so files an earlier run left in
+        # --scratch were read again and their points written twice
+        for f in os.listdir(scratch):
+            if f == 'format.txt' or (f[:2] in ('t_', 'h_', 'o_') and f.endswith(('.rec', '.xyz', '.xyzrgb'))):
+                os.remove(os.path.join(scratch, f))
         split_into_tiles(a, scratch)
         log(f'split done in {time.time() - t0:.0f} s')
 
@@ -1245,15 +1251,23 @@ def main():
             key, st, pg = process_tile(job)
             done(i, key, st, pg)
 
-    out_hdr = laspy.LasHeader(point_format=hdr.point_format, version=hdr.version)
-    out_hdr.scales = hdr.scales; out_hdr.offsets = hdr.offsets
-    for v in hdr.vlrs: out_hdr.vlrs.append(v)
+    # The input's header as it is (global encoding, GUID, system identifier,
+    # software, date, VLRs); a new one lost those and wrote the Extra Bytes
+    # VLR twice. The writer recounts the points.
+    out_hdr = copy.deepcopy(hdr)
     dtype = hdr.point_format.dtype()
     with laspy.open(a.output, mode='w', header=out_hdr) as wr:
         for key in keys:
             data = np.fromfile(os.path.join(scratch, f'o_{key}.rec'), dtype=dtype)
             wr.write_points(laspy.ScaleAwarePointRecord(data, hdr.point_format, hdr.scales, hdr.offsets))
             os.remove(os.path.join(scratch, f'o_{key}.rec'))
+        if hdr.evlrs:       # LAS 1.4 extended VLRs; the writer does not copy them
+            wr.write_evlrs(hdr.evlrs)
+        # the input's bounds, not the recoloured points' own: SimLOD places its
+        # frame at the header's minimum corner, so --view and the haze floor
+        # mean the same on both files
+        wr.header.mins = hdr.mins
+        wr.header.maxs = hdr.maxs
 
     if pages:
         pp = os.path.splitext(a.output)[0] + '_pages.csv'

@@ -72,6 +72,7 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 **Haze, sunbeams and the composite.**
 - The haze (`fog*` uniforms) has a density that depends only on height, so `hazeOpticalDepth()` computes its optical depth along a ray in closed form. The composite applies its extinction and its ambient light exactly, at full resolution.
 - The key light's share of the haze is shaded by the canopy, so it varies along the ray. The volumetric pass marches it through the light grid, alongside the calls' medium, at quarter resolution.
+- A ray that hits no point (sky, or the void below the horizon) gets the haze, its ambient light and its sunbeams only with Haze over sky (`fogSky`) on. The march's dither is fixed per pixel; a per-frame one made the lit haze flicker.
 - `volBuf` holds RGB plus the distance to the surface each ray sees (`SKY_DISTANCE` for sky). The composite upsamples it with weights from that distance (joint bilateral), so lit haze does not spread across silhouettes.
 - The composite keeps the backdrop (sky, or the void below the horizon) apart from the scene light and grades only the scene. Anything added in front of the sky is graded the same as when it is in front of geometry.
 
@@ -130,4 +131,4 @@ The docstring gives the method. In order, the steps are:
   - The tool streams them through 16 m ground tiles with a 0.6 m halo. Tiles over `--slab-points` (12 M) are cut into slabs, so a worker needs at most about 4.5 GB; memory is about 0.35 GB per million points processed at once.
   - `--workers N` processes tiles in parallel and gives identical output.
   - This version has not been run on a full scan. The samples take about a minute each with one worker in a 4-core cloud session; the previous version took about 15 minutes for a full scan on the 20-thread laptop.
-- Judge the results in SimLOD at 4K, with Look > "Fix blown-out canopy" off. That checkbox is a separate, on-the-fly repair inside the viewer.
+- Judge the results in SimLOD at 4K, with Scan clean-up > "Fix blown-out canopy" off. That checkbox is a separate, on-the-fly repair inside the viewer.

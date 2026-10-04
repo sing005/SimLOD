@@ -19,6 +19,9 @@
 #include <dbghelp.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <csignal>
+#include <exception>
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -43,25 +46,20 @@ static const char* exceptionName(DWORD code){
 	}
 }
 
-static LONG WINAPI onUnhandledException(EXCEPTION_POINTERS* ep){
-	HANDLE file = INVALID_HANDLE_VALUE;
-	if(g_crashLogPath[0] != 0){
-		file = CreateFileA(g_crashLogPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-		                   nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-	}
+static HANDLE openCrashLog(){
+	if(g_crashLogPath[0] == 0) return INVALID_HANDLE_VALUE;
+	return CreateFileA(g_crashLogPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+	                   nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
 
+// Walk and print the stack described by `context` (a copy; it is modified).
+static void writeStack(HANDLE file, CONTEXT context){
 	char line[1024];
-	DWORD code = ep->ExceptionRecord->ExceptionCode;
-	snprintf(line, sizeof(line), "[CRASH] exception 0x%08lX (%s) on thread %lu\n",
-	         code, exceptionName(code), GetCurrentThreadId());
-	writeOut(file, line);
-
 	HANDLE process = GetCurrentProcess();
 	HANDLE thread  = GetCurrentThread();
 	SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
 	SymInitialize(process, nullptr, TRUE);
 
-	CONTEXT context = *ep->ContextRecord;
 	STACKFRAME64 frame = {};
 	frame.AddrPC.Offset    = context.Rip;
 	frame.AddrPC.Mode      = AddrModeFlat;
@@ -98,17 +96,72 @@ static LONG WINAPI onUnhandledException(EXCEPTION_POINTERS* ep){
 	}
 
 	SymCleanup(process);
+}
+
+static LONG WINAPI onUnhandledException(EXCEPTION_POINTERS* ep){
+	HANDLE file = openCrashLog();
+	char line[256];
+	DWORD code = ep->ExceptionRecord->ExceptionCode;
+	snprintf(line, sizeof(line), "[CRASH] exception 0x%08lX (%s) on thread %lu\n",
+	         code, exceptionName(code), GetCurrentThreadId());
+	writeOut(file, line);
+	writeStack(file, *ep->ContextRecord);
 	if(file != INVALID_HANDLE_VALUE) CloseHandle(file);
 	return EXCEPTION_EXECUTE_HANDLER;   // terminate
+}
+
+// abort() - from an assertion, a failed allocation, or an exception nobody
+// caught - raises SIGABRT on the calling thread; log where that was.
+static void onAbortSignal(int){
+	HANDLE file = openCrashLog();
+	char line[256];
+	snprintf(line, sizeof(line), "[CRASH] abort() on thread %lu\n", GetCurrentThreadId());
+	writeOut(file, line);
+	CONTEXT context = {};
+	RtlCaptureContext(&context);
+	writeStack(file, context);
+	if(file != INVALID_HANDLE_VALUE) CloseHandle(file);
+	_exit(134);
+}
+
+static void onTerminate(){
+	HANDLE file = openCrashLog();
+	char line[1024];
+	const char* what = "unknown exception";
+	std::exception_ptr ep = std::current_exception();
+	if(ep){
+		try{ std::rethrow_exception(ep); }
+		catch(const std::exception& e){ snprintf(line, sizeof(line), "[CRASH] uncaught exception on thread %lu: %s\n", GetCurrentThreadId(), e.what()); what = nullptr; }
+		catch(...){}
+	}
+	if(what) snprintf(line, sizeof(line), "[CRASH] std::terminate on thread %lu (%s)\n", GetCurrentThreadId(), what);
+	writeOut(file, line);
+	// MSVC calls terminate before unwinding, so this stack still shows
+	// where the exception was thrown.
+	CONTEXT context = {};
+	RtlCaptureContext(&context);
+	writeStack(file, context);
+	if(file != INVALID_HANDLE_VALUE) CloseHandle(file);
+	_exit(134);
 }
 
 void installCrashHandler(const char* logPath){
 	if(logPath) snprintf(g_crashLogPath, sizeof(g_crashLogPath), "%s", logPath);
 	SetUnhandledExceptionFilter(onUnhandledException);
+	// no "abort() has been called" dialog (Debug) or Windows error report:
+	// go straight to the handler, which writes the stack to the log
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+	signal(SIGABRT, onAbortSignal);
+	installThreadTerminateHandler();
+}
+
+void installThreadTerminateHandler(){
+	std::set_terminate(onTerminate);
 }
 
 #else
 
 void installCrashHandler(const char*){}
+void installThreadTerminateHandler(){}
 
 #endif
