@@ -28,7 +28,9 @@ Each 16 m ground tile is processed with a halo of its neighbours' points:
      lying within a centimetre or two of a well-exposed point of the same
      surface, imaged in another photo, give pairs of (greyed, well-exposed)
      colour. The regression's estimate is averaged with the colour of
-     well-exposed points nearby, each weighted by its measured error.
+     well-exposed points nearby, each weighted by its measured error. A
+     point takes a share of that estimate set by how greyed it is, measured
+     on held-out pairs: even lightly greyed points need about half.
   4. Classify structure where there are blown points. A line of points is a
      trunk or branch; a less linear cluster is leaf material. Segments of
      points whose normals have similar verticality are judged by their own
@@ -501,6 +503,22 @@ def regression_error(dc):
     return np.interp(dc, _REG_DC, _REG_ERR)
 
 
+# How much of the estimate a greyed point takes, against its greyed weight w.
+# The weight's 0-to-1 ramp left lightly greyed points too pale: on held-out
+# pairs, a point with w at most 0.5 came out 2.8-5.1 L* lighter than the
+# well-exposed point of the same surface. The share that gave the smallest
+# error, chosen on half the pairs and checked on the other half, is about
+# 0.45 at w 0.03, 0.6 at 0.15, 0.75 at 0.37, 0.8 at 0.63 and 0.9 at 0.91,
+# in both samples. It roughly halved the error of lightly greyed points
+# (column_3m, w 0.03: 3.21 -> 2.24; every100: 5.40 -> 3.59).
+_SHARE_W = np.array([0.0, 0.03, 0.155, 0.37, 0.63, 0.91, 1.0])
+_SHARE_K = np.array([0.0, 0.45, 0.625, 0.75, 0.80, 0.875, 1.0])
+
+
+def correction_share(w):
+    return np.interp(w, _SHARE_W, _SHARE_K).astype(np.float32)
+
+
 def collect_pairs(xyz, rgb, t, a, cap, seed=0):
     """(greyed, well-exposed) colour pairs: a greyed point and the nearest well-exposed point
     within 2 point spacings (1-3 cm), captured more than a second apart."""
@@ -644,7 +662,7 @@ def palette_colours(q_xyz, q_cls, s_xyz, s_lab, s_cls, gpal, a):
 
 # ---------------------------------------------------------------- texture (--texture)
 # Recolouring averages: the regression pulls towards the mean, and borrowing takes Gaussian means of
-# neighbours. Measured on the samples' canopy, recoloured points keep only 9-24 % of the colour
+# neighbours. Measured on the samples' canopy, recoloured points keep only 8-21 % of the colour
 # variation that well-exposed foliage has between points under 2 cm apart, and about half at
 # 16-64 cm. --texture adds variation back. Each run measures the semivariance of colour (half the
 # mean squared difference between two points, against their distance; Cressie 1993) of well-exposed
@@ -820,7 +838,7 @@ def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None, tex=None):
             wr = 1.0 / regression_error(dc[pi]) ** 2
             wb = np.where(okb, 1.0 / borrow_error(dn) ** 2, 0.0)
             comb = ((wr[:, None] * reg + wb[:, None] * bo) / (wr + wb)[:, None]).astype(np.float32)
-        ww = w[pi][:, None]
+        ww = correction_share(w[pi])[:, None]
         new[pi] = (1 - ww) * lab[pi] + ww * comb
         path[pi] = 1
 
@@ -865,7 +883,7 @@ def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None, tex=None):
         ti = np.flatnonzero(path > 0)
         if len(ti):
             noise = (texture_noise(np.stack([X[ti], Y[ti], Z[ti]], 1), tex)
-                     * (np.sqrt(a.texture) * w[ti])[:, None]).astype(np.float32)
+                     * (np.sqrt(a.texture) * correction_share(w[ti]))[:, None]).astype(np.float32)
             base = new[ti].copy()
             _, _, w_base, _ = colour_state(np.clip(np.rint(lab_to_srgb(base)), 0, 255).astype(np.int32), a)
             left = np.ones(len(ti), bool)
@@ -1183,7 +1201,7 @@ def fit_texture_from_tiles(scratch, keys, hdr, scale16, model, gpal, a):
                 rgb >>= 8
             blown, _, w, trusted = colour_state(rgb, a)
             # Measured where the washing-out is: at --texture-above metres or more above the ground. Fitted
-            # there, the samples' recoloured canopy came out at 69-128 % (column) and 80-112 % (thinned
+            # there, the samples' recoloured canopy came out at 68-131 % (column) and 82-112 % (thinned
             # sample) of real variation at each distance, and the texture still suited the points lower
             # down. Fitted on all heights, it was 2-3 times too grainy in the canopy, because understory
             # foliage is grainier.

@@ -110,7 +110,7 @@ An offline Python tool, separate from the viewer. It rewrites the colour of two 
 The docstring gives the method. In order, the steps are:
 1. Detect blown-out and greyed points.
 2. Keep printed survey pages unchanged.
-3. Repair greyed points with a regression learnt per run.
+3. Repair greyed points with a regression learnt per run. Each point takes a share of the estimate set from held-out pairs (`_SHARE_W`, `_SHARE_K`); a share equal to the greyed weight left lightly greyed points too pale.
 4. Classify structure around blown points: a line of points is trunk or branch, a less linear cluster is leaf material.
 5. Borrow colour from points within 15 cm.
 6. Fill the rest with patches of real nearby colours.
@@ -123,7 +123,7 @@ The docstring gives the method. In order, the steps are:
   - It scores colour borrowing on hidden well-exposed points.
   - It scores the greyed-colour regression on held-out pairs.
   - It scores the whole tool on a simulated blowout. Use `--tool` to score another version, and `--tool-args "--texture 1"` to pass options.
-  - The error tables `_BORROW_A`, `_BORROW_B` and `_REG_ERR` in the tool come from its output.
+  - The error tables `_BORROW_A`, `_BORROW_B` and `_REG_ERR`, and the correction shares `_SHARE_K`, in the tool come from its output.
 - Diagnostics:
   - `--show classes` writes the structure classes as false colour: orange trunk/branch, green leaf, magenta pages.
   - `--show paths` shows which step coloured each point.
@@ -133,5 +133,5 @@ The docstring gives the method. In order, the steps are:
   - Memory is about 0.32 GB per million points a worker holds at once: a slab's own points plus those within 0.6 m of it. Near the scanner the slabs are about 1 m wide and their context holds more points than they do, so the full scan needs up to about 27 M points, about 10 GB, per worker. The log reports this after the split.
   - A quick test on a full scan: `--crop 8 -4 12 0`, about 3.4 M points. A patch around the scanner such as `--crop -10 -10 10 10` holds half the scan.
   - `--workers N` processes tiles in parallel and gives identical output.
-  - This version has not been run on a full scan. The samples take about a minute each with one worker in a 4-core cloud session; the previous version took about 15 minutes for a full scan on the 20-thread laptop.
+  - The rewritten tool has been run on the full WhiteCanopy scan (345.8 M points). The samples take about a minute each with one worker in a 4-core cloud session; the original version took about 15 minutes for a full scan on the 20-thread laptop.
 - Judge the results in SimLOD at 4K in Native colour, its default. The look's light, haze and grade change every colour, and Fix blown-out canopy is a separate, on-the-fly repair inside the viewer.
