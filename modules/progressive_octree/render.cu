@@ -2755,9 +2755,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			float dt    = tMax / float(steps);
 
 			// Dither the start point per pixel to trade banding for fine noise,
-			// which the bilinear upsample then smooths away.
-			uint32_t h = insectHash(uint32_t(i) * 2654435761u
-					   + uint32_t(uniforms.frameCounter) * 40503u);
+			// which the bilinear upsample then smooths away. Per pixel only: with
+			// the frame number in the hash the noise changed every frame, and the
+			// lit haze flickered in 4 x 4 blocks wherever rays run far through
+			// the canopy, toward the horizon most of all.
+			uint32_t h = insectHash(uint32_t(i) * 2654435761u);
 			float jitter = insectUnit(h);
 
 			float accR = 0.0f, accG = 0.0f, accB = 0.0f;
