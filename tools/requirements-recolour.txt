@@ -1,0 +1,4 @@
+# tools/recolour_canopy.py: pip install -r tools/requirements-recolour.txt
+laspy[lazrs]>=2.4
+numpy
+scipy
