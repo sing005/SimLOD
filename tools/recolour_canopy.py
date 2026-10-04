@@ -66,7 +66,7 @@ References
 
 Usage:
   python recolour_canopy.py IN.laz OUT.laz                      # whole scan
-  python recolour_canopy.py IN.laz OUT.laz --crop -10 -10 10 10 # test tile
+  python recolour_canopy.py IN.laz OUT.laz --crop 8 -4 12 0     # test patch (4 x 4 m)
   python recolour_canopy.py IN.laz OUT.laz --show classes       # structure classes as false colour
   python recolour_canopy.py IN.laz OUT.laz --workers 4          # tiles in parallel (memory x4)
   python recolour_canopy.py IN.laz OUT.laz --texture 1          # restore the natural variation of colour
@@ -972,11 +972,44 @@ def split_into_tiles(a, scratch):
 
 
 def load_tile(scratch, key, hdr, with_halo=True):
+    """A tile's records in memory: its own points, then its halo."""
     dtype = hdr.point_format.dtype()
     own = np.fromfile(os.path.join(scratch, f't_{key}.rec'), dtype=dtype)
     hp = os.path.join(scratch, f'h_{key}.rec')
     data = np.concatenate([own, np.fromfile(hp, dtype=dtype)]) if with_halo and os.path.exists(hp) else own
-    return laspy.ScaleAwarePointRecord(data, hdr.point_format, hdr.scales, hdr.offsets), len(own)
+    return as_points(data, hdr), len(own)
+
+
+def as_points(data, hdr):
+    return laspy.ScaleAwarePointRecord(data, hdr.point_format, hdr.scales, hdr.offsets)
+
+
+def tile_size(scratch, key, hdr):
+    """Number of a tile's own points."""
+    return os.path.getsize(os.path.join(scratch, f't_{key}.rec')) // hdr.point_format.size
+
+
+def tile_maps(scratch, key, hdr):
+    """A tile's own and halo records as read-only memory maps. Pages are read from disk as they
+    are touched, so a dense tile is never held in memory whole."""
+    dtype = hdr.point_format.dtype()
+    own = np.memmap(os.path.join(scratch, f't_{key}.rec'), dtype=dtype, mode='r')
+    hp = os.path.join(scratch, f'h_{key}.rec')
+    halo = np.memmap(hp, dtype=dtype, mode='r') if os.path.exists(hp) and os.path.getsize(hp) else np.zeros(0, dtype)
+    return own, halo
+
+
+def xs(raw, hdr):
+    """x in metres from raw X values, computed as laspy computes it, so slab edges come out the same."""
+    return raw * hdr.scales[0] + hdr.offsets[0]
+
+
+def central_slab(own, hdr, a):
+    """The middle --slab-points of a dense tile's own points along x, read from its map."""
+    x = xs(own['X'], hdr)
+    f = a.slab_points / len(own)
+    lo, hi = np.quantile(x, [0.5 - f / 2, 0.5 + f / 2])
+    return as_points(own[np.flatnonzero((x >= lo) & (x <= hi))], hdr)
 
 
 def has_gps_time(hdr):
@@ -996,12 +1029,10 @@ def fit_from_tiles(scratch, keys, hdr, scale16, a):
     Xs, Ys = [], []
     cap = max(10_000, a.fit_pairs // len(pick))
     for i, key in enumerate(pick):
-        pts, _ = load_tile(scratch, key, hdr, with_halo=False)
-        if len(pts) > a.slab_points:      # a central slab is plenty for pairs, and bounds memory
-            x = np.asarray(pts.x)
-            f = a.slab_points / len(pts)
-            lo, hi = np.quantile(x, [0.5 - f / 2, 0.5 + f / 2])
-            pts = pts[(x >= lo) & (x <= hi)]
+        if tile_size(scratch, key, hdr) > a.slab_points:   # a central slab is plenty for pairs, and bounds memory
+            pts = central_slab(tile_maps(scratch, key, hdr)[0], hdr, a)
+        else:
+            pts, _ = load_tile(scratch, key, hdr, with_halo=False)
         xyz = np.stack([np.asarray(pts.x), np.asarray(pts.y), np.asarray(pts.z)], 1)
         xyz = (xyz - xyz.min(0)).astype(np.float32)
         rgb = np.stack([np.asarray(pts.red), np.asarray(pts.green), np.asarray(pts.blue)], 1).astype(np.int32)
@@ -1022,40 +1053,104 @@ def fit_from_tiles(scratch, keys, hdr, scale16, a):
     return W, pal.astype(np.float32)
 
 
-def slabs(x_own, x_all, n_own, slab_points, margin):
-    """Cut a dense tile into slabs along x of at most slab_points own points, each with its
-    context: every other point of the tile or halo within margin. Memory is about 0.35 GB per
-    million points processed at once (measured on the samples)."""
-    n = max(1, int(np.ceil(n_own / slab_points)))
-    if n == 1:
-        yield np.arange(n_own), np.arange(n_own, len(x_all)), -np.inf, np.inf
-        return
-    edges = np.quantile(x_own, np.linspace(0, 1, n + 1)); edges[0] = -np.inf; edges[-1] = np.inf
-    for x0, x1 in zip(edges[:-1], edges[1:]):
-        own = np.flatnonzero((x_own >= x0) & (x_own < x1))
-        ctx = np.flatnonzero((x_all >= x0 - margin) & (x_all < x1 + margin))
-        yield own, ctx[(ctx >= n_own) | (x_all[ctx] < x0) | (x_all[ctx] >= x1)], x0, x1
-
-
-def recolour_slabbed(pts, n_own, key, scale16, model, gpal, tex, a):
-    """Recolour a tile's own points, slab by slab if it is dense. Returns 8-bit colours (or None), stats, pages."""
+def recolour_whole(pts, n_own, key, scale16, model, gpal, tex, a):
+    """Recolour a tile held in memory, in one piece. Returns 8-bit colours of its own points (or None), stats, pages."""
     ix, iy = (int(v) for v in key.split('_'))
-    X = np.asarray(pts.x)
-    st = dict.fromkeys(STAT_KEYS, 0); pages = []
-    res = None
-    for own_i, ctx_i, x0, x1 in slabs(X[:n_own], X, n_own, a.slab_points, a.margin):
-        box = (max(ix * a.tile, x0), iy * a.tile, min((ix + 1) * a.tile, x1), (iy + 1) * a.tile)
-        sub = pts if len(ctx_i) == len(X) - n_own and len(own_i) == n_own else pts[np.concatenate([own_i, ctx_i])]
-        r, s, p = recolour_tile(sub, len(own_i), scale16, model, gpal, a, own_box=box, tex=tex)
-        for k in STAT_KEYS: st[k] += s[k]
+    box = (ix * a.tile, iy * a.tile, (ix + 1) * a.tile, (iy + 1) * a.tile)
+    return recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=box, tex=tex)
+
+
+CHUNK = 4_000_000   # records scanned at a time when finding a dense tile's slab context
+# A worker's memory: GB_BASE + GB_PER_M per million points held at once. Measured peaks: 1.5 GB for
+# column_3m.laz held whole (4.8 M points), 6.3 GB for a 58 M-point tile of copies of it whose largest
+# slab held 19.6 M points with its context: 0.31-0.32 GB per million.
+GB_BASE, GB_PER_M = 0.3, 0.33
+
+
+def slab_plan(xr, hdr, a):
+    """Cut a dense tile into slabs along x of at most --slab-points own points, from the raw x of
+    its own points. Returns the slab edges and the slab of each own point."""
+    n = max(1, int(np.ceil(len(xr) / a.slab_points)))
+    x = xs(xr, hdr)
+    edges = np.quantile(x, np.linspace(0, 1, n + 1)); edges[0] = -np.inf; edges[-1] = np.inf
+    sid = np.empty(len(xr), np.min_scalar_type(n))
+    for c0 in range(0, len(xr), CHUNK):   # slab s holds edges[s] <= x < edges[s + 1]
+        sid[c0:c0 + CHUNK] = np.searchsorted(edges[1:-1], x[c0:c0 + CHUNK], side='right')
+    return edges, sid
+
+
+def dense_slabs(own, halo, xr, edges, sid, hdr, key, a):
+    """The slabs of a dense tile, read from its maps. Yields, for each slab, its number, the
+    indices of its own points, its records (those points, then their context: the tile's other
+    points and the halo points within --margin of the slab) and its box. xr is the raw x of the own
+    points, held in memory so that finding the context does not read the whole tile from disk again
+    for every slab."""
+    ix, iy = (int(v) for v in key.split('_'))
+    x_halo = xs(halo['X'], hdr)
+    m = a.margin
+    for s in range(len(edges) - 1):
+        x0, x1 = edges[s], edges[s + 1]
+        own_i = np.flatnonzero(sid == s)
+        ctx = []
+        for c0 in range(0, len(xr), CHUNK):
+            xc = xs(xr[c0:c0 + CHUNK], hdr)
+            ctx.append(c0 + np.flatnonzero((xc >= x0 - m) & (xc < x1 + m) & (sid[c0:c0 + CHUNK] != s)))
+        near = np.flatnonzero((x_halo >= x0 - m) & (x_halo < x1 + m))
+        yield (s, own_i, as_points(np.concatenate([own[own_i], own[np.concatenate(ctx)], halo[near]]), hdr),
+               (max(ix * a.tile, x0), iy * a.tile, min((ix + 1) * a.tile, x1), (iy + 1) * a.tile))
+
+
+def recolour_dense(scratch, key, hdr, scale16, model, gpal, tex, a):
+    """Recolour a tile with more own points than --slab-points, one slab at a time, and write
+    o_<key>.rec. The records are read through memory maps and the new colours written into a
+    mapped copy of the tile, so a worker holds one slab in memory, however dense the tile.
+    Returns stats and pages."""
+    own, halo = tile_maps(scratch, key, hdr)
+    xr = np.array(own['X'])   # 4 bytes a point
+    edges, sid = slab_plan(xr, hdr, a)
+    op = os.path.join(scratch, f'o_{key}.rec')
+    shutil.copyfile(os.path.join(scratch, f't_{key}.rec'), op)
+    out = np.memmap(op, dtype=own.dtype, mode='r+')
+    mul = 257 if scale16 else 1
+    st = dict.fromkeys(STAT_KEYS, 0); pages = []; untouched = []
+    for s, own_i, sub, box in dense_slabs(own, halo, xr, edges, sid, hdr, key, a):
+        r, s_st, p = recolour_tile(sub, len(own_i), scale16, model, gpal, a, own_box=box, tex=tex)
+        del sub
+        for k in STAT_KEYS: st[k] += s_st[k]
         pages.extend(p)
-        if r is not None:
-            if res is None:
-                res = np.stack([np.asarray(pts.red[:n_own]), np.asarray(pts.green[:n_own]), np.asarray(pts.blue[:n_own])], 1).astype(np.int32)
-                if scale16:
-                    res >>= 8
-            res[own_i] = r
-    return res, st, pages
+        if r is None:
+            untouched.append(s)
+            continue
+        for c, name in enumerate(('red', 'green', 'blue')):
+            out[name][own_i] = (r[:, c] * mul).astype(out.dtype[name])
+    if scale16 and len(untouched) < len(edges) - 1:
+        # as for a tile recoloured in one piece: once any of its points is recoloured, every
+        # colour in the tile is written at 8-bit precision
+        for s in untouched:
+            own_i = np.flatnonzero(sid == s)
+            for name in ('red', 'green', 'blue'):
+                out[name][own_i] = ((out[name][own_i].astype(np.int32) >> 8) * mul).astype(out.dtype[name])
+    out.flush()
+    del out   # unmapped before the main process reads and deletes the file (Windows will not delete a mapped file)
+    return st, pages
+
+
+def worker_memory(scratch, key, hdr, a, step=9973):
+    """The most points a worker holds at once for this tile, and the memory that needs in GB. A
+    tile is held whole with its halo; a dense tile one slab at a time, with that slab's context,
+    estimated from every step-th record (records 340 kB apart, so only part of the file is read).
+    Near the scanner a slab is narrow and its context can hold more points than the slab."""
+    own, halo = tile_maps(scratch, key, hdr)
+    if len(own) <= a.slab_points:
+        held = len(own) + len(halo)
+        return held, GB_BASE + GB_PER_M * held / 1e6
+    xo = xs(own['X'][::step], hdr); xh = xs(halo['X'][::step], hdr)
+    n = int(np.ceil(len(own) / a.slab_points))
+    e = np.quantile(xo, np.linspace(0, 1, n + 1)); e[0] = -np.inf; e[-1] = np.inf
+    m = a.margin
+    held = step * max(int(((xo >= x0 - m) & (xo < x1 + m)).sum() + ((xh >= x0 - m) & (xh < x1 + m)).sum())
+                      for x0, x1 in zip(e[:-1], e[1:]))
+    return held, GB_BASE + GB_PER_M * held / 1e6 + 5 * len(own) / 1e9   # + the tile's raw x and slab numbers
 
 
 def fit_texture_from_tiles(scratch, keys, hdr, scale16, model, gpal, a):
@@ -1068,32 +1163,43 @@ def fit_texture_from_tiles(scratch, keys, hdr, scale16, model, gpal, a):
     ST = np.zeros((n_bins, 3, 3)); NT = np.zeros(n_bins); SR = np.zeros((n_bins, 3, 3)); NR = np.zeros(n_bins)
     shape_xyz = None
     for i, key in enumerate(pick):
-        pts, n_own = load_tile(scratch, key, hdr)
-        res, _, _ = recolour_slabbed(pts, n_own, key, scale16, model, gpal, None, a)
-        if res is None:
-            continue
-        own = pts[:n_own]
-        xyz = np.stack([np.asarray(own.x), np.asarray(own.y), np.asarray(own.z)], 1)
-        rgb = np.stack([np.asarray(own.red), np.asarray(own.green), np.asarray(own.blue)], 1).astype(np.int32)
-        if scale16:
-            rgb >>= 8
-        blown, _, w, trusted = colour_state(rgb, a)
-        # Measured where the washing-out is: at --texture-above metres or more above the ground. Fitted
-        # there, the samples' recoloured canopy came out at 69-128 % (column) and 80-112 % (thinned
-        # sample) of real variation at each distance, and the texture still suited the points lower
-        # down. Fitted on all heights, it was 2-3 times too grainy in the canopy, because understory
-        # foliage is grainier.
-        high = height_above_ground(xyz) >= a.texture_above
-        R = (blown | (w > 0.5)) & high
-        if R.sum() < 1000:
-            continue
-        T = trusted & high & dilated_cells(xyz, R, a.roi_cell)   # well-exposed points near the washed-out areas
-        s_, n_ = semivariance_sums(xyz[T], srgb_to_lab(rgb[T]), seed=i); ST += s_; NT += n_
-        s_, n_ = semivariance_sums(xyz[R], srgb_to_lab(res[R]), seed=i); SR += s_; NR += n_
-        if shape_xyz is None:
-            ri = np.flatnonzero(R)
-            shape_xyz = xyz[np.random.default_rng(i).choice(ri, min(200_000, len(ri)), replace=False)]
-        log(f'texture: measured tile {i + 1}/{len(pick)}')
+        # (own records, their new colours, sampling seed): a dense tile slab by slab, which bounds memory
+        if tile_size(scratch, key, hdr) > a.slab_points:
+            own_m, halo_m = tile_maps(scratch, key, hdr)
+            xr = np.array(own_m['X'])
+            edges, sid = slab_plan(xr, hdr, a)
+            pieces = ((sub[:len(own_i)], recolour_tile(sub, len(own_i), scale16, model, gpal, a, own_box=box)[0], i * 1000 + s + 1)
+                      for s, own_i, sub, box in dense_slabs(own_m, halo_m, xr, edges, sid, hdr, key, a))
+        else:
+            pts, n_own = load_tile(scratch, key, hdr)
+            pieces = [(pts[:n_own], recolour_whole(pts, n_own, key, scale16, model, gpal, None, a)[0], i)]
+        measured = False
+        for own, res, seed in pieces:
+            if res is None:
+                continue
+            xyz = np.stack([np.asarray(own.x), np.asarray(own.y), np.asarray(own.z)], 1)
+            rgb = np.stack([np.asarray(own.red), np.asarray(own.green), np.asarray(own.blue)], 1).astype(np.int32)
+            if scale16:
+                rgb >>= 8
+            blown, _, w, trusted = colour_state(rgb, a)
+            # Measured where the washing-out is: at --texture-above metres or more above the ground. Fitted
+            # there, the samples' recoloured canopy came out at 69-128 % (column) and 80-112 % (thinned
+            # sample) of real variation at each distance, and the texture still suited the points lower
+            # down. Fitted on all heights, it was 2-3 times too grainy in the canopy, because understory
+            # foliage is grainier.
+            high = height_above_ground(xyz) >= a.texture_above
+            R = (blown | (w > 0.5)) & high
+            if R.sum() < 1000:
+                continue
+            T = trusted & high & dilated_cells(xyz, R, a.roi_cell)   # well-exposed points near the washed-out areas
+            s_, n_ = semivariance_sums(xyz[T], srgb_to_lab(rgb[T]), seed=seed); ST += s_; NT += n_
+            s_, n_ = semivariance_sums(xyz[R], srgb_to_lab(res[R]), seed=seed); SR += s_; NR += n_
+            if shape_xyz is None:
+                ri = np.flatnonzero(R)
+                shape_xyz = xyz[np.random.default_rng(seed).choice(ri, min(200_000, len(ri)), replace=False)]
+            measured = True
+        if measured:
+            log(f'texture: measured tile {i + 1}/{len(pick)}')
     tex = fit_texture(ST, NT, SR, NR, shape_xyz) if shape_xyz is not None else None
     if tex is None:
         log('texture: too few well-exposed or recoloured points to measure it; --texture is off')
@@ -1112,8 +1218,11 @@ def process_tile(job):
     scratch, key, a, scale16, model, gpal, tex = job
     with laspy.open(a.input) as rd:
         hdr = rd.header
+    if tile_size(scratch, key, hdr) > a.slab_points:
+        st, pages = recolour_dense(scratch, key, hdr, scale16, model, gpal, tex, a)
+        return key, st, pages
     pts, n_own = load_tile(scratch, key, hdr)
-    res, st, pages = recolour_slabbed(pts, n_own, key, scale16, model, gpal, tex, a)
+    res, st, pages = recolour_whole(pts, n_own, key, scale16, model, gpal, tex, a)
     own = pts[:n_own]
     if res is not None:
         mul = 257 if scale16 else 1
@@ -1181,9 +1290,11 @@ def build_parser():
     g.add_argument('--show', choices=('classes', 'paths'), default=None,
                    help='write false colour instead: classes = trunk/branch orange, leaf green; '
                         'paths = repaired yellow, borrowed cyan, palette red. Pages magenta, untouched points dim grey')
-    g.add_argument('--workers', type=int, default=1, help='tiles processed in parallel (default 1); memory grows with each')
+    g.add_argument('--workers', type=int, default=1,
+                   help='tiles processed in parallel (default 1); each needs the memory the log reports after the split')
     g.add_argument('--slab-points', type=int, default=12_000_000,
-                   help='denser tiles are processed in slabs of at most this many points (default 12 M, about 4.5 GB per worker)')
+                   help='a tile with more own points than this is read from disk in slabs of at most this many own '
+                        'points, each held with the points within --margin of it (default 12 M)')
     g.add_argument('--chunk', type=int, default=5_000_000)
     g.add_argument('--batch', type=int, default=500_000, help='points queried at once (memory)')
     g.add_argument('--reuse-scratch', action='store_true', help='--scratch already holds the tiles of this input: skip the split')
@@ -1222,10 +1333,11 @@ def main():
     keys = sorted(f[2:-4] for f in os.listdir(scratch) if f.startswith('t_') and f.endswith('.rec'))
     if not keys:
         raise SystemExit('no points to process (is --crop outside the scan?)')
-    biggest = max(os.path.getsize(os.path.join(scratch, f't_{k}.rec')) for k in keys) // hdr.point_format.size
-    at_once = min(biggest, a.slab_points)
-    log(f'{len(keys)} tiles; the largest holds {biggest / 1e6:.1f} M points. About {0.35 * at_once / 1e6 + 0.3:.1f} GB '
-        f'per worker ({a.workers} worker{"s" if a.workers > 1 else ""}); --slab-points and --tile lower it')
+    by_size = sorted(keys, key=lambda k: tile_size(scratch, k, hdr), reverse=True)
+    held, gb = max((worker_memory(scratch, k, hdr, a) for k in by_size[:3]), key=lambda t: t[1])
+    log(f'{len(keys)} tile{"s" if len(keys) > 1 else ""}; the largest holds {tile_size(scratch, by_size[0], hdr) / 1e6:.1f} M points. A worker holds '
+        f'up to about {held / 1e6:.1f} M points at once, about {gb:.1f} GB'
+        + (f'; {a.workers} workers up to about {a.workers * gb:.0f} GB' if a.workers > 1 else ''))
     model, gpal = fit_from_tiles(scratch, keys, hdr, scale16, a)
     tex = fit_texture_from_tiles(scratch, keys, hdr, scale16, model, gpal, a) if a.texture > 0 and not a.show else None
 
