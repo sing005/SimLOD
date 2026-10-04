@@ -66,6 +66,11 @@ void kernel(
 		root->numVoxels = 0;
 		root->numVoxelsStored = 0;
 		root->voxelChunks = nullptr;
+		// The chunk pool starts again from zero, so the root must give up the
+		// chunks it kept from the last cloud (one too small to split it): the
+		// next cloud's first split returned them to chunkQueue[-1], [-2] ...,
+		// in front of the queue, over numSpilledPoints.
+		root->points = nullptr;
 		root->grid = (OccupancyGrid*)allocator_octree->alloc(sizeof(OccupancyGrid));
 
 		*_numBatchesUploaded_volatile = 0;

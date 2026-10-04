@@ -174,13 +174,12 @@ void loadLasNative(string file, LasHeader header, uint64_t firstPoint, uint64_t 
 
 	// now parse loaded points and write results to <target>
 	uint64_t offset_rgb = 0;
+	// byte offset of red in each point format that has colour (LAS 1.4)
 	if(header.format == 2){
 		offset_rgb = 20;
-	}else if(header.format == 3){
+	}else if(header.format == 3 || header.format == 5){
 		offset_rgb = 28;
-	}if(header.format == 5){
-		offset_rgb = 28;
-	}if(header.format == 7){
+	}else if(header.format == 7 || header.format == 8 || header.format == 10){
 		offset_rgb = 30;
 	}
 
@@ -193,7 +192,7 @@ void loadLasNative(string file, LasHeader header, uint64_t firstPoint, uint64_t 
 
 	uint8_t* source = ((uint8_t*)thread_buffer) + padding;
 	Point* pTarget = (Point*)target;
-	Point point;
+	Point point = {};   // formats without colour load black, as the LAZ path does
 	int32_t XYZ[3];
 	double scale_x = header.scale[0];
 	double scale_y = header.scale[1];

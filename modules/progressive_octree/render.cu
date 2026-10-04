@@ -332,9 +332,14 @@ inline bool gridIsAirNearFoliage(int cx, int cy, int cz, int reach){
 // for most noise. reach 1 adds the six axis neighbours, seven reads, which
 // keeps thin surfaces that straddle a cell boundary and would otherwise be
 // thinned along the seam.
+// The cull runs only with a threshold and a grid to count in. Without the
+// grid no point is stray, so Show culled only must not then hide them all.
+inline bool cullActive(){
+	return uniforms.minNeighbours > 0 && uniforms.useVoxelGrid && uniforms.voxelGridPtr != 0;
+}
+
 inline bool isStrayPoint(float px, float py, float pz){
-	if(uniforms.minNeighbours <= 0) return false;
-	if(!uniforms.useVoxelGrid || uniforms.voxelGridPtr == 0) return false;
+	if(!cullActive()) return false;
 
 	float c = uniforms.cellSize;
 	int cx = int(floorf(px / c)), cy = int(floorf(py / c)), cz = int(floorf(pz / c));
@@ -839,9 +844,9 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 		// cheaper and rejects everything behind or beside the camera first.
 		// "Show culled only" with the threshold at 0 used to blank the screen:
 		// nothing was stray, so "only the strays" was nothing. Now the checkbox
-		// does nothing until there is a threshold for it to show.
+		// does nothing until the cull can run (cullActive).
 		bool stray = isStrayPoint(point.x, point.y, point.z);
-		if(uniforms.showCulledOnly && uniforms.minNeighbours > 0){ if(!stray) return; }
+		if(uniforms.showCulledOnly && cullActive()){ if(!stray) return; }
 		else if(stray) return;
 		countUp(&_numDrawn);     // on-screen points that pass density and the cull
 
@@ -949,7 +954,7 @@ inline bool hqsAcceptPoint(const Point& point, Node* node, float minWorldSize,
 
 	// stray-point culling, after the cheaper on-screen test (apply_stray_cull.ps1)
 	bool stray = isStrayPoint(point.x, point.y, point.z);
-	if(uniforms.showCulledOnly && uniforms.minNeighbours > 0){ if(!stray) return false; }
+	if(uniforms.showCulledOnly && cullActive()){ if(!stray) return false; }
 	else if(stray) return false;
 
 	color = point.color;
@@ -1420,10 +1425,12 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				int x, y, R; float depth; uint32_t color;
 				if(!hqsAcceptPoint(point, node, 0.0f, x, y, depth, R, color)) continue;
 				{
-					if(!uniforms.colorByNode && !uniforms.colorByLOD) color = repairColour(color, point.x, point.y, point.z);   // blown-out canopy
-					uint32_t base = color;
-					if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
-					color = applyTorch(color, base, point.x, point.y, point.z);
+					if(!uniforms.colorByNode && !uniforms.colorByLOD){   // debug colours stay unlit, as in drawPoint
+						color = repairColour(color, point.x, point.y, point.z);   // blown-out canopy
+						uint32_t base = color;
+						if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
+						color = applyTorch(color, base, point.x, point.y, point.z);
+					}
 					uint8_t* rgba = (uint8_t*)&color;
 
 					// HQS colour pass (apply_test_source.ps1): the same splat as
@@ -1530,10 +1537,12 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				if(!hqsAcceptPoint(point, node, voxelSplatMetres(nodeSize), x, y, depth, R, color)) continue;
 				{
 
-					if(!uniforms.colorByNode && !uniforms.colorByLOD) color = repairColour(color, point.x, point.y, point.z);   // blown-out canopy
-					uint32_t base = color;
-					if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
-					color = applyTorch(color, base, point.x, point.y, point.z);
+					if(!uniforms.colorByNode && !uniforms.colorByLOD){   // debug colours stay unlit, as in drawPoint
+						color = repairColour(color, point.x, point.y, point.z);   // blown-out canopy
+						uint32_t base = color;
+						if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated, HQS
+						color = applyTorch(color, base, point.x, point.y, point.z);
+					}
 					uint8_t* rgba = (uint8_t*)&color;
 
 					// HQS colour pass (apply_test_source.ps1): the same splat as
@@ -2287,7 +2296,8 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	grid.sync();
 
 	// clear framebuffer
-	processRange(0, uniforms.width * uniforms.height, [&](int pixelIndex){
+	// integer product: as a float it rounds above 2^24 pixels (--render 4097 4097)
+	processRange(0, int(uniforms.width) * int(uniforms.height), [&](int pixelIndex){
 		// depth:            7f800000 (Infinity)
 		// background color: 00332211 (aabbggrr)
 		// framebuffer[pixelIndex] = 0x7f800000'00332211ull;

@@ -30,9 +30,15 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 
 	if(GLRenderer::inputLocked) return;
 
+	// GLFW passes GLFW_KEY_UNKNOWN (-1) for keys it has no token for, such as
+	// media keys (glfw3.h, glfwSetKeyCallback); it was written to keyStates[-1]
+	if(key < 0 || key >= int(Runtime::keyStates.size())) return;
+
 	cout << "key: " << key << ", scancode: " << scancode << ", action: " << action << ", mods: " << mods << endl;
 
-	if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
+	// Esc closes the viewer, except while a text field or slider has the
+	// keyboard: there Esc cancels the edit, and closing lost unsaved markers
+	if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS && !ImGui::GetIO().WantCaptureKeyboard) {
 		glfwSetWindowShouldClose(window, GLFW_TRUE);
 	}
 

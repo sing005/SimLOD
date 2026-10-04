@@ -24,6 +24,7 @@ Usage:
   python recolour_canopy.py IN.laz OUT.laz --crop -10 -10 10 10 # test tile
 """
 import argparse
+import copy
 import os
 import shutil
 import sys
@@ -67,10 +68,13 @@ WOOD = np.array([[ 92,  68,  48], [ 78,  58,  42], [104,  80,  58],
                  [ 70,  56,  44], [ 88,  72,  56]], np.float64)
 
 
+HALO_EXT = '.xyzrgb'    # float64 x, y, z, red, green, blue (as stored) per halo point
+
+
 def split_into_tiles(a, scale16, scratch):
-    """Pass 1: stream the file into per-tile record files plus halo xyz."""
+    """Pass 1: stream the file into per-tile record files plus halo points."""
     tiles = {}      # (ix, iy) -> open file of raw records
-    halos = {}      # (ix, iy) -> open file of float64 xyz, neighbours' points within the margin
+    halos = {}      # (ix, iy) -> open file of neighbours' points within the margin, HALO_EXT
     t = a.tile
     m = a.margin
     n_in = 0
@@ -90,6 +94,7 @@ def split_into_tiles(a, scale16, scratch):
             else:
                 inside = np.ones(len(x), bool)
             z = np.asarray(chunk.z)
+            rgb = np.stack([np.asarray(chunk.red), np.asarray(chunk.green), np.asarray(chunk.blue)], 1)
             ix = np.floor(x / t).astype(np.int64); iy = np.floor(y / t).astype(np.int64)
             raw = chunk.array   # structured record array
             # own tile
@@ -119,7 +124,9 @@ def split_into_tiles(a, scale16, scratch):
                     if dy == 1:  sel &= fy > 1 - mt
                     if not sel.any(): continue
                     nk = (ix[sel] + dx) * 1_000_003 + (iy[sel] + dy)
-                    xyz = np.stack([x[sel], y[sel], z[sel]], 1)
+                    # colour too: halo points are colour sources for the tile's
+                    # blown points, as its own points are
+                    xyz = np.concatenate([np.stack([x[sel], y[sel], z[sel]], 1), rgb[sel]], 1)
                     nix = ix[sel] + dx; niy = iy[sel] + dy
                     o = np.argsort(nk, kind='stable')
                     b2 = np.flatnonzero(np.diff(nk[o])) + 1
@@ -128,7 +135,7 @@ def split_into_tiles(a, scale16, scratch):
                         k = (int(nix[grp[0]]), int(niy[grp[0]]))
                         f = halos.get(k)
                         if f is None:
-                            f = open(os.path.join(scratch, f'h_{k[0]}_{k[1]}.xyz'), 'ab'); halos[k] = f
+                            f = open(os.path.join(scratch, f'h_{k[0]}_{k[1]}{HALO_EXT}'), 'ab'); halos[k] = f
                         f.write(xyz[grp].astype(np.float64).tobytes())
             n_in += len(raw)
             log(f'split {n_in / 1e6:.1f} M of {total / 1e6:.1f} M points, {len(tiles)} tiles')
@@ -139,7 +146,7 @@ def split_into_tiles(a, scale16, scratch):
     return hdr, rec_size
 
 
-def recolour_tile(pts, halo_xyz, scale16, a, stats):
+def recolour_tile(pts, halo_pts, scale16, a, stats):
     x = np.asarray(pts.x); y = np.asarray(pts.y); z = np.asarray(pts.z)
     r, g, b = rgb8(pts)
     if scale16:
@@ -160,9 +167,17 @@ def recolour_tile(pts, halo_xyz, scale16, a, stats):
     # float32, relative to the tile corner: half the memory of float64
     origin = np.array([x.min(), y.min(), z.min()])
     own_xyz = (np.stack([x, y, z], 1) - origin).astype(np.float32)
-    halo = None if halo_xyz is None or len(halo_xyz) == 0 else (halo_xyz - origin).astype(np.float32)
+    halo = None
+    if halo_pts is not None and len(halo_pts) > 0:
+        halo = (halo_pts[:, :3] - origin).astype(np.float32)
+        hc = halo_pts[:, 3:6].astype(np.int64)
+        if scale16:
+            hc >>= 8
+        hr, hg, hb = (hc[:, i].astype(np.int32) for i in range(3))
+        h_good = (~blown_mask(hr, hg, hb, a)) & (np.maximum(np.maximum(hr, hg), hb) >= a.min_source)
     blown_idx = np.flatnonzero(blown)
     out = np.zeros((nb, 3), np.float64)
+    borrowed = np.zeros(nb, bool)
     pos_in_out = np.full(n_own, -1, np.int64); pos_in_out[blown_idx] = np.arange(nb)
 
     # Tiles beside the scanner hold tens of millions of points, too many for
@@ -178,11 +193,14 @@ def recolour_tile(pts, halo_xyz, scale16, a, stats):
         if len(q_sel) == 0: continue
         ctx_own = np.flatnonzero((own_xyz[:, 0] >= x0 - m) & (own_xyz[:, 0] < x1 + m))
         ctx = own_xyz[ctx_own]
+        ctx_r, ctx_g, ctx_b, good_ctx = r[ctx_own], g[ctx_own], b[ctx_own], good[ctx_own]
         if halo is not None:
+            # The halo's points used to fill places among the k nearest without
+            # ever lending colour, so fewer points borrowed near every tile edge
             hsel = (halo[:, 0] >= x0 - m) & (halo[:, 0] < x1 + m)
             ctx = np.vstack([ctx, halo[hsel]])
-        n_ctx_own = len(ctx_own)
-        good_ctx = np.zeros(len(ctx), bool); good_ctx[:n_ctx_own] = good[ctx_own]
+            ctx_r = np.concatenate([ctx_r, hr[hsel]]); ctx_g = np.concatenate([ctx_g, hg[hsel]])
+            ctx_b = np.concatenate([ctx_b, hb[hsel]]); good_ctx = np.concatenate([good_ctx, h_good[hsel]])
         tree = cKDTree(ctx)
         k = min(a.k, len(ctx))
         for b0 in range(0, len(q_sel), a.batch):
@@ -193,10 +211,11 @@ def recolour_tile(pts, halo_xyz, scale16, a, stats):
             borrow = ng.sum(1) >= a.min_good
             oi = pos_in_out[qi]
             if borrow.any():
-                src = ctx_own[np.where(idx[borrow] < n_ctx_own, idx[borrow], 0)]
+                src = idx[borrow]
                 gg = ng[borrow]
-                cr = np.where(gg, r[src], np.nan); cg_ = np.where(gg, g[src], np.nan); cb = np.where(gg, b[src], np.nan)
+                cr = np.where(gg, ctx_r[src], np.nan); cg_ = np.where(gg, ctx_g[src], np.nan); cb = np.where(gg, ctx_b[src], np.nan)
                 out[oi[borrow]] = np.stack([np.nanmedian(cr, 1), np.nanmedian(cg_, 1), np.nanmedian(cb, 1)], 1)
+                borrowed[oi[borrow]] = True
             stats['borrowed'] += int(borrow.sum())
 
             rest = ~borrow
@@ -220,9 +239,12 @@ def recolour_tile(pts, halo_xyz, scale16, a, stats):
                 out[oi[rest]] = col
         del tree
 
-    # brightness floor for borrowed colours
+    # brightness floor for borrowed colours only: on the palette colours it
+    # raised most browns and greens to the floor, erasing their variation
+    # (--floor-palette keeps that earlier look)
+    floored = borrowed | a.floor_palette
     luma = 0.299 * out[:, 0] + 0.587 * out[:, 1] + 0.114 * out[:, 2]
-    lift = np.where((luma > 1) & (luma < a.min_luma), a.min_luma / np.maximum(luma, 1), 1.0)
+    lift = np.where(floored & (luma > 1) & (luma < a.min_luma), a.min_luma / np.maximum(luma, 1), 1.0)
     out = np.clip(out * lift[:, None], 0, 255)
 
     mul = 257 if scale16 else 1
@@ -245,7 +267,9 @@ def main():
     ap.add_argument('--sky-cast', type=int, default=6, help='blue above green by more than this is a sky cast; 0 = off')
     ap.add_argument('--min-source', type=int, default=60, help='brightest channel a colour source needs')
     ap.add_argument('--min-good', type=int, default=6, help='good neighbours needed to borrow colour')
-    ap.add_argument('--min-luma', type=float, default=85.0)
+    ap.add_argument('--min-luma', type=float, default=85.0, help='brightness floor for borrowed colours (default 85)')
+    ap.add_argument('--floor-palette', action='store_true',
+                    help='lift the wood and leaf palette colours to --min-luma too, as earlier versions did')
     ap.add_argument('--w-shape', type=float, default=0.65, help='weight of shape vs intensity in the wood score')
     ap.add_argument('--wood-threshold', type=float, default=0.55)
     ap.add_argument('--chunk', type=int, default=5_000_000)
@@ -266,16 +290,25 @@ def main():
     log(f'colour is {"16" if scale16 else "8"}-bit')
 
     if a.reuse_scratch:
+        if any(f.startswith('h_') and f.endswith('.xyz') for f in os.listdir(scratch)):
+            sys.exit('--scratch holds halo files from an older version of this tool, without colour: '
+                     'run once without --reuse-scratch')
         with laspy.open(a.input) as rd:
             hdr = rd.header
         log('reusing the tiles already in scratch')
     else:
+        # The split appends to tile files, so files an earlier run left in
+        # --scratch were read again and their points written twice
+        for f in os.listdir(scratch):
+            if (f.startswith('t_') and f.endswith('.rec')) or (f.startswith('h_') and f.endswith(('.xyz', HALO_EXT))):
+                os.remove(os.path.join(scratch, f))
         hdr, rec_size = split_into_tiles(a, scale16, scratch)
         log(f'split done in {time.time() - t0:.0f} s')
 
-    out_hdr = laspy.LasHeader(point_format=hdr.point_format, version=hdr.version)
-    out_hdr.scales = hdr.scales; out_hdr.offsets = hdr.offsets
-    for v in hdr.vlrs: out_hdr.vlrs.append(v)
+    # The input's header as it is (global encoding, GUID, system identifier,
+    # software, date, VLRs); a new one lost those and wrote the Extra Bytes
+    # VLR twice. The writer recounts the points.
+    out_hdr = copy.deepcopy(hdr)
     dtype = hdr.point_format.dtype()
 
     stats = dict(points=0, blown=0, borrowed=0, wood=0, leaf=0)
@@ -285,8 +318,8 @@ def main():
             key = fn[2:-4]
             data = np.fromfile(os.path.join(scratch, fn), dtype=dtype)
             pts = laspy.ScaleAwarePointRecord(data, hdr.point_format, hdr.scales, hdr.offsets)
-            hp = os.path.join(scratch, f'h_{key}.xyz')
-            halo = np.fromfile(hp, dtype=np.float64).reshape(-1, 3) if os.path.exists(hp) else None
+            hp = os.path.join(scratch, f'h_{key}{HALO_EXT}')
+            halo = np.fromfile(hp, dtype=np.float64).reshape(-1, 6) if os.path.exists(hp) else None
             res = recolour_tile(pts, halo, scale16, a, stats)
             if res is not None:
                 pts.red, pts.green, pts.blue = res
@@ -295,6 +328,13 @@ def main():
                 log(f'tile {i + 1}/{len(files)}: {stats["points"] / 1e6:.1f} M points, '
                     f'{stats["blown"] / 1e6:.2f} M blown ({stats["borrowed"] / 1e6:.2f} M borrowed, '
                     f'{stats["wood"] / 1e6:.2f} M wood, {stats["leaf"] / 1e6:.2f} M leaf)')
+        if hdr.evlrs:       # LAS 1.4 extended VLRs; the writer does not copy them
+            wr.write_evlrs(hdr.evlrs)
+        # the input's bounds, not the recoloured points' own: SimLOD places its
+        # frame at the header's minimum corner, so --view and the haze floor
+        # mean the same on both files
+        wr.header.mins = hdr.mins
+        wr.header.maxs = hdr.maxs
 
     if a.scratch is None:
         shutil.rmtree(scratch, ignore_errors=True)
