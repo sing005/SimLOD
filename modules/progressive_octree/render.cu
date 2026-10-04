@@ -2767,7 +2767,12 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			float sunAcc   = 0.0f;   // key light: lit optical depth, before colour and phase
 			float sunTrans = 1.0f;   // key light: transmittance through the haze so far
 			bool  eventsLive = volEvents;
-			bool  sunLive    = volSun;
+			// The sunbeams light the haze, and with Haze over sky off the haze
+			// lies in front of points only, as in the composite: a ray that
+			// hits none (sky, or the void below the horizon) gets no lit haze.
+			// It was marched anyway, and below the ground, where the haze is
+			// at full density and nothing shades it, the void filled with light.
+			bool  sunLive    = volSun && (!sky || uniforms.fogSky != 0);
 
 			for(int s = 0; s < steps && (eventsLive || sunLive); s++){
 				float t = (float(s) + jitter) * dt;
