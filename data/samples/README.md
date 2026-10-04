@@ -46,11 +46,11 @@ python tools/recolour_eval.py data/samples/column_3m.laz --output out.laz       
 1. **Detect** blown-out and greyed points. The greyed correction is weighted from 0 to 1, so there is no visible edge where it starts.
 2. **Protect survey pages.** Flat, A4-sized, achromatic patches with near-white paper and dark print, which also show the print's low laser intensity, keep their colour. Their centres go to `OUT_pages.csv`, in the viewer's `markers.csv` format.
 3. **Repair greyed points** with a regression from the greyed colour to the well-exposed colour, learnt on each run from this scan, averaged with nearby well-exposed colour.
-4. **Classify structure** around blown points: a line of points (trunk or branch) or a less linear cluster. The method follows LeWoS (Wang et al. 2020), with multi-scale linearity for thin branches.
+4. **Classify structure** around blown points: a line of points is trunk or branch, and a less linear cluster is leaf material. The method follows LeWoS (Wang et al. 2020), with multi-scale linearity for thin branches.
 5. **Fill blown points** from well-exposed and repaired points within 15 cm, the same class first. A second pass reaches 30 cm.
 6. **Palette.** The remaining points take the colours of real points of the same class nearby, one colour per 0.3 m cellular patch.
 
-Every attribute other than red, green and blue is left unchanged, and so are the points that need no change. `--show classes` writes the structure classes as false colour (orange trunk/branch, green cluster, magenta pages). `--show paths` shows which step coloured each point.
+Every attribute other than red, green and blue is left unchanged, and so are the points that need no change. `--show classes` writes the structure classes as false colour (orange trunk/branch, green leaf, magenta pages). `--show paths` shows which step coloured each point.
 
 Time and memory, measured in a 4-core cloud session:
 
@@ -81,6 +81,34 @@ These measurements, made on `column_3m.laz`, set the defaults. `python tools/rec
 
    After a run, by the tool's own tests, 0.00 % of the column's points are still blown out and 0.03 % greyed.
 
+## Where the colours come from
+
+Every replacement colour comes from points of this scan that the camera did not wash out. Most of those lie near the ground. The near-ground forest therefore supplies the colours, though not by copying them directly:
+
+1. **Greyed points** are repaired by the regression. It learns from pairs of the same surface seen washed out and seen well exposed. The well-exposed points of those pairs lie mostly near the ground: a median of 1.6 m above it in `every100.laz` (2.3 m in the column), 83 % below 4 m and 0.6 % above 8 m.
+   - The regression is applied to each canopy point's own washed-out colour. The hue, and the differences between canopy points, therefore come from the canopy. The overall lightness and saturation come from what the regression learnt lower down.
+   - Well-exposed colour from within 15 cm is averaged in where there is any. That is rare in the canopy.
+2. **Blown points** take their colour from their neighbours, mostly repaired greyed points at the same height. Where there are none within 30 cm, they take a real colour of the same class from within 2 m.
+
+The result in `every100.laz`, by height above ground (`recolour_eval.py --output`):
+
+| | L* (median) | L* interquartile range | Chroma C* | Hue |
+|---|---|---|---|---|
+| Well-exposed, below 4 m | 36.1 | 14.6 | 17.8 | 113° |
+| Well-exposed, 8–12 m (17,883 points) | 46.2 | 11.4 | 23.3 | 118° |
+| Recoloured, 8–12 m | 44.3 | 6.0 | 22.7 | 116° |
+| Recoloured, above 12 m | 44.3 | 7.4 | 23.2 | 116° |
+
+The recoloured canopy is lighter and more saturated than the near-ground forest. Its median is close to that of the few canopy points the camera did expose well. Its lightness varies about half as much as real foliage does, because both the regression and the borrowing average. The column gives the same picture:
+
+| | L* (median) | L* interquartile range | Chroma C* |
+|---|---|---|---|
+| Well-exposed, near the ground | 35.3 | 13.6 | 17.1 |
+| Well-exposed, 8–12 m | 48.1 | 10.5 | 26.5 |
+| Recoloured, 8–12 m | 48.3 | 6.9 | 25.8 |
+
+After a run, 0.02 % of `every100.laz` still counts as blown out. That is the white paper of the two protected pages.
+
 ## Survey pages in `every100.laz`
 
 Two pages pass every test in the thinned sample. Both are flat, about 29 × 22 cm, with paper returning a laser intensity of 43–53 and print about 1. The centres, in file coordinates, are:
@@ -94,9 +122,9 @@ They have not been checked against the survey. The column sample has none. Six s
 
 ## Known limits
 
-- **No labelled wood/leaf data for this forest.** The structure classes are judged by eye (`--show classes`). During development, with a simpler linearity score than the final classifier, adding the class changed neither the regression (4.62 against 4.63) nor borrowing. Well-exposed points of high and low linearity also had similar median colours (hue 113–119° against 109–115°). The script does not reproduce these two checks. In the thinned sample, trunks inside crowns are often classed as cluster; in the full-density column the trunk is found along its whole length.
+- **No labelled wood/leaf data for this forest.** The structure classes are judged by eye (`--show classes`). During development, with a simpler linearity score than the final classifier, adding the class changed neither the regression (4.62 against 4.63) nor borrowing. Well-exposed points of high and low linearity also had similar median colours (hue 113–119° against 109–115°). The script does not reproduce these two checks. In the thinned sample, trunks inside crowns are often classed as leaf; in the full-density column the trunk is found along its whole length.
 - **Pages that touch other near-white or grey surfaces can be missed.** A page pinned flush to a pale, achromatic surface, or hanging among blown-out leaves, may join up with them.
-- **The canopy takes the colours of the well-exposed forest.** Those are mostly from the shaded lower storeys, so the canopy comes out about as dark as the understory, not sunlit.
+- **Recoloured areas vary less than real foliage.** Their lightness spread is about half that of well-exposed points at the same height (see *Where the colours come from*).
 - **The error tables and the built-in greyed-colour model were measured on `column_3m.laz`.** The model is refitted on each run. For another scan, run `recolour_eval.py` and update `_BORROW_A`, `_BORROW_B` and `_REG_ERR` if they differ much.
 
 ## Neighbour density

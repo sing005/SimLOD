@@ -30,7 +30,7 @@ Each 16 m ground tile is processed with a halo of its neighbours' points:
      colour. The regression's estimate is averaged with the colour of
      well-exposed points nearby, each weighted by its measured error.
   4. Classify structure where there are blown points. A line of points is a
-     trunk or branch; a less linear cluster is the other class. Segments of
+     trunk or branch; a less linear cluster is leaf material. Segments of
      points whose normals have similar verticality are judged by their own
      linearity and size over a range of thresholds (after LeWoS, Wang et al.
      2020); thin lines are found by multi-scale linearity (Weinmann et al.
@@ -634,10 +634,10 @@ def palette_colours(q_xyz, q_cls, s_xyz, s_lab, s_cls, gpal, a):
 
 # ---------------------------------------------------------------- one tile
 
-STAT_KEYS = ('points', 'blown', 'greyed', 'repaired', 'borrowed', 'palette', 'protected', 'line', 'cluster')
+STAT_KEYS = ('points', 'blown', 'greyed', 'repaired', 'borrowed', 'palette', 'protected', 'line', 'leaf')
 
 SHOW_COLOURS = {   # --show: false colours, 8-bit sRGB
-    'line': (230, 140, 40), 'cluster': (60, 150, 80), 'page': (255, 0, 255),
+    'line': (230, 140, 40), 'leaf': (60, 150, 80), 'page': (255, 0, 255),
     'repaired': (240, 220, 60), 'borrowed': (60, 200, 230), 'palette': (220, 60, 60),
 }
 
@@ -694,7 +694,7 @@ def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None):
         path[pi] = 1
 
     # 4-6. blown points
-    cls = np.full(n, -1, np.int8)         # -1 not classified, 0 cluster, 1 line (trunk or branch)
+    cls = np.full(n, -1, np.int8)         # -1 not classified, 0 leaf (less linear cluster), 1 line (trunk or branch)
     if blown.any():
         roi = dilated_cells(xyz, blown, a.roi_cell)
         ri = np.flatnonzero(roi)
@@ -730,13 +730,13 @@ def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None):
     o = slice(0, n_own)
     st['repaired'] = int((path[o] == 1).sum()); st['borrowed'] = int((path[o] == 2).sum())
     st['palette'] = int((path[o] == 3).sum())
-    st['line'] = int((blown[o] & (cls[o] == 1)).sum()); st['cluster'] = int((blown[o] & (cls[o] == 0)).sum())
+    st['line'] = int((blown[o] & (cls[o] == 1)).sum()); st['leaf'] = int((blown[o] & (cls[o] == 0)).sum())
 
     if a.show:
         grey = (0.3 * rgb[o, 0] + 0.59 * rgb[o, 1] + 0.11 * rgb[o, 2]) * 0.5
         out = np.repeat(grey[:, None], 3, 1)
         if a.show == 'classes':
-            for name, m in (('line', cls[o] == 1), ('cluster', cls[o] == 0)):
+            for name, m in (('line', cls[o] == 1), ('leaf', cls[o] == 0)):
                 out[m & (blown[o] | pale[o])] = SHOW_COLOURS[name]
         else:
             for name, code in (('repaired', 1), ('borrowed', 2), ('palette', 3)):
@@ -969,7 +969,7 @@ def build_parser():
     g.add_argument('--fit-pairs', type=int, default=400_000, help='pairs to fit on at most (default 400000)')
     g = ap.add_argument_group('run')
     g.add_argument('--show', choices=('classes', 'paths'), default=None,
-                   help='write false colour instead: classes = trunk/branch orange, cluster green; '
+                   help='write false colour instead: classes = trunk/branch orange, leaf green; '
                         'paths = repaired yellow, borrowed cyan, palette red. Pages magenta, untouched points dim grey')
     g.add_argument('--workers', type=int, default=1, help='tiles processed in parallel (default 1); memory grows with each')
     g.add_argument('--slab-points', type=int, default=12_000_000,
@@ -1061,7 +1061,7 @@ def main():
         f'{100 * stats["blown"] / p:.2f}% blown, {100 * stats["greyed"] / p:.2f}% greyed. '
         f'Greyed repaired: {stats["repaired"]:,}. Blown filled from neighbours: {100 * stats["borrowed"] / b:.0f}%, '
         f'from the palette: {100 * stats["palette"] / b:.0f}%. Blown classed trunk/branch: {stats["line"]:,}, '
-        f'cluster: {stats["cluster"]:,}. Page points kept: {stats["protected"]:,}')
+        f'leaf: {stats["leaf"]:,}. Page points kept: {stats["protected"]:,}')
 
 
 if __name__ == '__main__':
