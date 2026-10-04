@@ -78,7 +78,7 @@ static_assert(sizeof(Point) == 16, "Point must stay 16 bytes, as on the device")
 
 struct PointBatch{
 	string file = "";
-	int first = 0;
+	uint64_t first = 0;   // index of its first point in the file; an int wrapped past 2^31
 	int count = 0;
 	shared_ptr<vector<Point>> points;
 	PinnedMemorySlot pinnedMem;
@@ -394,6 +394,18 @@ uint32_t loadKeepPer10k            = 10000;
 inline uint64_t keptBefore(uint64_t i){ return i * loadKeepPer10k / 10000; }
 inline bool keepPoint(uint64_t i){ return keptBefore(i + 1) != keptBefore(i); }
 
+// Points in batches a loader could not read: the file moved, locked or
+// damaged during the load. skipUnreadableBatch takes such a batch off the
+// totals, or the load never counted as finished (no refill, no colour grid,
+// and --exit and --shots waited for ever). The main loop reports the count.
+atomic_uint64_t g_pointsUnreadable = 0;
+static void skipUnreadableBatch(const PointBatch& batch){
+	uint64_t kept = keptBefore(batch.first + uint64_t(batch.count)) - keptBefore(batch.first);
+	g_pointsUnreadable += kept;
+	numPointsTotal     -= kept;
+	numBatchesTotal--;
+}
+
 // How far the construct kernel has got, for the loader and uploader threads to
 // gate on. Copied from stats after each readback: the main thread overwrites
 // the stats struct itself every frame while those threads would be reading it.
@@ -444,6 +456,10 @@ static void logLine(const char* fmt, ...){
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
+
+	// loader threads log a file they cannot read, often several at once
+	static std::mutex mtx_log;
+	std::lock_guard<std::mutex> lock(mtx_log);
 
 	fputs(buf, stdout);
 
@@ -614,6 +630,8 @@ static std::vector<std::string> splitCsvLine(const std::string& line){
 	return f;
 }
 
+static void notice(const char* fmt, ...);   // one line on screen for three seconds, defined below
+
 static void loadCallSchedule(const std::string& path){
 	g_calls.clear();
 	std::ifstream in(path);
@@ -644,6 +662,10 @@ static void loadCallSchedule(const std::string& path){
 		g_calls.push_back(c);
 	}
 	g_callsLoaded = !g_calls.empty();
+	if(g_callsLoaded && g_callsInSurvey && !g_surveyValid){
+		logLine("[calls] calls.csv is marked as survey coordinates, but no survey frame is fitted: positions used as file coordinates\n");
+		notice("calls.csv is marked as survey coordinates, but there is no survey fit: positions used as file (LAS) coordinates");
+	}
 	std::cout << "[calls] loaded " << g_calls.size() << " calls from " << path;
 	if(skipped > 0) std::cout << " (" << skipped << " malformed rows skipped, see log)";
 	std::cout << std::endl;
@@ -745,6 +767,36 @@ static void jacobiMaxEigenvector4(double N[4][4], double q[4]){
 	for(int k = 0; k < 4; k++) q[k] = V[k][best];
 }
 
+// Eigenvalues of a symmetric 3x3 by cyclic Jacobi, as above, largest first.
+static void jacobiEigenvalues3(double A[3][3], double ev[3]){
+	for(int sweep = 0; sweep < 50; sweep++){
+		double off  = A[0][1]*A[0][1] + A[0][2]*A[0][2] + A[1][2]*A[1][2];
+		double diag = A[0][0]*A[0][0] + A[1][1]*A[1][1] + A[2][2]*A[2][2];
+		if(off <= 1e-30 * diag) break;
+		for(int p = 0; p < 2; p++){
+			for(int r = p + 1; r < 3; r++){
+				if(std::fabs(A[p][r]) < 1e-300) continue;
+				double theta = (A[r][r] - A[p][p]) / (2.0 * A[p][r]);
+				double t = (theta >= 0.0 ? 1.0 : -1.0) / (std::fabs(theta) + std::sqrt(theta*theta + 1.0));
+				double c = 1.0 / std::sqrt(t*t + 1.0);
+				double s = t * c;
+				for(int k = 0; k < 3; k++){           // rotate columns p and r
+					double kp = A[k][p], kr = A[k][r];
+					A[k][p] = c*kp - s*kr;
+					A[k][r] = s*kp + c*kr;
+				}
+				for(int k = 0; k < 3; k++){           // rotate rows p and r
+					double pk = A[p][k], rk = A[r][k];
+					A[p][k] = c*pk - s*rk;
+					A[r][k] = s*pk + c*rk;
+				}
+			}
+		}
+	}
+	ev[0] = A[0][0]; ev[1] = A[1][1]; ev[2] = A[2][2];
+	for(int i = 0; i < 2; i++) for(int j = 0; j < 2 - i; j++) if(ev[j] < ev[j + 1]) std::swap(ev[j], ev[j + 1]);
+}
+
 // Fit from every marker that has survey coordinates. Fills g_surveyR/T and
 // writes each marker's residual to the log. Returns false with fewer than
 // three pairs, which is the minimum for a unique rigid motion in 3D.
@@ -770,6 +822,32 @@ static bool fitSurveyFrame(){
 		cb[0] += bx[i]; cb[1] += by[i]; cb[2] += bz[i];
 	}
 	for(int k = 0; k < 3; k++){ ca[k] /= n; cb[k] /= n; }
+
+	// The markers must not lie on one line: any rotation about that line
+	// leaves them in place, so the fit cannot tell those rotations apart, and
+	// still reports a small rms. Their spread off their best line is the root
+	// of the second-largest eigenvalue of their scatter, per marker. A pick
+	// error e turns the frame about the line by about e / spread radians:
+	// with 1 cm and a 1 m spread that is 0.6 degrees, which moves a call 20 m
+	// from the line by 0.2 m; with a 5 cm spread it is 11 degrees. Below 5 cm
+	// the fit is refused, below 1 m it is made with a warning.
+	double spread = 0.0;
+	{
+		double C[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
+		for(int i = 0; i < n; i++){
+			double a[3] = {ax[i]-ca[0], ay[i]-ca[1], az[i]-ca[2]};
+			for(int r = 0; r < 3; r++) for(int c = 0; c < 3; c++) C[r][c] += a[r]*a[c];
+		}
+		double ev[3];
+		jacobiEigenvalues3(C, ev);
+		spread = std::sqrt(std::max(ev[1], 0.0) / n);
+	}
+	if(spread < 0.05){
+		logLine("[survey] the %d markers lie on one line (%.3f m off it), so the rotation about it is undetermined; place a marker away from that line\n", n, spread);
+		notice("Survey fit refused: the markers lie on one line (%.3f m off it). Add a marker away from that line.", spread);
+		g_surveyValid = false;
+		return false;
+	}
 
 	// cross-covariance, file (left) against survey (right): S_ab = sum a_i b_i
 	double S[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
@@ -829,7 +907,12 @@ static bool fitSurveyFrame(){
 		f << "R " << R[0]<<" "<<R[1]<<" "<<R[2]<<" "<<R[3]<<" "<<R[4]<<" "<<R[5]<<" "<<R[6]<<" "<<R[7]<<" "<<R[8] << "\n";
 		f << "t " << g_surveyT[0] << " " << g_surveyT[1] << " " << g_surveyT[2] << "\n";
 	}
-	notice("Survey frame fitted from %d markers: yaw %.1f deg, rms %.3f m (see log)", n, yawDeg, g_surveyRms);
+	logLine("[survey] the markers spread %.2f m off their best line\n", spread);
+	if(spread < 1.0){
+		notice("Survey frame fitted from %d markers, but they lie close to one line (%.2f m off it): the rotation about it is uncertain. Add a marker away from that line.", n, spread);
+	}else{
+		notice("Survey frame fitted from %d markers: yaw %.1f deg, rms %.3f m (see log)", n, yawDeg, g_surveyRms);
+	}
 	return true;
 }
 
@@ -1581,7 +1664,10 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		if(untouched && totalI > 0){
 			settings.targetPoints = totalI;
 		}
-		lastTotal = totalI;
+		// A drop zeroes the stats. Remembering that 0 made the old cloud's total
+		// look like a target the user had set, so a newly dropped cloud was
+		// drawn at old total / new total of its points.
+		if(totalI > 0) lastTotal = totalI;
 		if(total > 0.0){
 			double d = double(settings.targetPoints) / total;
 			settings.pointDensity = float(d < 0.001 ? 0.001 : (d > 1.0 ? 1.0 : d));
@@ -2233,6 +2319,7 @@ void reload(){
 	boxSize = float3{0.0, 0.0, 0.0};
 
 	numPointsTotal  = 0;
+	g_pointsUnreadable = 0;
 	numPointsLoaded = 0;
 	numBatchesTotal = 0;
 	numBytesTotal   = 0;
@@ -2277,7 +2364,7 @@ void reload(){
 			for (uint64_t first = 0; first < header.numPoints; first += MAX_BATCH_SIZE) {
 				PointBatch batch;
 				batch.file = path;
-				batch.first = static_cast<int>(first);
+				batch.first = first;
 				batch.count = static_cast<int>(std::min(header.numPoints - first, MAX_BATCH_SIZE));
 				batch.lasHeader = header;
 
@@ -2304,7 +2391,7 @@ void reload(){
 			for(uint64_t first = 0; first < numPoints; first += MAX_BATCH_SIZE){
 				PointBatch batch;
 				batch.file = path;
-				batch.first = static_cast<int>(first);
+				batch.first = first;
 				batch.count = static_cast<int>(std::min(numPoints - first, MAX_BATCH_SIZE));
 
 				batchesToProcess.push_back(batch);
@@ -2478,7 +2565,10 @@ void spawnLoader(size_t i, int maxLazThreads) {
 
 		while (true) {
 			bool everythingIsDone = batchStreamUploadIndex == numBatchesTotal;
-			bool processingLagsBehind = numPointsLoaded > pointsProcessedHost + MAX_DECODED_AHEAD * MAX_BATCH_SIZE;
+			// in kept points: with --set keep a batch holds that fraction of
+			// MAX_BATCH_SIZE but still fills a whole pinned slot, and the
+			// unscaled limit let the loaders pin 1/keep times as many batches
+			bool processingLagsBehind = numPointsLoaded > pointsProcessedHost + keptBefore(MAX_DECODED_AHEAD * MAX_BATCH_SIZE);
 
 			// if (processingLagsBehind) {
 			// 	printfmt("processing lags behind\n");
@@ -2561,7 +2651,8 @@ void spawnLoader(size_t i, int maxLazThreads) {
 					// One reader per batch, destroyed at the end: it was created and
 					// never destroyed, leaking a reader for every batch of every load.
 					if(laszip_create(&laszip_reader) != 0 || laszip_reader == nullptr){
-						logLine("[load] laszip_create failed for %s\n", batch.file.c_str());
+						logLine("[load] laszip_create failed for %s; %d points skipped\n", batch.file.c_str(), batch.count);
+						skipUnreadableBatch(batch);
 						pinnedMemPool.release(pinnedMemSlot);
 						numThreadsLoading--;
 						continue;
@@ -2570,8 +2661,9 @@ void spawnLoader(size_t i, int maxLazThreads) {
 					if(laszip_open_reader(laszip_reader, batch.file.c_str(), &is_compressed) != 0){
 						laszip_CHAR* err = nullptr;
 						laszip_get_error(laszip_reader, &err);
-						logLine("[load] cannot open %s: %s\n", batch.file.c_str(), err ? err : "unknown laszip error");
+						logLine("[load] cannot open %s: %s; %d points skipped\n", batch.file.c_str(), err ? err : "unknown laszip error", batch.count);
 						laszip_destroy(laszip_reader);
+						skipUnreadableBatch(batch);
 						pinnedMemPool.release(pinnedMemSlot);
 						numThreadsLoading--;
 						continue;
@@ -3391,6 +3483,15 @@ int main(int argc, char** argv){
 			// }
 			
 
+			{   // batches a loader could not read (skipUnreadableBatch)
+				static uint64_t reportedUnreadable = 0;
+				uint64_t unreadable = g_pointsUnreadable.load();
+				if(unreadable != reportedUnreadable){
+					reportedUnreadable = unreadable;
+					if(unreadable > 0) notice("Could not read part of the input: %.2f M points skipped (see log)", double(unreadable) / 1e6);
+				}
+			}
+
 			bool newLastBatchFinishedDevice = stats.numPointsProcessed == uint64_t(numPointsTotal);
 			if(stats.memCapacityReached){
 				newLastBatchFinishedDevice = true;
@@ -3433,7 +3534,12 @@ int main(int argc, char** argv){
 				}
 				bool open = ImGui::Begin(title);
 				bool nowCollapsed = ImGui::IsWindowCollapsed();
-				if(!nowCollapsed){
+				if(!nowCollapsed && collapsedState && savedSize.x > 0.0f){
+					// just expanded: ImGui applied the narrow collapsed width
+					// before expanding, so restore the saved size rather than
+					// record the narrow one over it (as GLRenderer's Performance)
+					ImGui::SetWindowSize(savedSize, ImGuiCond_Always);
+				}else if(!nowCollapsed){
 					ImVec2 s = ImGui::GetWindowSize();
 					if(s.x > 0.0f) savedSize = s;
 				}
@@ -3924,7 +4030,12 @@ int main(int argc, char** argv){
 			ImGui::Begin("Stats");
 			{
 				bool nc = ImGui::IsWindowCollapsed();
-				if(!nc){ ImVec2 s = ImGui::GetWindowSize(); if(s.x > 0.0f) statsSaved = s; }
+				if(!nc && statsCollapsed && statsSaved.x > 0.0f){
+					ImGui::SetWindowSize(statsSaved, ImGuiCond_Always);   // just expanded, as beginPanel
+				}else if(!nc){
+					ImVec2 s = ImGui::GetWindowSize();
+					if(s.x > 0.0f) statsSaved = s;
+				}
 				statsCollapsed = nc;
 			}
 

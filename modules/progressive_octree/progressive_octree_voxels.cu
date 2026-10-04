@@ -142,15 +142,16 @@ bool doCounting(
 
 	auto countPoint = [&](Point point){
 
-		// node coordinate at MAX_DEPTH
-		uint32_t X = fGridSize * (point.x - octreeMin.x) / octreeSize;
-		uint32_t Y = fGridSize * (point.y - octreeMin.y) / octreeSize;
-		uint32_t Z = fGridSize * (point.z - octreeMin.z) / octreeSize;
+		// node coordinate at MAX_DEPTH; the far face goes in the last cell
+		// (MAX_DEPTH_LAST_CELL), the same in all three traversals
+		uint32_t X = min(uint32_t(fGridSize * (point.x - octreeMin.x) / octreeSize), MAX_DEPTH_LAST_CELL);
+		uint32_t Y = min(uint32_t(fGridSize * (point.y - octreeMin.y) / octreeSize), MAX_DEPTH_LAST_CELL);
+		uint32_t Z = min(uint32_t(fGridSize * (point.z - octreeMin.z) / octreeSize), MAX_DEPTH_LAST_CELL);
 
 		// integer point coordinate relative to root node
-		uint32_t pX = MAX_DEPTH_GRIDSIZE * (point.x - octreeMin.x) / octreeSize;
-		uint32_t pY = MAX_DEPTH_GRIDSIZE * (point.y - octreeMin.y) / octreeSize;
-		uint32_t pZ = MAX_DEPTH_GRIDSIZE * (point.z - octreeMin.z) / octreeSize;
+		uint32_t pX = min(uint32_t(MAX_DEPTH_GRIDSIZE * (point.x - octreeMin.x) / octreeSize), MAX_DEPTH_GRID_LAST_CELL);
+		uint32_t pY = min(uint32_t(MAX_DEPTH_GRIDSIZE * (point.y - octreeMin.y) / octreeSize), MAX_DEPTH_GRID_LAST_CELL);
+		uint32_t pZ = min(uint32_t(MAX_DEPTH_GRIDSIZE * (point.z - octreeMin.z) / octreeSize), MAX_DEPTH_GRID_LAST_CELL);
 
 		Node* current = root;
 
@@ -427,15 +428,16 @@ void voxelSampling(
 
 	auto traverse = [&](Point point){
 
-		// node coordinate at MAX_DEPTH
-		uint32_t X = fGridSize * (point.x - octreeMin.x) / octreeSize;
-		uint32_t Y = fGridSize * (point.y - octreeMin.y) / octreeSize;
-		uint32_t Z = fGridSize * (point.z - octreeMin.z) / octreeSize;
+		// node coordinate at MAX_DEPTH; the far face goes in the last cell
+		// (MAX_DEPTH_LAST_CELL), the same in all three traversals
+		uint32_t X = min(uint32_t(fGridSize * (point.x - octreeMin.x) / octreeSize), MAX_DEPTH_LAST_CELL);
+		uint32_t Y = min(uint32_t(fGridSize * (point.y - octreeMin.y) / octreeSize), MAX_DEPTH_LAST_CELL);
+		uint32_t Z = min(uint32_t(fGridSize * (point.z - octreeMin.z) / octreeSize), MAX_DEPTH_LAST_CELL);
 
 		// integer point coordinate relative to root node
-		uint32_t pX = MAX_DEPTH_GRIDSIZE * (point.x - octreeMin.x) / octreeSize;
-		uint32_t pY = MAX_DEPTH_GRIDSIZE * (point.y - octreeMin.y) / octreeSize;
-		uint32_t pZ = MAX_DEPTH_GRIDSIZE * (point.z - octreeMin.z) / octreeSize;
+		uint32_t pX = min(uint32_t(MAX_DEPTH_GRIDSIZE * (point.x - octreeMin.x) / octreeSize), MAX_DEPTH_GRID_LAST_CELL);
+		uint32_t pY = min(uint32_t(MAX_DEPTH_GRIDSIZE * (point.y - octreeMin.y) / octreeSize), MAX_DEPTH_GRID_LAST_CELL);
+		uint32_t pZ = min(uint32_t(MAX_DEPTH_GRIDSIZE * (point.z - octreeMin.z) / octreeSize), MAX_DEPTH_GRID_LAST_CELL);
 
 		Node* current = root;
 
@@ -554,10 +556,10 @@ void insertPoints(
 
 	// point: where it goes (as doCounting saw it); stored: what is written
 	auto insertPoint = [&](Point point, StoredPoint stored){
-		// node coordinate at MAX_DEPTH
-		uint32_t X = fGridSize * (point.x - octreeMin.x) / octreeSize;
-		uint32_t Y = fGridSize * (point.y - octreeMin.y) / octreeSize;
-		uint32_t Z = fGridSize * (point.z - octreeMin.z) / octreeSize;
+		// node coordinate at MAX_DEPTH, clamped as in doCounting
+		uint32_t X = min(uint32_t(fGridSize * (point.x - octreeMin.x) / octreeSize), MAX_DEPTH_LAST_CELL);
+		uint32_t Y = min(uint32_t(fGridSize * (point.y - octreeMin.y) / octreeSize), MAX_DEPTH_LAST_CELL);
+		uint32_t Z = min(uint32_t(fGridSize * (point.z - octreeMin.z) / octreeSize), MAX_DEPTH_LAST_CELL);
 
 		Node* current = root;
 
@@ -609,6 +611,12 @@ void insertPoints(
 		// Count it (Stats::numDroppedPoints, in the load summary) and print the
 		// first one only: a print per point floods the print buffer.
 		if(chunk == nullptr){
+			// Give the slot back, so numPoints stays the number of points the
+			// chunks hold: every reader walks the chunk list that far, and a
+			// node with points but no chunk faulted the refill and the draw.
+			// Only slots at or past the chunks' capacity get here, so the count
+			// never falls below the capacity and no stored slot is given twice.
+			atomicSub(&leaf->numPoints, 1u);
 			uint32_t numDroppedBefore = atomicAdd(&stats->numDroppedPoints, 1);
 			if(numDroppedBefore == 0){
 				cudaprint->print("chunk is NULL: {} \n", (const char*)leaf->name);

@@ -34,6 +34,12 @@ constexpr int MAX_DEPTH_GRIDSIZE_LOG2 = 28;
 constexpr float MAX_DEPTH_GRIDSIZE   = 268'435'456.0f;   // 2^MAX_DEPTH_GRIDSIZE_LOG2
 static_assert(MAX_DEPTH_GRIDSIZE == float(1u << MAX_DEPTH_GRIDSIZE_LOG2), "MAX_DEPTH_GRIDSIZE must be 2^MAX_DEPTH_GRIDSIZE_LOG2");
 static_assert(MAX_DEPTH_GRIDSIZE_LOG2 - GRID_SIZE_LOG2 >= MAX_DEPTH, "voxel cells must not be finer than the full-depth grid");
+// Last cell index of the node grid at MAX_DEPTH and of the full-depth grid. A
+// point on the cube's far face (the maximum of its longest axis) computes
+// 2^MAX_DEPTH, whose low bits are all zero, and was filed down the minimum
+// side at every level; kernel_construct clamps it into the last cell.
+constexpr uint32_t MAX_DEPTH_LAST_CELL    = (1u << MAX_DEPTH) - 1u;
+constexpr uint32_t MAX_DEPTH_GRID_LAST_CELL = (1u << MAX_DEPTH_GRIDSIZE_LOG2) - 1u;
 
 // BATCH_STREAM_SIZE is in HostDeviceInterface.h, shared with the host
 
