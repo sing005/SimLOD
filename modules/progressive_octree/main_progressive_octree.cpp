@@ -3592,7 +3592,14 @@ int main(int argc, char** argv){
 					tipFor("Angle spanned top to bottom of the frame. 180 puts the horizon at the frame edge with the camera looking straight up; wider sees below it. The sides of a 16:9 frame reach further still.");
 				}
 				ImGui::Separator();
-				ImGui::SliderFloat("Eye height (m)",   &settings.eyeHeight,      0.2f, 10.0f, "%.2f");
+				// It only set the height Go to centre used, so moving it changed
+				// nothing on screen. Now the camera rises or drops to it, keeping
+				// its place over the ground and where it looks.
+				if(ImGui::SliderFloat("Eye height (m)",   &settings.eyeHeight,      0.2f, 10.0f, "%.2f")){
+					glm::dvec3 pos = renderer->controls->getPosition();
+					renderer->controls->target.z += double(settings.eyeHeight) - pos.z;
+				}
+				tipFor("Height of the camera above the lowest point of the cloud. Moving the slider moves the camera up or down; Go to centre uses this height too.");
 				// live in both directions: dragging the slider tilts the camera now,
 				// and tilting the camera with the mouse moves the slider
 				if(ImGui::SliderFloat("Look up (deg)",    &settings.lookUpDeg,    -89.0f, 89.0f)){
