@@ -3723,7 +3723,7 @@ int main(int argc, char** argv){
 				}
 				ImGui::Separator();
 				ImGui::SliderFloat("Sunbeams",         &settings.sunbeams,       0.0f,   4.0f);
-				tipFor("The key light (Light) scattered by the haze where the canopy lets it through, so the light shows in the air between the trunks. Needs Depth haze above 0 and the key light on. At 0 the haze gets only the ambient light. Marched at quarter resolution with Volume steps and Volume reach, below; more steps give smoother beams at more cost.");
+				tipFor("The key light (Light) scattered by the haze where the canopy lets it through, so the light shows in the air between the trunks. Needs Depth haze above 0 and the key light on; in front of the sky and below the horizon, Haze over sky as well. At 0 the haze gets only the ambient light. Marched at quarter resolution with Volume steps and Volume reach, below; more steps give smoother beams at more cost.");
 				ImGui::SliderFloat("Forward scatter",  &settings.sunAnisotropy,  0.0f,   0.9f);
 				tipFor("How much brighter the haze looks facing the light than with the light behind you (Henyey-Greenstein g). 0 scatters the same in every direction; at 0.5 the haze facing the light is 27 times brighter than facing away. Water droplets scatter strongly forward.");
 				ImGui::SliderInt  ("Volume steps",      &settings.volSteps,         8,     128);
