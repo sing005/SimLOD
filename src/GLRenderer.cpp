@@ -28,6 +28,8 @@ void error_callback(int error, const char* description){
 
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods){
 
+	if(GLRenderer::inputLocked) return;
+
 	cout << "key: " << key << ", scancode: " << scancode << ", action: " << action << ", mods: " << mods << endl;
 
 	if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
@@ -41,7 +43,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 
 static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos){
 	ImGuiIO& io = ImGui::GetIO();
-	if(io.WantCaptureMouse){
+	if(io.WantCaptureMouse || GLRenderer::inputLocked){
 		return;
 	}
 	
@@ -52,7 +54,7 @@ static void cursor_position_callback(GLFWwindow* window, double xpos, double ypo
 
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset){
 	ImGuiIO& io = ImGui::GetIO();
-	if(io.WantCaptureMouse){
+	if(io.WantCaptureMouse || GLRenderer::inputLocked){
 		return;
 	}
 
@@ -71,7 +73,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 	// cout << "start button: " << button << ", action: " << action << ", mods: " << mods << endl;
 
 	ImGuiIO& io = ImGui::GetIO();
-	if(io.WantCaptureMouse){
+	if(io.WantCaptureMouse || GLRenderer::inputLocked){
 		return;
 	}
 
@@ -109,7 +111,7 @@ void GLRenderer::init(){
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 	glfwWindowHint(GLFW_DECORATED, true);
 	glfwWindowHint(GLFW_RESIZABLE, true);
-	glfwWindowHint(GLFW_VISIBLE, true);
+	glfwWindowHint(GLFW_VISIBLE, !startHidden);
 
 	int numMonitors;
 	GLFWmonitor** monitors = glfwGetMonitors(&numMonitors);
@@ -251,6 +253,13 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 		// WINDOW
 		int width, height;
 		glfwGetWindowSize(window, &width, &height);
+		this->windowWidth = width;
+		this->windowHeight = height;
+		// a fixed render size, if one is set, independent of the window
+		if(renderWidth > 0 && renderHeight > 0 && width > 0 && height > 0){
+			width = renderWidth;
+			height = renderHeight;
+		}
 		camera->setSize(width, height);
 		this->width = width;
 		this->height = height;
@@ -373,18 +382,43 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 			ImGui::End();
 		}
 
-		ImGui::Render();
-		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
+		// Present: scale the rendered frame to the window, then draw the UI on
+		// top at window size. The UI used to be drawn into the frame itself,
+		// which only works while frame and window are the same size; this
+		// also leaves the frame free of UI for screenshots.
+		// A frame of another shape than the window (--render) is letterboxed,
+		// not stretched.
 		auto source = view.framebuffer;
+		presentX = 0;
+		presentY = 0;
+		presentWidth  = this->windowWidth;
+		presentHeight = this->windowHeight;
+		if(source->width > 0 && source->height > 0 && this->windowWidth > 0 && this->windowHeight > 0){
+			int64_t frameByWindow = int64_t(source->width) * this->windowHeight;
+			int64_t windowByFrame = int64_t(this->windowWidth) * source->height;
+			if(frameByWindow > windowByFrame){        // frame wider: bars top and bottom
+				presentHeight = int(windowByFrame / source->width);
+			}else if(frameByWindow < windowByFrame){  // frame taller: bars left and right
+				presentWidth = int(frameByWindow / source->height);
+			}
+			presentX = (this->windowWidth  - presentWidth)  / 2;
+			presentY = (this->windowHeight - presentHeight) / 2;
+		}
+
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glViewport(0, 0, this->windowWidth, this->windowHeight);
+		if(presentWidth != this->windowWidth || presentHeight != this->windowHeight){
+			glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+			glClear(GL_COLOR_BUFFER_BIT);
+		}
 		glBlitNamedFramebuffer(
 			source->handle, 0,
 			0, 0, source->width, source->height,
-			0, 0, 0 + source->width, 0 + source->height,
+			presentX, presentY, presentX + presentWidth, presentY + presentHeight,
 			GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
-		glViewport(0, 0, this->width, this->height);
+		ImGui::Render();
+		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
 
 		glfwSwapBuffers(window);
