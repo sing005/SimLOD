@@ -61,7 +61,9 @@ Time and memory, measured in a 4-core cloud session:
 | `column_3m.laz` | 4.8 M | 64 s | | 1.3 GB |
 | `every100.laz` | 3.5 M | 66 s | 33 s | 1.2 GB |
 
-Memory grows by about 0.35 GB per million points processed at once. Tiles larger than `--slab-points` (12 M) are processed in slabs, so a worker needs at most about 4.5 GB. The log reports the largest tile after the split. The full scan has not been run with this version.
+A worker's memory depends on how many points it holds at once: about 0.32 GB per million points, measured on `column_3m.laz` and on a 58 M-point tile made of copies of it. A tile with at most `--slab-points` own points (12 M) is held whole, with its halo. A denser tile is read from disk one slab at a time. A slab is a band across the tile with up to 12 M own points, held together with the points within 0.6 m of it, its context. Near the scanner the full scan's slabs are only about 1 m wide, so the context holds more points than the slab: up to about 27 M points in all, which needs about 10 GB (estimated from `every100.laz`). After the split, the log reports the most points a worker will hold at once and the memory that needs. Earlier versions also held each dense tile whole while working through its slabs, which added about 6 GB for the densest tile of the full scan. The output is the same, except with `--texture` on a scan with dense tiles: its fit now measures such a tile slab by slab, so pairs of points in different slabs are no longer compared. The full scan has not been run with this version.
+
+A quick test on the full scan: `--crop 8 -4 12 0` recolours a 4 × 4 m patch, about 3.4 M points with 16 % blown, through the full canopy height. A patch around the scanner is not a quick test: `--crop -10 -10 10 10` holds half the scan.
 
 ## What the samples showed
 

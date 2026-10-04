@@ -128,7 +128,9 @@ The docstring gives the method. In order, the steps are:
   - `--show paths` shows which step coloured each point.
   - Detected page centres go to `OUT_pages.csv`, in the viewer's `markers.csv` format.
 - The full scans (3–4 GB, 346–455 M points) live only on the local machine.
-  - The tool streams them through 16 m ground tiles with a 0.6 m halo. Tiles over `--slab-points` (12 M) are cut into slabs, so a worker needs at most about 4.5 GB; memory is about 0.35 GB per million points processed at once.
+  - The tool streams them through 16 m ground tiles with a 0.6 m halo. A tile over `--slab-points` (12 M own points) is read from disk one slab at a time.
+  - Memory is about 0.32 GB per million points a worker holds at once: a slab's own points plus those within 0.6 m of it. Near the scanner the slabs are about 1 m wide and their context holds more points than they do, so the full scan needs up to about 27 M points, about 10 GB, per worker. The log reports this after the split.
+  - A quick test on a full scan: `--crop 8 -4 12 0`, about 3.4 M points. A patch around the scanner such as `--crop -10 -10 10 10` holds half the scan.
   - `--workers N` processes tiles in parallel and gives identical output.
   - This version has not been run on a full scan. The samples take about a minute each with one worker in a 4-core cloud session; the previous version took about 15 minutes for a full scan on the 20-thread laptop.
 - Judge the results in SimLOD at 4K, with Scan clean-up > "Fix blown-out canopy" off. That checkbox is a separate, on-the-fly repair inside the viewer.
