@@ -70,6 +70,9 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 	libs/glew/include)
 target_sources(${PROJECT_NAME} PRIVATE
 	libs/glew/glew.c)
+# glew.c is compiled into the exe, so the header must not declare its symbols
+# as dllimport; without this every GL entry point raised C4273 (~3,600 warnings)
+target_compile_definitions(${PROJECT_NAME} PRIVATE GLEW_STATIC)
 
 ## GLFW
 include(cmake/glfw.cmake)

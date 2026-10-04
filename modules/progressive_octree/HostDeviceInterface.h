@@ -10,6 +10,41 @@ struct mat4{
 
 #define MAX_EVENTS 16
 
+// ---- buffer sizes shared by the host and the kernels ---------------------
+
+// Upload ring: device slots of one batch (MAX_BATCH_SIZE points, 16 MB) each,
+// filled by the uploader and drained by kernel_construct. The kernel adds
+// about one batch per frame, so a few slots keep it fed; the loaders decode
+// further ahead into pinned host memory (MAX_DECODED_AHEAD on the host).
+// Was 50 slots, 800 MB of VRAM.
+constexpr uint64_t BATCH_STREAM_SIZE = 8;
+
+// kernel_construct's scratch (momentary) buffer. The capacities live here so
+// the host allocates exactly what the kernel lays out; it was a fixed 1.2 GB
+// of which 409 MB was used.
+constexpr uint64_t CONSTRUCT_VOXEL_BACKLOG  = 10'000'000;   // voxel samples: a 16 B point and an 8 B node pointer each
+constexpr uint64_t CONSTRUCT_SPILLING_NODES = 100'000;      // node pointers, 8 B
+constexpr uint64_t CONSTRUCT_SPILLED_POINTS = 10'000'000;   // 12 B stored points; written unchecked, re-inserted only up to 3 M
+constexpr uint64_t CONSTRUCT_SCRATCH_FIXED_BYTES =
+	  CONSTRUCT_VOXEL_BACKLOG  * (16 + 8)
+	+ CONSTRUCT_SPILLING_NODES * 8
+	+ CONSTRUCT_SPILLED_POINTS * 12
+	+ 4096;                                                  // counters and 16-byte alignment
+// After the fixed part comes the chunk queue: one 8 B entry for every point
+// chunk the octree pool can hold (pool / CHUNK_BYTES + 1), because chunks
+// freed by a split are queued there for reuse. It was a fixed 1 M entries,
+// which a pool over 16 GB could overflow. The host sizes it from total VRAM.
+constexpr uint64_t CHUNK_BYTES = 12'016;                     // sizeof(Chunk): 1000 12-byte points + header; checked in structures.cuh
+
+// kernel_render's scratch starts with a list of up to MAX_VISIBLE_NODES copies
+// of struct Node. The host sizes that buffer from these (renderBufferBytesFor),
+// so a field added to Node must update NODE_BYTES: when the LOD cross-fade
+// grew Node from 152 to 168 B, every frame under ~2.1 Mpx overran the buffer
+// and drew nothing. Fisheye disables frustum culling, so wide lenses inside a
+// large cloud can exceed the cap; writes past it are dropped.
+constexpr uint32_t MAX_VISIBLE_NODES = 100'000;
+constexpr uint64_t NODE_BYTES        = 168;                  // sizeof(Node); checked in structures.cuh
+
 struct Uniforms{
 	float width;
 	float height;
@@ -24,6 +59,7 @@ struct Uniforms{
 
 	uint64_t persistentBufferCapacity;
 	uint64_t momentaryBufferCapacity;
+	uint64_t renderBufferCapacity;      // kernel_render draws nothing if its layout would not fit
 
 	uint64_t frameCounter;
 	
@@ -141,6 +177,23 @@ struct Uniforms{
 	float    sunbeams;          // key light scattered by the haze; 0 = haze gets ambient only
 	float    sunAnisotropy;     // Henyey-Greenstein g: 0 even, toward 1 brighter facing the light
 
+	// blown-out colour repair: the scanner's camera whites out the sunlit canopy
+	uint64_t colourGridPtr;     // per occupancy cell, uint64: see render.cu, colour repair
+	int      whiteFix;          // 1 = recolour blown-out points from their neighbours
+	float    whiteLevel;        // darkest channel at or above this ...
+	float    whiteSpread;       // ... and channels within this of each other = blown out
+	int      whiteReach;        // cells searched for a colour when a cell has none
+	float    tintMargin;        // blue above green by more than this = sky cast; 0 = off
+
+	// torch: a spotlight from the camera, aimed through the mouse pixel
+	int      torchOn;
+	float    torchX;            // frame pixel the torch points through (y up, as pickY)
+	float    torchY;
+	float    torchIntensity;    // added light at the beam centre, 1 m away
+	float    torchCosInner;     // cos of the half-angle of the full-strength core
+	float    torchCosOuter;     // cos of the half-angle where the beam ends
+	float    torchRange;        // metres at which the light has fallen to half
+
 	// regroup (apply_regroup.ps1)
 	int      lightOn;           // key light switch
 	float    nearClip;          // metres: points nearer than this are not drawn
@@ -172,13 +225,7 @@ struct Uniforms{
 	float    belowG;
 	float    belowB;
 
-	// find the checkerboards (fix_walk_targets.ps1)
-	int      findTargets;       // 1 = paint bright points magenta
-	float    findThreshold;     // sRGB byte value all three channels must exceed
 	float    markerScale;       // marker cluster size, metres
-	float    findGrey;          // max allowed spread between R, G and B
-	int      findIsolate;       // 1 = draw ONLY matches, everything else hidden
-	int      findBoost;         // extra splat pixels for a match
 	float    horizonSoftness;   // degrees the sky-to-void blend spans; 0 = hard edge
 	float eventX[MAX_EVENTS];
 	float eventY[MAX_EVENTS];
@@ -209,7 +256,6 @@ struct Stats{
 	uint32_t numDrawn                   = 0;   // apply_sweep_fixes.ps1
 	uint64_t stageNs[8]                 = {0,0,0,0,0,0,0,0};   // apply_stage_timers.ps1: ns since kernel start at each stage boundary
 	int      pickValid                  = 0;   // apply_navigate.ps1: a pick landed on geometry
-	uint32_t numTargets                 = 0;   // fix_find_targets.ps1: points matching the target test
 	float    pickWX                     = 0;   // its position, renderer frame
 	float    pickWY                     = 0;
 	float    pickWZ                     = 0;
@@ -222,6 +268,9 @@ struct Stats{
 	uint64_t numAllocatedChunks         = 0;
 	uint64_t chunkPoolSize              = 0;
 	uint32_t dbg                        = 0;
+	uint32_t numDroppedPoints           = 0;   // points whose leaf had no chunk for them; not stored
+	uint32_t numRingMismatches          = 0;   // upload-ring slots refilled before the kernel had finished their batch
+	uint32_t numClampedPoints           = 0;   // points outside the box, stored on its faces (header bounds too small)
 
 	bool memCapacityReached             = false;
 };

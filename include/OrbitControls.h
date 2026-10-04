@@ -108,6 +108,13 @@ struct OrbitControls{
 			return;
 		}
 
+		// torch mode: keep track of the cursor so the camera does not jump
+		// when it ends, but do not turn or pan
+		if(Runtime::torchMode){
+			mousePos = {xpos, ypos};
+			return;
+		}
+
 		
 		glm::dvec2 newMousePos = {xpos, ypos};
 		glm::dvec2 diff = newMousePos - mousePos;
