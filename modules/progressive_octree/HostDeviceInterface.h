@@ -45,13 +45,16 @@ struct Uniforms{
 	bool enableEDL;
 	float edlStrength;
 
-	// tier 1 shading (inserted by apply_tier1_shading.ps1)
+	// tier 1 shading
 	bool  roundSplats;
 	bool  enableFog;
-	float fogDensity;
-	float fogR;
+	float fogDensity;        // haze extinction per metre, at and below fogBase
+	float fogR;              // haze colour, linear (the host converts the picker's sRGB)
 	float fogG;
 	float fogB;
+	float fogHeightFalloff;  // per metre: 0 = even haze; above 0 it thins with height
+	float fogBase;           // metres above the lowest point: full density at and below
+	int   fogSky;            // 1 = the haze also lies between the camera and the sky
 	bool  enableBloom;
 	float bloomThreshold;
 	float bloomStrength;
@@ -122,7 +125,7 @@ struct Uniforms{
 	float    grain;             // film grain amplitude
 	float    vignette;          // corner darkening 0..1
 
-	// directional key light (apply_keylight.ps1)
+	// directional key light
 	uint64_t lightGridPtr;      // per-cell transmittance toward the light, 0..1
 	float    lightDirX;         // unit vector TOWARD the light
 	float    lightDirY;
@@ -131,10 +134,12 @@ struct Uniforms{
 	float    lightG;
 	float    lightB;
 	float    lightIntensity;
-	float    ambient;           // floor, so shadowed points are not black
-	float    lightAbsorb;       // extinction per occupied cell along the ray
+	float    ambient;           // floor, so shadowed points (and haze) are not black
+	float    lightAbsorb;       // extinction per metre inside occupied cells
 	int      lightSteps;        // cells marched toward the light
 	int      lightDirty;        // 1 = rebuild the transmittance grid this frame
+	float    sunbeams;          // key light scattered by the haze; 0 = haze gets ambient only
+	float    sunAnisotropy;     // Henyey-Greenstein g: 0 even, toward 1 brighter facing the light
 
 	// regroup (apply_regroup.ps1)
 	int      lightOn;           // key light switch

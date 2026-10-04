@@ -405,6 +405,147 @@ inline uint32_t applyKeyLight(uint32_t c, float trans){
 	return (c & 0xff000000u) | (bi << 16) | (gi << 8) | ri;
 }
 
+// ---- haze and sunbeams ------------------------------------------------------
+// The haze is a medium whose extinction per metre is fogDensity at and below
+// fogBase, falling off exponentially above it:
+//
+//   sigma(z) = a                        z <= h0
+//   sigma(z) = a * exp(-b * (z - h0))   z >  h0
+//
+// with a = fogDensity, b = fogHeightFalloff and h0 = fogBase (renderer frame,
+// z = 0 at the lowest point). b = 0 is the even haze this replaced. Along a
+// straight ray the optical depth has a closed form, so the composite applies
+// the haze to every pixel exactly, at full resolution, without marching.
+//
+// The haze is lit the way the key light lights a point: an ambient share that
+// reaches all of it, and the key light's share where the canopy lets it
+// through. The ambient share is the same everywhere, so it also has a closed
+// form, colour * (1 - transmittance), applied in the composite. The key light's
+// share changes along the ray with the canopy's shade, so the volumetric pass
+// marches it through the light grid. Looking toward the light, the lit haze
+// between the trunks shows as beams.
+
+// The sky is taken to lie this far away, beyond any haze. Rays toward it are
+// this long when the haze covers the sky, and the volumetric upsample uses it
+// as the sky's distance.
+constexpr float SKY_DISTANCE = 1.0e7f;
+
+// The key light changes nothing unless it is on with some strength; the same
+// test applyKeyLight makes.
+inline bool keyLightActive(){
+	return uniforms.lightOn != 0 && uniforms.lightIntensity > 0.0f;
+}
+
+inline float hazeDensityAt(float z){
+	float a = uniforms.fogDensity;
+	float b = uniforms.fogHeightFalloff;
+	if(b <= 0.0f || z <= uniforms.fogBase) return a;
+	return a * __expf(-b * (z - uniforms.fogBase));
+}
+
+// Optical depth of the haze along z(s) = z0 + dz * s, for s from 0 to len.
+// The density depends only on height, so the integral is the same in either
+// direction along the segment. It is taken from the lower end upward, where
+// every exponent is zero or negative and nothing can overflow, even on the
+// 1e7 m rays the composite uses for the sky.
+inline float hazeOpticalDepth(float z0, float dz, float len){
+	float a = uniforms.fogDensity;
+	if(!(len > 0.0f) || a <= 0.0f) return 0.0f;
+	float b = uniforms.fogHeightFalloff;
+	if(b <= 0.0f) return a * len;
+
+	float h0  = uniforms.fogBase;
+	float z1  = z0 + dz * len;
+	float zlo = fminf(z0, z1);
+	float zhi = fmaxf(z0, z1);
+
+	// the part of the segment at or below h0 has the full density
+	float below = 0.0f;
+	if(zhi <= h0)     below = len;
+	else if(zlo < h0) below = len * (h0 - zlo) / (zhi - zlo);
+	float tau = a * below;
+
+	// above h0, starting at height zs and rising |dz| per metre of ray:
+	//   integral of a * exp(-b * (zs + |dz| u - h0)) du over u from 0 to above
+	//   = a * exp(-b * (zs - h0)) * above * (1 - exp(-x)) / x,   x = b |dz| above
+	// with the last factor taken from its series where x is too small to divide by
+	float above = len - below;
+	if(above > 0.0f){
+		float zs    = fmaxf(zlo, h0);
+		float x     = b * fabsf(dz) * above;
+		float shape = (x < 1e-3f) ? 1.0f - 0.5f * x + x * x * (1.0f / 6.0f)
+								  : (1.0f - __expf(-x)) / x;
+		tau += a * __expf(-b * (zs - h0)) * above * shape;
+	}
+	return tau;
+}
+
+// Beams need the key light, some haze, and some light left above the ambient
+// floor for the beams to add.
+inline bool sunbeamsOn(){
+	return keyLightActive() && uniforms.enableFog && uniforms.fogDensity > 0.0f
+		&& uniforms.sunbeams > 0.0f && uniforms.ambient < 1.0f;
+}
+
+// Henyey-Greenstein phase function (Henyey & Greenstein 1941), multiplied by
+// 4 pi so that g = 0, scattering the same in every direction, gives 1.
+// cosTheta is the cosine between the view ray and the direction toward the
+// light: 1 when looking straight at the light, where g > 0 is brightest.
+inline float phaseHG(float cosTheta, float g){
+	float g2 = g * g;
+	float d  = fmaxf(1.0f + g2 - 2.0f * g * cosTheta, 1e-6f);
+	return (1.0f - g2) / (d * sqrtf(d));
+}
+
+// Light the haze sends toward the camera per unit of optical depth, from the
+// ambient share. With the key light off this is the haze colour as picked;
+// with it on, the haze in shade darkens with the points in shade, and is
+// tinted by the light colour as they are.
+inline float3 hazeAmbientColour(){
+	float3 f = float3{uniforms.fogR, uniforms.fogG, uniforms.fogB};
+	if(!keyLightActive()) return f;
+	float k = uniforms.ambient;
+	return float3{f.x * k * uniforms.lightR, f.y * k * uniforms.lightG, f.z * k * uniforms.lightB};
+}
+
+// The key light's share, before the canopy's shade and the phase function
+// are applied. Zero unless beams are on.
+inline float3 hazeSunColour(){
+	if(!sunbeamsOn()) return float3{0.0f, 0.0f, 0.0f};
+	float k = (1.0f - uniforms.ambient) * uniforms.lightIntensity * uniforms.sunbeams;
+	return float3{uniforms.fogR * k * uniforms.lightR,
+				  uniforms.fogG * k * uniforms.lightG,
+				  uniforms.fogB * k * uniforms.lightB};
+}
+
+// One light grid cell. Outside the grid there is no canopy above, so full light.
+inline float lightCell(int cx, int cy, int cz){
+	if(cx < 0 || cy < 0 || cz < 0) return 1.0f;
+	if(cx >= uniforms.gridX || cy >= uniforms.gridY || cz >= uniforms.gridZ) return 1.0f;
+	return ((const float*)uniforms.lightGridPtr)[cx + uniforms.gridX * (cy + uniforms.gridY * cz)];
+}
+
+// lightAt, interpolated between cell centres. A point takes its own cell's
+// value, but haze marched through whole cells comes out in cell-sized steps,
+// which near the camera show on screen as blocks along the beams.
+inline float lightAtSmooth(float px, float py, float pz){
+	if(uniforms.lightGridPtr == 0) return 1.0f;
+	float c  = uniforms.cellSize;
+	float fx = px / c - 0.5f;
+	float fy = py / c - 0.5f;
+	float fz = pz / c - 0.5f;
+	int   x0 = int(floorf(fx)), y0 = int(floorf(fy)), z0 = int(floorf(fz));
+	float tx = fx - float(x0), ty = fy - float(y0), tz = fz - float(z0);
+
+	float c00 = lightCell(x0, y0,     z0    ) * (1.0f - tx) + lightCell(x0 + 1, y0,     z0    ) * tx;
+	float c10 = lightCell(x0, y0 + 1, z0    ) * (1.0f - tx) + lightCell(x0 + 1, y0 + 1, z0    ) * tx;
+	float c01 = lightCell(x0, y0,     z0 + 1) * (1.0f - tx) + lightCell(x0 + 1, y0,     z0 + 1) * tx;
+	float c11 = lightCell(x0, y0 + 1, z0 + 1) * (1.0f - tx) + lightCell(x0 + 1, y0 + 1, z0 + 1) * tx;
+	float c0  = c00 * (1.0f - ty) + c10 * ty;
+	float c1  = c01 * (1.0f - ty) + c11 * ty;
+	return c0 * (1.0f - tz) + c1 * tz;
+}
+
 // ---- survey marker balls (apply_markers2.ps1) -----------------------------
 // A picked checkerboard centre, drawn as a filled disc of a fixed WORLD
 // diameter (markerScale, default 0.10 m) in magenta, which nothing in a
@@ -1772,8 +1913,23 @@ void compute_visibility_add(
 	grid.sync();
 }
 
+// The host launches this with 256-thread blocks (workgroupSize in renderCUDA),
+// as many as fit on each SM, and every stage of the frame shares those
+// threads. Two blocks fit only at 128 registers per thread or fewer. The
+// kernel used about 120 on every generation measured (Maxwell 52, Volta 70,
+// Turing 75, Ampere 86, Ada 89) until the haze composite pushed the compiler
+// toward 140, which would halve the threads drawing points even with the
+// haze off. The bound keeps two blocks; the few registers the composite
+// gives up are spilled there, once per pixel, not in the point loops.
+// Pascal already ran one block (about 130 registers) and is left unbounded.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600 && __CUDA_ARCH__ < 700
+#define RENDER_LAUNCH_BOUNDS
+#else
+#define RENDER_LAUNCH_BOUNDS __launch_bounds__(256, 2)
+#endif
+
 extern "C" __global__
-void kernel_render(
+void RENDER_LAUNCH_BOUNDS kernel_render(
 	uint32_t* buffer,
 	const Uniforms _uniforms,
 	Node* nodes,
@@ -1831,11 +1987,13 @@ void kernel_render(
 	float* bloomChain = allocator->alloc<float*>((int(uniforms.width) * int(uniforms.height) + 8192) * sizeof(float));
 
 	// volumetric scattering, accumulated at quarter resolution. Volumetrics are
-	// low frequency, so a quarter-res march upsampled bilinearly is
-	// indistinguishable from full res and sixteen times cheaper.
+	// low frequency, so a quarter-res march upsampled is indistinguishable from
+	// full res and sixteen times cheaper. Four floats per pixel: RGB, and the
+	// distance to the surface the ray sees (SKY_DISTANCE for sky), which the
+	// upsample matches against each full-res pixel's own.
 	int volW = int(uniforms.width)  / 4; if(volW < 1) volW = 1;
 	int volH = int(uniforms.height) / 4; if(volH < 1) volH = 1;
-	float* volBuf = allocator->alloc<float*>(volW * volH * 3 * sizeof(float));
+	float* volBuf = allocator->alloc<float*>(volW * volH * 4 * sizeof(float));
 	if(grid.thread_rank() == 0){ _numEmitting = 0; _numDrawn = 0; _numTargets = 0; }
 
 	// Recount the occupancy grid first: the light grid below is derived from
@@ -2277,17 +2435,29 @@ void kernel_render(
 	//  carries every field, including the emitting count via Stats)
 
 	if(grid.thread_rank() == 0) stats->stageNs[3] = nanotime() - tStart;   // apply_stage_timers.ps1
-	// ---- volumetric medium (apply_volumetric.ps1) -----------------------
+	// ---- volumetric light -------------------------------------------------
 	// The reason light only landed on leaves and trunks: those were the only
 	// things in the scene. Real forest light scatters off the AIR - that is
 	// why a lamp in mist has a body rather than only illuminating what it
-	// touches. This marches a ray per quarter-res pixel through a participating
-	// medium, accumulating light from every active event at each step.
+	// touches. This marches a ray per quarter-res pixel and accumulates light
+	// scattered toward the camera from two kinds of source.
 	//
-	// The voxel grid does two jobs here. Occupied cells add extinction, so
-	// trunks and canopy cast shafts rather than glowing through. And the medium
-	// is suppressed inside them, since solid wood is not air.
-	if(uniforms.enableVolumetric && uniforms.numEvents > 0){
+	// Calls light the volumetric medium (Advanced). The voxel grid does two
+	// jobs there. Occupied cells add extinction, so trunks and canopy cast
+	// shafts rather than glowing through. And the medium is suppressed inside
+	// them, since solid wood is not air.
+	//
+	// The key light lights the haze (Depth haze), shaded by the canopy through
+	// the light grid: the sunbeams. The haze's ambient share and its extinction
+	// of whatever lies behind it are applied in closed form in the composite;
+	// only the part that changes along the ray with the canopy's shade is
+	// marched here.
+	bool volEvents = uniforms.enableVolumetric && uniforms.numEvents > 0;
+	bool volSun    = sunbeamsOn();
+	if(volEvents || volSun){
+
+		// constant over the frame; the phase function is constant along each ray
+		float3 sunCol = hazeSunColour();
 
 		processRange(0, volW * volH, [&](int i){
 			int vx = i % volW;
@@ -2296,9 +2466,10 @@ void kernel_render(
 			// volBuf is scratch memory that also serves other kernels, and the
 			// composite reads every entry, so clear it before any early return
 			// (fisheye corners beyond the lens, or nothing to march through).
-			volBuf[3*i + 0] = 0.0f;
-			volBuf[3*i + 1] = 0.0f;
-			volBuf[3*i + 2] = 0.0f;
+			volBuf[4*i + 0] = 0.0f;
+			volBuf[4*i + 1] = 0.0f;
+			volBuf[4*i + 2] = 0.0f;
+			volBuf[4*i + 3] = SKY_DISTANCE;
 
 			// Ray through the centre of this quarter-res pixel.
 			float3 dir;
@@ -2314,11 +2485,11 @@ void kernel_render(
 			uint32_t dbits = uint32_t(fbv >> 32);
 			float viewDepth = *((float*)&dbits);
 
-			float tMax = uniforms.volMaxDist;
-			if(viewDepth > 0.0f && viewDepth < 1.0e30f){
-				float d = depthToDistance(viewDepth, dir);
-				if(d < tMax) tMax = d;
-			}
+			// distance to what this ray sees: a surface, or the sky
+			bool  sky   = !(viewDepth > 0.0f && viewDepth < 1.0e30f);
+			float tSurf = sky ? SKY_DISTANCE : depthToDistance(viewDepth, dir);
+			float tMax  = fminf(tSurf, uniforms.volMaxDist);
+			volBuf[4*i + 3] = tSurf;
 			if(tMax <= 0.0f) return;
 
 			int   steps = uniforms.volSteps;
@@ -2331,100 +2502,145 @@ void kernel_render(
 			float jitter = insectUnit(h);
 
 			float accR = 0.0f, accG = 0.0f, accB = 0.0f;
-			float trans = 1.0f;
+			float trans    = 1.0f;   // calls: transmittance through the medium so far
+			float sunAcc   = 0.0f;   // key light: lit optical depth, before colour and phase
+			float sunTrans = 1.0f;   // key light: transmittance through the haze so far
+			bool  eventsLive = volEvents;
+			bool  sunLive    = volSun;
 
-			for(int s = 0; s < steps; s++){
+			for(int s = 0; s < steps && (eventsLive || sunLive); s++){
 				float t = (float(s) + jitter) * dt;
 				float px = uniforms.camPos.x + dir.x * t;
 				float py = uniforms.camPos.y + dir.y * t;
 				float pz = uniforms.camPos.z + dir.z * t;
 
-				// medium density: uniform, optionally pooled near the ground
-				float dens = uniforms.volDensity;
-				if(uniforms.volHeightFalloff > 0.0f){
-					dens *= __expf(-fmaxf(pz, 0.0f) * uniforms.volHeightFalloff);   // apply_markers2.ps1: below z=0 this grew without bound
-				}
+				bool occupied = uniforms.useVoxelGrid && gridCountAtPos(px, py, pz) > 0;
 
-				// occupied cells are solid: no medium, and they block
-				float extinction = dens;
-				if(uniforms.useVoxelGrid && gridCountAtPos(px, py, pz) > 0){
-					dens = 0.0f;
-					extinction += uniforms.volOcclusion;
-				}
+				if(eventsLive){
+					// medium density: uniform, optionally pooled near the ground
+					float dens = uniforms.volDensity;
+					if(uniforms.volHeightFalloff > 0.0f){
+						dens *= __expf(-fmaxf(pz, 0.0f) * uniforms.volHeightFalloff);   // below z=0 this grew without bound
+					}
 
-				if(dens > 0.0f){
-					// Per event, with a SHADOW RAY. Without this the medium is
-					// a featureless ball of glow: extinction along the view ray
-					// alone never asks whether the path from the light to this
-					// sample is blocked, so a point behind a trunk is lit as
-					// brightly as one in the open. Marching a short ray back
-					// towards the source is what produces shafts and dappling.
-					//
-					// Naturally sparse: samples outside every event radius skip
-					// the whole thing, and most of the volume is outside.
-					float sR = 0.0f, sG = 0.0f, sB = 0.0f;
+					// occupied cells are solid: no medium, and they block
+					float extinction = dens;
+					if(occupied){
+						dens = 0.0f;
+						extinction += uniforms.volOcclusion;
+					}
 
-					for(int e = 0; e < uniforms.numEvents; e++){
-						float dx = uniforms.eventX[e] - px;
-						float dy = uniforms.eventY[e] - py;
-						float dz = uniforms.eventZ[e] - pz;
-						float rr = uniforms.eventR[e];
-						float d2 = dx*dx + dy*dy + dz*dz;
-						if(d2 > rr * rr) continue;
+					if(dens > 0.0f){
+						// Per event, with a SHADOW RAY. Without this the medium is
+						// a featureless ball of glow: extinction along the view ray
+						// alone never asks whether the path from the light to this
+						// sample is blocked, so a point behind a trunk is lit as
+						// brightly as one in the open. Marching a short ray back
+						// towards the source is what produces shafts and dappling.
+						//
+						// Naturally sparse: samples outside every event radius skip
+						// the whole thing, and most of the volume is outside.
+						float sR = 0.0f, sG = 0.0f, sB = 0.0f;
 
-						float d = sqrt(d2);
-						if(d < 1e-4f) d = 1e-4f;
-						float v = uniforms.eventI[e] * uniforms.emissionGain
-								* eventFalloff(d, rr);
+						for(int e = 0; e < uniforms.numEvents; e++){
+							float dx = uniforms.eventX[e] - px;
+							float dy = uniforms.eventY[e] - py;
+							float dz = uniforms.eventZ[e] - pz;
+							float rr = uniforms.eventR[e];
+							float d2 = dx*dx + dy*dy + dz*dz;
+							if(d2 > rr * rr) continue;
 
-						int ss = uniforms.volShadowSteps;
-						if(ss > 0 && uniforms.useVoxelGrid && uniforms.voxelGridPtr != 0){
-							float sdt = d / float(ss + 1);
-							float ux = dx / d, uy = dy / d, uz = dz / d;
-							float shadow = 1.0f;
-							for(int k = 1; k <= ss; k++){
-								float q = float(k) * sdt;
-								if(gridCountAtPos(px + ux*q, py + uy*q, pz + uz*q) > 0){
-									shadow *= __expf(-uniforms.volOcclusion * sdt);
-									if(shadow < 0.02f) break;
+							float d = sqrt(d2);
+							if(d < 1e-4f) d = 1e-4f;
+							float v = uniforms.eventI[e] * uniforms.emissionGain
+									* eventFalloff(d, rr);
+
+							int ss = uniforms.volShadowSteps;
+							if(ss > 0 && uniforms.useVoxelGrid && uniforms.voxelGridPtr != 0){
+								float sdt = d / float(ss + 1);
+								float ux = dx / d, uy = dy / d, uz = dz / d;
+								float shadow = 1.0f;
+								for(int k = 1; k <= ss; k++){
+									float q = float(k) * sdt;
+									if(gridCountAtPos(px + ux*q, py + uy*q, pz + uz*q) > 0){
+										shadow *= __expf(-uniforms.volOcclusion * sdt);
+										if(shadow < 0.02f) break;
+									}
 								}
+								v *= shadow;
 							}
-							v *= shadow;
+
+							sR += v * uniforms.eventCR[e];
+							sG += v * uniforms.eventCG[e];
+							sB += v * uniforms.eventCB[e];
 						}
 
-						sR += v * uniforms.eventCR[e];
-						sG += v * uniforms.eventCG[e];
-						sB += v * uniforms.eventCB[e];
+						if(sR + sG + sB > 0.0f){
+							float w = trans * dens * uniforms.volScatter * dt;
+							accR += sR * w;
+							accG += sG * w;
+							accB += sB * w;
+						}
 					}
 
-					if(sR + sG + sB > 0.0f){
-						float w = trans * dens * uniforms.volScatter * dt;
-						accR += sR * w;
-						accG += sG * w;
-						accB += sB * w;
-					}
+					trans *= __expf(-extinction * dt);
+					if(trans < 0.003f) eventsLive = false;   // fully occluded, nothing more to add
 				}
 
-				trans *= __expf(-extinction * dt);
-				if(trans < 0.003f) break;   // fully occluded, nothing more to add
+				if(sunLive){
+					// Haze at this height, lit by whatever the canopy lets through
+					// to this sample. The step is integrated exactly for constant
+					// density, (1 - exp(-ext dt)) / ext rather than dt, so dense haze
+					// over a long step is not over-counted. Foliage along the view
+					// ray that this pixel does not show dims what lies behind it,
+					// at the same per-metre canopy density the light grid uses.
+					float sigma = hazeDensityAt(pz);
+					float ext   = sigma + (occupied ? uniforms.lightAbsorb : 0.0f);
+					float att   = __expf(-ext * dt);
+					float w     = ext > 1e-6f ? (1.0f - att) / ext : dt;
+					float lit   = sunTrans * sigma * w;
+					if(lit > 1e-6f) sunAcc += lit * lightAtSmooth(px, py, pz);   // skip 8 reads high above thinning haze
+					sunTrans *= att;
+					if(sunTrans < 0.003f) sunLive = false;
+				}
 			}
 
-			volBuf[3*i + 0] = accR;
-			volBuf[3*i + 1] = accG;
-			volBuf[3*i + 2] = accB;
+			if(volSun){
+				// Past Medium reach there is no canopy left to shade the haze, so
+				// the rest of the ray, out to the surface or, with Haze over sky,
+				// to the sky, is lit throughout. Its share has a closed form:
+				// what got through to the reach, times the part of that the haze
+				// beyond scatters.
+				float tEnd = sky ? (uniforms.fogSky != 0 ? SKY_DISTANCE : 0.0f) : tSurf;
+				if(tEnd > tMax && sunLive){
+					float tau = hazeOpticalDepth(uniforms.camPos.z + dir.z * tMax, dir.z, tEnd - tMax);
+					sunAcc += sunTrans * (1.0f - __expf(-tau));
+				}
+
+				float cosT = dir.x * uniforms.lightDirX + dir.y * uniforms.lightDirY + dir.z * uniforms.lightDirZ;
+				float s = sunAcc * phaseHG(cosT, uniforms.sunAnisotropy);
+				accR += sunCol.x * s;
+				accG += sunCol.y * s;
+				accB += sunCol.z * s;
+			}
+
+			volBuf[4*i + 0] = accR;
+			volBuf[4*i + 1] = accG;
+			volBuf[4*i + 2] = accB;
 		});
 		grid.sync();
 
 	}else{
 		processRange(0, volW * volH, [&](int i){
-			volBuf[3*i + 0] = 0.0f;
-			volBuf[3*i + 1] = 0.0f;
-			volBuf[3*i + 2] = 0.0f;
+			volBuf[4*i + 0] = 0.0f;
+			volBuf[4*i + 1] = 0.0f;
+			volBuf[4*i + 2] = 0.0f;
+			volBuf[4*i + 3] = SKY_DISTANCE;
 		});
 		grid.sync();
 	}
 
-	// ---- tier 1 shading composite (inserted by apply_tier1_shading.ps1) ----
+	// ---- tier 1 shading composite ------------------------------------------
 	{
 		struct Pixel { uint32_t color; float depth; };
 		Pixel* fb = (Pixel*)framebuffer;
@@ -2547,7 +2763,16 @@ void kernel_render(
 		}
 
 		if(grid.thread_rank() == 0) stats->stageNs[5] = nanotime() - tStart;   // apply_stage_timers.ps1
-		// ---- composite: fog, bloom, exposure, tone map, encode --------
+		// ---- composite: haze, light, grade, exposure, tone map, encode ------
+		// Each pixel has two parts. The scene is light from geometry and from
+		// the air in front of it (haze, emission, volumetric light, bloom), and
+		// it is graded. The backdrop is the sky, or the void below the horizon,
+		// seen through any haze in front of it, and it keeps the exact colour
+		// it was given. Every step of the grade is linear in RGB, so this is
+		// the whole pixel graded with the backdrop left out: haze and beams in
+		// front of the sky are graded the same as in front of the trunk beside
+		// it, and nothing changes colour at the silhouette.
+		bool volActive = (uniforms.enableVolumetric && uniforms.numEvents > 0) || sunbeamsOn();
 		processRange(0, W * H, [&](int pixelIndex){
 
 			int x = pixelIndex % W;
@@ -2555,21 +2780,32 @@ void kernel_render(
 
 			Pixel p = fb[pixelIndex];
 
-			float r = srgbToLinear(float((p.color >>  0) & 0xff));
-			float g = srgbToLinear(float((p.color >>  8) & 0xff));
-			float b = srgbToLinear(float((p.color >> 16) & 0xff));
+			float cr = srgbToLinear(float((p.color >>  0) & 0xff));
+			float cg = srgbToLinear(float((p.color >>  8) & 0xff));
+			float cb = srgbToLinear(float((p.color >> 16) & 0xff));
 
 			// Background was cleared with depth = +infinity (0x7f800000).
-			// It must not be fogged, or the sky fogs into itself.
 			bool isGeometry = (p.depth > 0.0f) && (p.depth < 1.0e30f);
 
-			// Below the horizon (apply_navigate.ps1): an empty pixel looking
-			// downward is the void under the ground, not sky. Painted the
-			// "below" colour, black by default, as a game engine would. A
-			// narrow blend across the horizon so it does not cut.
-			if(!isGeometry){
-				float3 rd;
-				if(pixelRayDir(float(x) + 0.5f, float(y) + 0.5f, rd)){
+			// This pixel's view ray and, for geometry, the distance along it.
+			// Perspective stores view-plane depth, which is shorter than the
+			// path through the haze everywhere off the image centre.
+			float3 rd;
+			bool  haveRay = pixelRayDir(float(x) + 0.5f, float(y) + 0.5f, rd);
+			float dist    = (isGeometry && haveRay) ? depthToDistance(p.depth, rd) : 0.0f;
+
+			float r  = 0.0f, g  = 0.0f, b  = 0.0f;   // scene, graded
+			float kr = 0.0f, kg = 0.0f, kb = 0.0f;   // backdrop, not graded
+			if(isGeometry){
+				r = cr; g = cg; b = cb;
+			}else{
+				kr = cr; kg = cg; kb = cb;
+
+				// Below the horizon (apply_navigate.ps1): an empty pixel looking
+				// downward is the void under the ground, not sky. Painted the
+				// "below" colour, black by default, as a game engine would. A
+				// narrow blend across the horizon so it does not cut.
+				if(haveRay){
 					// The blend used a fixed 0.5 - rd.z*25, which spans about
 					// 1.2 degrees either side of level: at any field of view
 					// that is a HARD EDGE, and it reads as a drawn line across
@@ -2588,18 +2824,27 @@ void kernel_render(
 						t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
 						f = t * t * (3.0f - 2.0f * t);      // smoothstep
 					}
-					r = r * (1.0f - f) + srgbToLinear(uniforms.belowR * 255.0f) * f;
-					g = g * (1.0f - f) + srgbToLinear(uniforms.belowG * 255.0f) * f;
-					b = b * (1.0f - f) + srgbToLinear(uniforms.belowB * 255.0f) * f;
+					kr = kr * (1.0f - f) + srgbToLinear(uniforms.belowR * 255.0f) * f;
+					kg = kg * (1.0f - f) + srgbToLinear(uniforms.belowG * 255.0f) * f;
+					kb = kb * (1.0f - f) + srgbToLinear(uniforms.belowB * 255.0f) * f;
 				}
 			}
 
-			if(uniforms.enableFog && isGeometry){
-				float f = 1.0f - __expf(-p.depth * uniforms.fogDensity);
-				f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
-				r = r * (1.0f - f) + uniforms.fogR * f;
-				g = g * (1.0f - f) + uniforms.fogG * f;
-				b = b * (1.0f - f) + uniforms.fogB * f;
+			// ---- haze -------------------------------------------------
+			// Exact for the height profile in hazeOpticalDepth, with the sky at
+			// SKY_DISTANCE: a ray level with or below the camera never leaves
+			// the haze and sees only haze, while a ray climbing out of haze
+			// that thins with height sees the sky through what lies below it.
+			// With Haze over sky off, the sky is left as it was, since even
+			// haze would cover it completely. The key light's share is added
+			// with the volumetric light below.
+			if(uniforms.enableFog && haveRay && (isGeometry || uniforms.fogSky != 0)){
+				float T = __expf(-hazeOpticalDepth(uniforms.camPos.z, rd.z, isGeometry ? dist : SKY_DISTANCE));
+				float3 amb = hazeAmbientColour();
+				r  = r  * T + amb.x * (1.0f - T);
+				g  = g  * T + amb.y * (1.0f - T);
+				b  = b  * T + amb.z * (1.0f - T);
+				kr *= T; kg *= T; kb *= T;
 			}
 
 			// unblurred emission core, before the blurred halo
@@ -2607,8 +2852,16 @@ void kernel_render(
 			g += _emission[3 * pixelIndex + 1];
 			b += _emission[3 * pixelIndex + 2];
 
-			// volumetric medium, bilinear from quarter resolution
-			if(uniforms.enableVolumetric){
+			// Volumetric light from quarter resolution. The march stopped at the
+			// geometry under one pixel of each 4x4 block, so beside a silhouette
+			// a neighbouring sample may have marched far past the trunk this
+			// pixel shows, or stopped at a trunk this pixel sees past. Each of
+			// the four bilinear neighbours is weighted by how closely the
+			// distance it saw matches this pixel's own (joint bilateral
+			// upsampling, Kopf et al. 2007, with distance as the guide), so lit
+			// haze behind a trunk does not spread onto its edge. If none match,
+			// the closest is used alone.
+			if(volActive){
 				float fvx = (float(x) + 0.5f) * 0.25f - 0.5f;
 				float fvy = (float(y) + 0.5f) * 0.25f - 0.5f;
 				int vx0 = int(fvx); vx0 = vx0 < 0 ? 0 : (vx0 >= volW ? volW-1 : vx0);
@@ -2618,14 +2871,34 @@ void kernel_render(
 				float ux = fvx - float(vx0); ux = ux < 0.0f ? 0.0f : (ux > 1.0f ? 1.0f : ux);
 				float uy = fvy - float(vy0); uy = uy < 0.0f ? 0.0f : (uy > 1.0f ? 1.0f : uy);
 
-				int j00 = 3*(vx0 + volW*vy0), j10 = 3*(vx1 + volW*vy0);
-				int j01 = 3*(vx0 + volW*vy1), j11 = 3*(vx1 + volW*vy1);
-				float q00 = (1.0f-ux)*(1.0f-uy), q10 = ux*(1.0f-uy);
-				float q01 = (1.0f-ux)*uy,        q11 = ux*uy;
+				// the distance to what this pixel sees, as the march records it
+				float tPix = isGeometry ? dist : SKY_DISTANCE;
+				float inv  = 1.0f / fmaxf(tPix, 0.01f);
 
-				r += volBuf[j00+0]*q00 + volBuf[j10+0]*q10 + volBuf[j01+0]*q01 + volBuf[j11+0]*q11;
-				g += volBuf[j00+1]*q00 + volBuf[j10+1]*q10 + volBuf[j01+1]*q01 + volBuf[j11+1]*q11;
-				b += volBuf[j00+2]*q00 + volBuf[j10+2]*q10 + volBuf[j01+2]*q01 + volBuf[j11+2]*q11;
+				float vr = 0.0f, vg = 0.0f, vb = 0.0f, wSum = 0.0f;
+				int   best = 0;
+				float bestDiff = 1.0e30f;
+				for(int k = 0; k < 4; k++){
+					int   j    = 4 * (((k & 1) ? vx1 : vx0) + volW * ((k & 2) ? vy1 : vy0));
+					float q    = ((k & 1) ? ux : 1.0f - ux) * ((k & 2) ? uy : 1.0f - uy);
+					float diff = fabsf(volBuf[j + 3] - tPix) * inv;   // relative
+					float w    = q * __expf(-50.0f * diff * diff);    // 10% apart: 0.6, 30%: 0.01
+					vr   += w * volBuf[j + 0];
+					vg   += w * volBuf[j + 1];
+					vb   += w * volBuf[j + 2];
+					wSum += w;
+					if(diff < bestDiff){ bestDiff = diff; best = j; }
+				}
+				if(wSum > 1e-4f){
+					float n = 1.0f / wSum;
+					r += vr * n;
+					g += vg * n;
+					b += vb * n;
+				}else{
+					r += volBuf[best + 0];
+					g += volBuf[best + 1];
+					b += volBuf[best + 2];
+				}
 			}
 
 			if(uniforms.enableBloom){
@@ -2650,11 +2923,13 @@ void kernel_render(
 				b += s * (bloomChain[i00+2]*w00 + bloomChain[i10+2]*w10 + bloomChain[i01+2]*w01 + bloomChain[i11+2]*w11);
 			}
 
-			// ---- colour grading (apply_features.ps1) ---------------------
-			// Geometry only: the sky keeps the exact colour it was given, and
-			// emission has already been added, so light sources are graded with
-			// the surfaces they sit on rather than separately.
-			if(isGeometry){
+			// ---- colour grading -------------------------------------------
+			// The scene only: the backdrop keeps the exact colour it was given,
+			// and is added after. Emission has already been added, so light
+			// sources are graded with the surfaces they sit on rather than
+			// separately. On an empty pixel with nothing in front of the sky the
+			// scene is zero and every step below leaves it zero.
+			{
 				// tint mix: pull the colour towards a chosen tint
 				// channel mixer (apply_regroup.ps1): plain per-channel gain in
 				// linear light, before everything else in the grade
@@ -2687,6 +2962,11 @@ void kernel_render(
 					if(b < 0.0f) b = 0.0f;
 				}
 			}
+
+			// the backdrop, ungraded, behind everything graded above
+			r += kr;
+			g += kg;
+			b += kb;
 
 			// vignette (apply_look.ps1): quadratic falloff from the centre, in
 			// linear light so it darkens rather than greys
