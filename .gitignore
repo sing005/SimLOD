@@ -36,6 +36,7 @@ log/
 *.log
 markers.csv
 
-# point-cloud data (too large for git)
+# point-cloud data (too large for git), except the small development samples
 *.las
 *.laz
+!data/samples/*.laz
