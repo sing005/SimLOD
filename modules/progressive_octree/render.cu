@@ -851,10 +851,6 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 		}else if(uniforms.colorByLOD){
 			color = getLodColor(node->level);
 		}else{
-			// ground band (apply_regroup.ps1): everything within groundHeight of
-			// the lowest point takes the ground colour. z is in the translated
-			// frame, so the lowest point is at 0.
-			// (ground band removed by apply_navigate.ps1: points keep their scanned colour)
 			color = repairColour(color, point.x, point.y, point.z);   // blown-out canopy
 			uint32_t base = color;
 			if(uniforms.lightOn != 0) color = applyKeyLight(color, lightAt(point.x, point.y, point.z));   // gated: no grid read while off
@@ -2318,7 +2314,6 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 
 	grid.sync();
 	
-	// if(uniforms.doUpdateVisibility)
 	{
 		if(visiblityMethod == VISIBLITY_DISJUNCT){
 			compute_visibility_disjunct(
@@ -2696,7 +2691,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	// touches. This marches a ray per quarter-res pixel and accumulates light
 	// scattered toward the camera from two kinds of source.
 	//
-	// Calls light the volumetric medium (Advanced). The voxel grid does two
+	// Calls light the volumetric medium (Calls). The voxel grid does two
 	// jobs there. Occupied cells add extinction, so trunks and canopy cast
 	// shafts rather than glowing through. And the medium is suppressed inside
 	// them, since solid wood is not air.

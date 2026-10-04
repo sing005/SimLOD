@@ -106,4 +106,4 @@ An offline Python tool, separate from the viewer. It rewrites the colour of the 
 - Install with `pip install -r tools/requirements-recolour.txt` (laspy with lazrs, numpy, scipy).
 - Develop on `data/samples/`; its README describes the files, their coordinates and the colour encoding. For example: `python tools/recolour_canopy.py data/samples/every100.laz out.laz`.
 - The full scans (3–4 GB, 346–455 M points) live only on the local machine. The tool streams them through 16 m ground tiles with a 0.6 m halo, so memory stays bounded. A full run takes about 15 minutes on the 20-thread laptop.
-- Judge the results in SimLOD at 4K, with Look > "Fix blown-out canopy" off. That checkbox is a separate, on-the-fly repair inside the viewer.
+- Judge the results in SimLOD at 4K, with Scan clean-up > "Fix blown-out canopy" off. That checkbox is a separate, on-the-fly repair inside the viewer.
