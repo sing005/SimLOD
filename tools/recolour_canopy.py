@@ -46,6 +46,9 @@ Each 16 m ground tile is processed with a halo of its neighbours' points:
      class nearby, one colour per cellular patch of about --patch metres
      (Worley 1996), so a branch or a cluster of leaves gets one consistent
      colour instead of a speckle of unrelated ones.
+  7. Optional texture (--texture). Steps 3 and 5 average, so recoloured
+     areas vary less than real foliage. --texture adds back variation fitted,
+     scale by scale, to the gap measured on this scan.
 
 tools/recolour_eval.py reproduces the measurements behind these choices.
 
@@ -55,6 +58,10 @@ References
   Weinmann, Jutzi & Mallet (2014) ISPRS Annals II-3: 181-188 (eigenvalue features).
   Wang, Momo Takoudjou & Casella (2020) Methods Ecol. Evol. 11(3): 376-389 (LeWoS).
   Worley (1996) SIGGRAPH '96: 291-294 (cellular texture).
+  Perlin (1985) SIGGRAPH '85, doi:10.1145/325165.325247 (lattice noise).
+  Heeger & Bergen (1995) SIGGRAPH '95, doi:10.1145/218380.218446 (matching texture statistics scale by scale).
+  Maraun (2013) J. Climate 26(6): 2137-2143 (adding variation instead of stretching predictions).
+  Cressie (1993) Statistics for Spatial Data, Wiley (semivariance).
   Sharma, Wu & Dalal (2005) Color Res. Appl. 30(1): 21-30 (CIEDE2000).
 
 Usage:
@@ -62,6 +69,7 @@ Usage:
   python recolour_canopy.py IN.laz OUT.laz --crop -10 -10 10 10 # test tile
   python recolour_canopy.py IN.laz OUT.laz --show classes       # structure classes as false colour
   python recolour_canopy.py IN.laz OUT.laz --workers 4          # tiles in parallel (memory x4)
+  python recolour_canopy.py IN.laz OUT.laz --texture 1          # restore the natural variation of colour
 """
 import argparse
 import concurrent.futures
@@ -73,6 +81,7 @@ import time
 
 import laspy
 import numpy as np
+from scipy.optimize import nnls
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
@@ -632,6 +641,127 @@ def palette_colours(q_xyz, q_cls, s_xyz, s_lab, s_cls, gpal, a):
     return out
 
 
+# ---------------------------------------------------------------- texture (--texture)
+# Recolouring averages: the regression pulls towards the mean, and borrowing takes Gaussian means of
+# neighbours. Measured on the samples' canopy, recoloured points keep only 9-24 % of the colour
+# variation that well-exposed foliage has between points under 2 cm apart, and about half at
+# 16-64 cm. --texture adds variation back. Each run measures the semivariance of colour (half the
+# mean squared difference between two points, against their distance; Cressie 1993) of well-exposed
+# foliage near the washed-out areas and of the recoloured points. It then fits the gap with a
+# separate value for every point plus smooth lattice noise (after Perlin 1985) at four scales.
+# Matching the variation scale by scale follows Heeger & Bergen (1995). Adding variation, instead
+# of stretching the predicted colours, follows Maraun (2013), who shows that stretching
+# misrepresents spatial structure.
+
+TEX_EDGES = np.array([0, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64])
+TEX_SCALES = (0.0, 0.02, 0.05, 0.12, 0.30)     # lattice spacing of each component, m; 0 = per point
+_f = np.linspace(0, 1, 100_001); _s = _f * _f * (3 - 2 * _f)
+_LATTICE_SD = float(np.sqrt(np.mean((1 - _s) ** 2 + _s ** 2) ** 3))   # sd of the interpolated noise
+
+
+def semivariance_sums(xyz, lab, n_q=20_000, k=32, seed=0, cap=1_000_000):
+    """Per distance bin (TEX_EDGES): the sum of (c_i - c_j)(c_i - c_j)^T / 2 over sampled pairs, and the pair count.
+
+    For each bin the points are first thinned to one per voxel of half the bin's lower distance,
+    so the k nearest neighbours reach the bin in dense and sparse areas alike. Random thinning
+    leaves the semivariance at a given distance unbiased."""
+    S = np.zeros((len(TEX_EDGES) - 1, 3, 3)); N = np.zeros(len(TEX_EDGES) - 1)
+    rng = np.random.default_rng(seed)
+    xyz = np.asarray(xyz, np.float64); lab = np.asarray(lab, np.float64)
+    if len(xyz) > cap:
+        keep = rng.choice(len(xyz), cap, replace=False); xyz = xyz[keep]; lab = lab[keep]
+    for i, (lo, hi) in enumerate(zip(TEX_EDGES[:-1], TEX_EDGES[1:])):
+        if lo > 0:
+            order = rng.permutation(len(xyz))
+            _, first = np.unique(cell_keys(xyz[order], lo / 2), return_index=True)
+            sel = order[first]
+        else:
+            sel = np.arange(len(xyz))
+        if len(sel) < 10:
+            continue
+        P = xyz[sel]; C = lab[sel]
+        q = rng.choice(len(P), min(n_q, len(P)), replace=False)
+        d, idx = cKDTree(P).query(P[q], k=min(k, len(P)), distance_upper_bound=hi, workers=-1)
+        ok = np.isfinite(d) & (d >= lo) & (d > 0)
+        diff = C[np.repeat(q, d.shape[1])[ok.ravel()]] - C[idx[ok]]
+        S[i] = 0.5 * diff.T @ diff; N[i] = ok.sum()
+    return S, N
+
+
+def _three_units(h):
+    """Three values of unit variance (uniform on +-sqrt 3) from the bits of 64-bit hashes."""
+    m = np.uint64((1 << 21) - 1)
+    u = np.stack([h & m, (h >> np.uint64(21)) & m, (h >> np.uint64(42)) & m], 1).astype(np.float64) / float(1 << 21)
+    return (u - 0.5) * (2 * np.sqrt(3.0))
+
+
+def lattice_noise3(xyz_abs, cell, salt):
+    """Three independent noise fields of unit variance in scan coordinates, so they continue across tiles.
+    cell > 0: values on a lattice of that spacing, interpolated smoothly (after Perlin 1985).
+    cell = 0: a separate value for every point."""
+    if cell <= 0:
+        q = np.floor(np.asarray(xyz_abs) * 1e4).astype(np.int64)
+        return _three_units(hash_ints(q[:, 0], q[:, 1], q[:, 2], np.full(len(q), salt)))
+    p = np.asarray(xyz_abs, np.float64) / cell
+    i0 = np.floor(p).astype(np.int64); f = p - i0
+    s = f * f * (3 - 2 * f)
+    out = np.zeros((len(p), 3))
+    for dx in (0, 1):
+        wx = s[:, 0] if dx else 1 - s[:, 0]
+        for dy in (0, 1):
+            wy = s[:, 1] if dy else 1 - s[:, 1]
+            for dz in (0, 1):
+                wz = s[:, 2] if dz else 1 - s[:, 2]
+                h = hash_ints(i0[:, 0] + dx, i0[:, 1] + dy, i0[:, 2] + dz, np.full(len(p), salt))
+                out += (wx * wy * wz)[:, None] * _three_units(h)
+    return out / _LATTICE_SD
+
+
+def texture_noise(xyz_abs, tex):
+    """The fitted variation (CIELAB) at these points."""
+    out = np.zeros((len(xyz_abs), 3))
+    for k, (cell, v) in enumerate(zip(TEX_SCALES, tex['v'])):
+        if v > 0:
+            out += np.sqrt(v) * lattice_noise3(xyz_abs, cell, 1000 + k)
+    return out @ tex['L'].T
+
+
+def height_above_ground(xyz, cell=2.0):
+    """Height above a simple ground model: the 2nd-percentile z of each 2 m cell (empty cells take the nearest)."""
+    x, y, z = (np.asarray(xyz[:, i], np.float64) for i in range(3))
+    ix = np.floor(x / cell).astype(np.int64); iy = np.floor(y / cell).astype(np.int64)
+    key = (ix - ix.min()) * 1_000_003 + (iy - iy.min())
+    order = np.lexsort((z, key)); ks = key[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(ks)) + 1]; ends = np.r_[starts[1:], len(ks)]
+    gz = z[order][starts + ((ends - starts) * 0.02).astype(int)]
+    cxy = np.stack([(ix[order][starts] + 0.5) * cell, (iy[order][starts] + 0.5) * cell], 1)
+    _, j = cKDTree(cxy).query(np.stack([x, y], 1), k=1, workers=-1)
+    return z - gz[j]
+
+
+def fit_texture(ST, NT, SR, NR, shape_xyz):
+    """Variances of the noise components that close the semivariance gap between well-exposed (T)
+    and recoloured (R) points, and the colour direction of the gap."""
+    ok = (NT >= 200) & (NR >= 200)
+    if ok.sum() < 3:
+        return None
+    D = ST[ok] / NT[ok][:, None, None] - SR[ok] / NR[ok][:, None, None]
+    w, V = np.linalg.eigh(D)
+    D = np.einsum('bij,bj,bkj->bik', V, np.maximum(w, 0), V)     # nearest positive semi-definite gap
+    target = np.trace(D, axis1=1, axis2=2)
+    G = []                     # semivariance of each unit-variance component on the recoloured points' own layout
+    for k, cell in enumerate(TEX_SCALES):
+        Sg, Ng = semivariance_sums(shape_xyz, lattice_noise3(shape_xyz, cell, 1000 + k), seed=1)
+        G.append(np.trace(Sg, axis1=1, axis2=2)[ok] / np.maximum(Ng[ok], 1))
+    G = np.stack(G, 1)
+    v, _ = nnls(G, target)
+    Sig = (D * NR[ok][:, None, None]).sum(0)
+    if np.trace(Sig) <= 0:
+        return None
+    Sig *= 3 / np.trace(Sig)
+    return dict(v=v, L=np.linalg.cholesky(Sig + 1e-6 * np.eye(3)), target=target, fit=G @ v, bins=np.flatnonzero(ok))
+
+
 # ---------------------------------------------------------------- one tile
 
 STAT_KEYS = ('points', 'blown', 'greyed', 'repaired', 'borrowed', 'palette', 'protected', 'line', 'leaf')
@@ -642,7 +772,7 @@ SHOW_COLOURS = {   # --show: false colours, 8-bit sRGB
 }
 
 
-def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None):
+def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None, tex=None):
     """New colours for the tile's own points (the first n_own of pts; the rest is halo)."""
     st = dict.fromkeys(STAT_KEYS, 0)
     X = np.asarray(pts.x); Y = np.asarray(pts.y); Z = np.asarray(pts.z)
@@ -726,6 +856,24 @@ def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None):
             ps = np.flatnonzero(roi & ~blown & ~protected)
             new[ti] = palette_colours(xyz[ti], cls[ti], xyz[ps], new[ps], cls[ps], gpal, a)
             path[ti] = 3
+
+    # --texture: the variation recolouring averaged away, in proportion to each point's correction.
+    # A point never ends up greyed or blown out by the tool's own tests because of it: it takes the
+    # full variation, else half, else none.
+    if tex is not None and a.texture > 0 and not a.show:
+        ti = np.flatnonzero(path > 0)
+        if len(ti):
+            noise = (texture_noise(np.stack([X[ti], Y[ti], Z[ti]], 1), tex)
+                     * (np.sqrt(a.texture) * w[ti])[:, None]).astype(np.float32)
+            base = new[ti].copy()
+            _, _, w_base, _ = colour_state(np.clip(np.rint(lab_to_srgb(base)), 0, 255).astype(np.int32), a)
+            left = np.ones(len(ti), bool)
+            for share in (1.0, 0.5):
+                cand = base + share * noise
+                b_c, _, w_c, _ = colour_state(np.clip(np.rint(lab_to_srgb(cand)), 0, 255).astype(np.int32), a)
+                ok = left & ~b_c & (w_c <= w_base)
+                new[ti[ok]] = cand[ok]
+                left &= ~ok
 
     o = slice(0, n_own)
     st['repaired'] = int((path[o] == 1).sum()); st['borrowed'] = int((path[o] == 2).sum())
@@ -888,12 +1036,8 @@ def slabs(x_own, x_all, n_own, slab_points, margin):
         yield own, ctx[(ctx >= n_own) | (x_all[ctx] < x0) | (x_all[ctx] >= x1)], x0, x1
 
 
-def process_tile(job):
-    """Recolour one tile and write its records to o_<key>.rec. Runs in a worker process when --workers > 1."""
-    scratch, key, a, scale16, model, gpal = job
-    with laspy.open(a.input) as rd:
-        hdr = rd.header
-    pts, n_own = load_tile(scratch, key, hdr)
+def recolour_slabbed(pts, n_own, key, scale16, model, gpal, tex, a):
+    """Recolour a tile's own points, slab by slab if it is dense. Returns 8-bit colours (or None), stats, pages."""
     ix, iy = (int(v) for v in key.split('_'))
     X = np.asarray(pts.x)
     st = dict.fromkeys(STAT_KEYS, 0); pages = []
@@ -901,7 +1045,7 @@ def process_tile(job):
     for own_i, ctx_i, x0, x1 in slabs(X[:n_own], X, n_own, a.slab_points, a.margin):
         box = (max(ix * a.tile, x0), iy * a.tile, min((ix + 1) * a.tile, x1), (iy + 1) * a.tile)
         sub = pts if len(ctx_i) == len(X) - n_own and len(own_i) == n_own else pts[np.concatenate([own_i, ctx_i])]
-        r, s, p = recolour_tile(sub, len(own_i), scale16, model, gpal, a, own_box=box)
+        r, s, p = recolour_tile(sub, len(own_i), scale16, model, gpal, a, own_box=box, tex=tex)
         for k in STAT_KEYS: st[k] += s[k]
         pages.extend(p)
         if r is not None:
@@ -910,6 +1054,65 @@ def process_tile(job):
                 if scale16:
                     res >>= 8
             res[own_i] = r
+    return res, st, pages
+
+
+def fit_texture_from_tiles(scratch, keys, hdr, scale16, model, gpal, a):
+    """Recolour a few tiles without texture and fit the texture to the gap between their recoloured
+    points and the well-exposed points near them."""
+    sizes = np.array([os.path.getsize(os.path.join(scratch, f't_{k}.rec')) for k in keys])
+    big = [k for k, s in zip(keys, sizes) if s >= np.median(sizes)] or list(keys)
+    pick = [big[i] for i in np.unique(np.linspace(0, len(big) - 1, min(a.texture_tiles, len(big))).round().astype(int))]
+    n_bins = len(TEX_EDGES) - 1
+    ST = np.zeros((n_bins, 3, 3)); NT = np.zeros(n_bins); SR = np.zeros((n_bins, 3, 3)); NR = np.zeros(n_bins)
+    shape_xyz = None
+    for i, key in enumerate(pick):
+        pts, n_own = load_tile(scratch, key, hdr)
+        res, _, _ = recolour_slabbed(pts, n_own, key, scale16, model, gpal, None, a)
+        if res is None:
+            continue
+        own = pts[:n_own]
+        xyz = np.stack([np.asarray(own.x), np.asarray(own.y), np.asarray(own.z)], 1)
+        rgb = np.stack([np.asarray(own.red), np.asarray(own.green), np.asarray(own.blue)], 1).astype(np.int32)
+        if scale16:
+            rgb >>= 8
+        blown, _, w, trusted = colour_state(rgb, a)
+        # Measured where the washing-out is: at --texture-above metres or more above the ground. Fitted
+        # there, the samples' recoloured canopy came out at 69-128 % (column) and 80-112 % (thinned
+        # sample) of real variation at each distance, and the texture still suited the points lower
+        # down. Fitted on all heights, it was 2-3 times too grainy in the canopy, because understory
+        # foliage is grainier.
+        high = height_above_ground(xyz) >= a.texture_above
+        R = (blown | (w > 0.5)) & high
+        if R.sum() < 1000:
+            continue
+        T = trusted & high & dilated_cells(xyz, R, a.roi_cell)   # well-exposed points near the washed-out areas
+        s_, n_ = semivariance_sums(xyz[T], srgb_to_lab(rgb[T]), seed=i); ST += s_; NT += n_
+        s_, n_ = semivariance_sums(xyz[R], srgb_to_lab(res[R]), seed=i); SR += s_; NR += n_
+        if shape_xyz is None:
+            ri = np.flatnonzero(R)
+            shape_xyz = xyz[np.random.default_rng(i).choice(ri, min(200_000, len(ri)), replace=False)]
+        log(f'texture: measured tile {i + 1}/{len(pick)}')
+    tex = fit_texture(ST, NT, SR, NR, shape_xyz) if shape_xyz is not None else None
+    if tex is None:
+        log('texture: too few well-exposed or recoloured points to measure it; --texture is off')
+        return None
+    labels = ['per point'] + [f'{c * 100:.0f} cm' for c in TEX_SCALES[1:]]
+    log('texture: standard deviation of each component (CIELAB): '
+        + ', '.join(f'{lab} {np.sqrt(v):.1f}' for lab, v in zip(labels, tex['v'])))
+    log('texture: gap in semivariance (sum of L*, a*, b*) by distance, measured and fitted: '
+        + ', '.join(f'{TEX_EDGES[b] * 100:.0f}-{TEX_EDGES[b + 1] * 100:.0f} cm {t:.0f}/{f:.0f}'
+                    for b, t, f in zip(tex['bins'], tex['target'], tex['fit'])))
+    return tex
+
+
+def process_tile(job):
+    """Recolour one tile and write its records to o_<key>.rec. Runs in a worker process when --workers > 1."""
+    scratch, key, a, scale16, model, gpal, tex = job
+    with laspy.open(a.input) as rd:
+        hdr = rd.header
+    pts, n_own = load_tile(scratch, key, hdr)
+    res, st, pages = recolour_slabbed(pts, n_own, key, scale16, model, gpal, tex, a)
     own = pts[:n_own]
     if res is not None:
         mul = 257 if scale16 else 1
@@ -967,6 +1170,12 @@ def build_parser():
     g.add_argument('--jitter', type=float, default=2.0, help='per-point lightness variation in palette patches, CIELAB L* (default 2)')
     g.add_argument('--fit-tiles', type=int, default=8, help='tiles the greyed-colour model is fitted on; 0 = built-in model (default 8)')
     g.add_argument('--fit-pairs', type=int, default=400_000, help='pairs to fit on at most (default 400000)')
+    g.add_argument('--texture', type=float, default=0.0,
+                   help='add back this share of the colour variation that recolouring averages away, as measured on '
+                        'this scan against well-exposed foliage: 0 = off (default), 1 = all of it')
+    g.add_argument('--texture-tiles', type=int, default=4, help='tiles the texture is measured on (default 4)')
+    g.add_argument('--texture-above', type=float, default=4.0,
+                   help='the texture is measured on points at least this high above the ground, m (default 4)')
     g = ap.add_argument_group('run')
     g.add_argument('--show', choices=('classes', 'paths'), default=None,
                    help='write false colour instead: classes = trunk/branch orange, leaf green; '
@@ -1012,10 +1221,11 @@ def main():
     log(f'{len(keys)} tiles; the largest holds {biggest / 1e6:.1f} M points. About {0.35 * at_once / 1e6 + 0.3:.1f} GB '
         f'per worker ({a.workers} worker{"s" if a.workers > 1 else ""}); --slab-points and --tile lower it')
     model, gpal = fit_from_tiles(scratch, keys, hdr, scale16, a)
+    tex = fit_texture_from_tiles(scratch, keys, hdr, scale16, model, gpal, a) if a.texture > 0 and not a.show else None
 
     stats = dict.fromkeys(STAT_KEYS, 0)
     pages = []
-    jobs = [(scratch, key, a, scale16, model, gpal) for key in keys]
+    jobs = [(scratch, key, a, scale16, model, gpal, tex) for key in keys]
 
     def done(i, key, st, pg):
         for k in STAT_KEYS: stats[k] += st[k]

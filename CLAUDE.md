@@ -112,6 +112,7 @@ The docstring gives the method. In order, the steps are:
 4. Classify structure around blown points: a line of points is trunk or branch, a less linear cluster is leaf material.
 5. Borrow colour from points within 15 cm.
 6. Fill the rest with patches of real nearby colours.
+7. Optionally (`--texture`, off by default) add back the colour variation that steps 3 and 5 average away. The amount is fitted per run, scale by scale, to the gap between well-exposed and recoloured points at least 4 m above ground.
 
 - Install with `pip install -r tools/requirements-recolour.txt` (laspy with lazrs, numpy, scipy).
 - Develop on `data/samples/`. Its README describes the files, their coordinates and the colour encoding, and records the measurements behind the defaults. For example: `python tools/recolour_canopy.py data/samples/every100.laz out.laz`.
@@ -119,7 +120,7 @@ The docstring gives the method. In order, the steps are:
   - It checks the CIEDE2000 code against the published test pairs.
   - It scores colour borrowing on hidden well-exposed points.
   - It scores the greyed-colour regression on held-out pairs.
-  - It scores the whole tool on a simulated blowout. Use `--tool` to score another version.
+  - It scores the whole tool on a simulated blowout. Use `--tool` to score another version, and `--tool-args "--texture 1"` to pass options.
   - The error tables `_BORROW_A`, `_BORROW_B` and `_REG_ERR` in the tool come from its output.
 - Diagnostics:
   - `--show classes` writes the structure classes as false colour: orange trunk/branch, green leaf, magenta pages.
