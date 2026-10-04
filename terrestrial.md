@@ -101,9 +101,32 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 
 ## Canopy recolour (`tools/recolour_canopy.py`)
 
-An offline Python tool, separate from the viewer. It rewrites the colour of the points the scanner's camera blew out in the sunlit canopy (white, pale grey, or sky-cast lilac and blue), and leaves every other point and attribute unchanged.
+An offline Python tool, separate from the viewer. It rewrites the colour of two kinds of point and leaves every other point and attribute unchanged:
+- points the scanner's camera blew out in the sunlit canopy (white, or a lilac/blue sky cast);
+- greyed points (pale or unsaturated), which fade from the floor up into the white canopy.
+
+The docstring gives the method. In order, the steps are:
+1. Detect blown-out and greyed points.
+2. Keep printed survey pages unchanged.
+3. Repair greyed points with a regression learnt per run.
+4. Classify structure around blown points (line, i.e. trunk or branch, against cluster).
+5. Borrow colour from points within 15 cm.
+6. Fill the rest with patches of real nearby colours.
 
 - Install with `pip install -r tools/requirements-recolour.txt` (laspy with lazrs, numpy, scipy).
-- Develop on `data/samples/`; its README describes the files, their coordinates and the colour encoding. For example: `python tools/recolour_canopy.py data/samples/every100.laz out.laz`.
-- The full scans (3–4 GB, 346–455 M points) live only on the local machine. The tool streams them through 16 m ground tiles with a 0.6 m halo, so memory stays bounded. A full run takes about 15 minutes on the 20-thread laptop.
+- Develop on `data/samples/`. Its README describes the files, their coordinates and the colour encoding, and records the measurements behind the defaults. For example: `python tools/recolour_canopy.py data/samples/every100.laz out.laz`.
+- `tools/recolour_eval.py` reproduces those measurements. Run it after changing the method, for example `python tools/recolour_eval.py data/samples/column_3m.laz --output out.laz --blowout 0.15`.
+  - It checks the CIEDE2000 code against the published test pairs.
+  - It scores colour borrowing on hidden well-exposed points.
+  - It scores the greyed-colour regression on held-out pairs.
+  - It scores the whole tool on a simulated blowout. Use `--tool` to score another version.
+  - The error tables `_BORROW_A`, `_BORROW_B` and `_REG_ERR` in the tool come from its output.
+- Diagnostics:
+  - `--show classes` writes the structure classes as false colour: orange trunk/branch, green cluster, magenta pages.
+  - `--show paths` shows which step coloured each point.
+  - Detected page centres go to `OUT_pages.csv`, in the viewer's `markers.csv` format.
+- The full scans (3–4 GB, 346–455 M points) live only on the local machine.
+  - The tool streams them through 16 m ground tiles with a 0.6 m halo. Tiles over `--slab-points` (12 M) are cut into slabs, so a worker needs at most about 4.5 GB; memory is about 0.35 GB per million points processed at once.
+  - `--workers N` processes tiles in parallel and gives identical output.
+  - This version has not been run on a full scan. The samples take about a minute each with one worker in a 4-core cloud session; the previous version took about 15 minutes for a full scan on the 20-thread laptop.
 - Judge the results in SimLOD at 4K, with Look > "Fix blown-out canopy" off. That checkbox is a separate, on-the-fly repair inside the viewer.
