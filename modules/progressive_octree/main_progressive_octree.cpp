@@ -154,15 +154,19 @@ struct {
 	bool enableEDL                   = false;   // reference has no outlines (apply_look.ps1)
 	float edlStrength                = 0.8f;
 
-	// tier 1 shading (inserted by apply_tier1_shading.ps1)
+	// tier 1 shading
 	bool  roundSplats                = true;
-	// Depth haze: distance goes LIGHTER (apply_look.ps1). The slider is
-	// logarithmic: 0.001 is already a visible haze, 0.018 washes out past ~30 m.
+	// Depth haze. The slider is logarithmic: 0.001 is already a visible haze,
+	// 0.018 washes out past ~30 m. The colour is sRGB like the other colour
+	// pickers; white is the same in sRGB and linear.
 	bool  enableFog                  = true;
 	float fogDensity                 = 0.00024f;
 	float fogR                       = 1.0f;    // white haze
 	float fogG                       = 1.0f;
 	float fogB                       = 1.0f;
+	float fogHeightFalloff           = 0.0f;    // per metre; 0 keeps the haze even with height
+	float fogBase                    = 0.0f;    // metres above the lowest point
+	bool  fogSky                     = false;   // haze between the camera and the sky as well
 	bool  enableBloom                = false;
 	float bloomThreshold             = 0.55f;
 	float bloomStrength              = 1.2f;
@@ -218,18 +222,20 @@ struct {
 	float grain                      = 0.0f;
 	float vignette                   = 0.402f;
 
-	// directional key light (apply_keylight.ps1). Defaults: high and behind,
-	// as in the reference, warm-green light through the canopy.
+	// directional key light. Defaults: the chosen look, high and from the
+	// north-west, white.
 	float lightAzimuth               = 295.35f;  // degrees
 	float lightElevation             = 56.1f;   // degrees above horizon
 	float lightColour[3]             = {1.0f, 1.0f, 1.0f};      // white
 	float lightIntensity             = 2.5f;
-	float ambient                    = 0.109f;   // shadowed points keep a third of their colour
-	float lightAbsorb                = 0.16f;   // per metre: 5 m of canopy passes ~14%
+	float ambient                    = 0.109f;   // shadowed points (and haze) keep a tenth of their colour
+	float lightAbsorb                = 0.16f;   // per metre: 5 m of canopy passes ~45%
 	int   lightSteps                 = 40;
+	float sunbeams                   = 1.0f;    // key light in the haze; 0 = haze lit by ambient only
+	float sunAnisotropy              = 0.5f;    // forward scattering of the haze (Henyey-Greenstein g)
 
 	// regroup (apply_regroup.ps1)
-	bool  lightOn                    = true;   // off until you switch it on
+	bool  lightOn                    = true;   // the chosen look is lit
 	float nearClip                   = 0.81f;
 	bool  groundOn                   = true;
 	float groundHeight               = 0.35f;
@@ -983,17 +989,18 @@ static void ensureLightGrid(bool wanted){
 }
 
 // kernel_render's scratch, per frame: the visible-node list (16.8 MB, from
-// HostDeviceInterface.h) and the 16 MB line list, then per pixel 44.75 B:
-// framebuffer 8, emission 12, bloom chain 4, quarter-resolution volumetrics
-// 0.75, and the high-quality pass's depth 4 and colour 16. The fixed 200 MB it
-// used to get was overrun with no check by any window above 3.8 Mpx: a 4K
-// frame needs 404 MB, a 1080p one 126 MB. Sized to the window instead,
-// growing but never shrinking; growth after startup comes out of the VRAM
-// reserve beside the octree pool.
+// HostDeviceInterface.h) and the 16 MB line list, then per pixel 45 B:
+// framebuffer 8, emission 12, bloom chain 4, quarter-resolution volumetrics 1
+// (RGB and the distance each ray saw), and the high-quality pass's depth 4 and
+// colour 16. The per-pixel term is exact, so the constant pad is the only
+// slack. The fixed 200 MB it used to get was overrun with no check by any
+// window above 3.8 Mpx: a 4K frame needs 406 MB, a 1080p one 126 MB. Sized to
+// the window instead, growing but never shrinking; growth after startup comes
+// out of the VRAM reserve beside the octree pool.
 static uint64_t renderBufferBytesFor(int width, int height){
 	uint64_t pixels = uint64_t(std::max(width, 1)) * uint64_t(std::max(height, 1));
 	uint64_t lists  = uint64_t(MAX_VISIBLE_NODES) * NODE_BYTES + 16'000'000;   // nodes, line vertices
-	return lists + 45 * pixels + 1'000'000;   // + alignment and the bloom chain's padding
+	return lists + 45 * pixels + 2'000'000;   // + counters, alignment and the bloom chain's padding
 }
 
 // Returns whether the buffer holds a frame of this size. On failure the old
@@ -1383,6 +1390,13 @@ void initCuda(){
 	cuDeviceGetAttribute(&numSMs, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
 }
 
+// A colour picker value (sRGB, 0..1) in linear light, by the same curve as
+// srgbToLinear in render.cu.
+static float srgbToLinear01(float c){
+	c = std::clamp(c, 0.0f, 1.0f);
+	return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
 Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	Uniforms uniforms;
 
@@ -1474,9 +1488,12 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.roundSplats              = settings.roundSplats;
 	uniforms.enableFog                = settings.enableFog;
 	uniforms.fogDensity               = settings.fogDensity;
-	uniforms.fogR                     = settings.fogR;
-	uniforms.fogG                     = settings.fogG;
-	uniforms.fogB                     = settings.fogB;
+	uniforms.fogR                     = srgbToLinear01(settings.fogR);   // the composite works in linear light
+	uniforms.fogG                     = srgbToLinear01(settings.fogG);
+	uniforms.fogB                     = srgbToLinear01(settings.fogB);
+	uniforms.fogHeightFalloff         = settings.fogHeightFalloff;
+	uniforms.fogBase                  = settings.fogBase;
+	uniforms.fogSky                   = settings.fogSky ? 1 : 0;
 	uniforms.enableBloom              = settings.enableBloom;
 	uniforms.bloomThreshold           = settings.bloomThreshold;
 	uniforms.bloomStrength            = settings.bloomStrength;
@@ -1650,6 +1667,8 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.lightAbsorb    = settings.lightAbsorb;
 		uniforms.lightSteps     = settings.lightSteps;
 		uniforms.lightDirty     = g_frameLightDirty ? 1 : 0;   // decided once per frame in beginFrameState
+		uniforms.sunbeams       = settings.sunbeams;
+		uniforms.sunAnisotropy  = std::clamp(settings.sunAnisotropy, -0.95f, 0.95f);   // g = 1 is a spike
 	}
 	uniforms.lightOn        = settings.lightOn ? 1 : 0;
 	uniforms.nearClip       = settings.nearClip;
@@ -1739,6 +1758,10 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 			renderer->controls->pitch * 57.2958, renderer->controls->radius, effectiveMinNodeSize(), effectiveMaxSplatPx());
 		logIfChanged("events", 5.0, "[host] numEvents=%d  gain=%.3f  calls=%d  density=%.3f\n",
 			uniforms.numEvents, uniforms.emissionGain, (int)g_calls.size(), settings.pointDensity);
+		logIfChanged("haze", 5.0, "[host] haze=%.3f/m thins=%.3f/m floor=%.1fm sky=%d | light=%d strength=%.2f ambient=%.2f sunbeams=%.2f g=%.2f | medium steps=%d reach=%.0fm\n",
+			settings.enableFog ? settings.fogDensity : 0.0f, settings.fogHeightFalloff, settings.fogBase, settings.fogSky ? 1 : 0,
+			settings.lightOn ? 1 : 0, settings.lightIntensity, settings.ambient, settings.sunbeams, settings.sunAnisotropy,
+			settings.volSteps, settings.volMaxDist);
 		logIfChanged("box", 0.0, "[host] box min=(%.2f %.2f %.2f) max=(%.2f %.2f %.2f), load offset (subtracted from every point) = (%.2f %.2f %.2f)\n",
 			uniforms.boxMin.x, uniforms.boxMin.y, uniforms.boxMin.z,
 			uniforms.boxMax.x, uniforms.boxMax.y, uniforms.boxMax.z,
@@ -1944,7 +1967,7 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	cuEventRecord(ce_render_start, 0);
 
 	float time = static_cast<float>(now());
-	int workgroupSize = 256;
+	int workgroupSize = 256;   // kernel_render's __launch_bounds__ in render.cu assumes 256
 	
 	int maxActiveBlocksPerSM;
 	cuOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocksPerSM, 
@@ -2966,13 +2989,19 @@ int main(int argc, char** argv){
 			else if(key == "pointsize") settings.pointWorldSize        = float(v);
 			else if(key == "gain")      settings.emissionGain          = float(v);
 			else if(key == "haze")    { settings.fogDensity            = float(v); settings.enableFog = v > 0.0; }
+			else if(key == "hazefall")  settings.fogHeightFalloff      = float(v);
+			else if(key == "hazefloor") settings.fogBase               = float(v);
+			else if(key == "hazesky")   settings.fogSky                = v != 0.0;
+			else if(key == "light")     settings.lightOn               = v != 0.0;
+			else if(key == "sunbeams")  settings.sunbeams              = float(v);
 			else if(key == "whitefix")  settings.whiteFix              = v != 0.0;
 			else if(key == "skycast")   settings.tintMargin            = float(v);   // Look > Sky cast
 			else if(key == "torch")     settings.torchOn               = v != 0.0;   // aims at the frame centre
 			else if(key == "radius")  { g_eventRadiusArg = float(v); if(v > 0.0) g_eventRadius = float(v); }
 			else if(key == "exposure")  settings.exposure              = float(v);
 			else if(key == "keep")      loadKeepPer10k = uint32_t(std::clamp(v, 0.01, 1.0) * 10000.0 + 0.5);   // fraction of each file loaded
-			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze, whitefix, skycast, torch, radius, exposure, keep)\n", key);
+			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, "
+			              "haze, hazefall, hazefloor, hazesky, light, sunbeams, whitefix, skycast, torch, radius, exposure, keep)\n", key);
 		}else if(iEndsWith(arg, "las") || iEndsWith(arg, "laz") || iEndsWith(arg, "simlod")){
 			std::error_code ec;
 			auto absolute = std::filesystem::absolute(arg, ec);   // dropped files are absolute too
@@ -3452,13 +3481,20 @@ int main(int argc, char** argv){
 				ImGui::Separator();
 				ImGui::SliderFloat("Depth haze",       &settings.fogDensity,     0.0f, 0.08f, "%.5f",
 						ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
-				tipFor("Distance blends toward the haze colour. The reference goes LIGHTER with distance, so keep the colour pale.");
+				tipFor("Distance blends toward the haze colour. The reference goes LIGHTER with distance, so keep the colour pale. The value is the haze's density per metre at and below the haze floor.");
 				if(settings.fogDensity <= 0.0f) settings.enableFog = false; else settings.enableFog = true;
+				ImGui::SliderFloat("Haze thins with height", &settings.fogHeightFalloff, 0.0f, 0.5f, "%.3f /m", ImGuiSliderFlags_Logarithmic);
+				tipFor("0 keeps the haze even. Above 0 the haze thins with height above the haze floor, halving every 0.69 / value metres: at 0.1 every 7 m, so it lies low among the trunks and clears toward the canopy.");
+				ImGui::SliderFloat("Haze floor (m)",   &settings.fogBase,        0.0f, boxSize.z > 0.0f ? boxSize.z : 40.0f, "%.1f");
+				tipFor("Height above the lowest point up to which the haze keeps its full density. It only thins above this, so it only matters when Haze thins with height is above 0.");
+				ImGui::Checkbox   ("Haze over sky",    &settings.fogSky);
+				tipFor("The haze also lies between the camera and the sky, so gaps between the trunks and the horizon show haze rather than sky. Use it with Haze thins with height: even haze has no top, so it covers the whole sky.");
 				{
 					float hc[3] = {settings.fogR, settings.fogG, settings.fogB};
 					if(ImGui::ColorEdit3("Haze colour", hc, ImGuiColorEditFlags_NoInputs)){
 						settings.fogR = hc[0]; settings.fogG = hc[1]; settings.fogB = hc[2];
 					}
+					tipFor("Picked like the sky colour, so the same values in both match. With the key light on, haze in shade darkens to the Ambient level, as points do, and Sunbeams (Light) adds the light that reaches it.");
 				}
 				ImGui::ColorEdit3 ("Sky colour",       settings.skyColour, ImGuiColorEditFlags_NoInputs);
 				ImGui::Separator();
@@ -3509,10 +3545,15 @@ int main(int argc, char** argv){
 				lm |= ImGui::SliderFloat("Strength",         &settings.lightIntensity, 0.0f,   6.0f);
 				ImGui::ColorEdit3 ("Light colour",     settings.lightColour, ImGuiColorEditFlags_NoInputs);
 				ImGui::SliderFloat("Ambient",          &settings.ambient,        0.0f, 1.0f);
-				tipFor("Floor under the key light, so shadowed points keep some of their own colour.");
+				tipFor("Floor under the key light, so shadowed points keep some of their own colour. The haze in shade darkens to the same level.");
 				lm |= ImGui::SliderFloat("Canopy density",   &settings.lightAbsorb,    0.0f,   1.5f, "%.2f /m");
 				tipFor("Light lost per metre of occupied foliage, so it means the same at every grid resolution. 0.4 lets about a seventh through five metres of canopy; 1.0 almost none.");
 				if(lm) g_lightDirty = true;
+				ImGui::Separator();
+				ImGui::SliderFloat("Sunbeams",         &settings.sunbeams,       0.0f,   4.0f);
+				tipFor("The key light scattered by the haze where the canopy lets it through, so the light shows in the air between the trunks. Needs Depth haze above 0. At 0 the haze gets only the ambient light. Marched at quarter resolution with Medium steps and Medium reach (Advanced); more steps give smoother beams at more cost.");
+				ImGui::SliderFloat("Forward scatter",  &settings.sunAnisotropy,  0.0f,   0.9f);
+				tipFor("How much brighter the haze looks facing the light than with the light behind you (Henyey-Greenstein g). 0 scatters the same in every direction; at 0.5 the haze facing the light is 27 times brighter than facing away. Water droplets scatter strongly forward.");
 				ImGui::Separator();
 				ImGui::Checkbox   ("Torch (T)",        &settings.torchOn);
 				tipFor("A torch held at the camera. While it is on, moving the mouse over the forest aims the beam and does not turn the camera; walk with W/A/S/D and the wheel. T toggles it.");
@@ -3794,8 +3835,10 @@ int main(int argc, char** argv){
 				ImGui::SliderFloat("Medium pools low",  &settings.volHeightFalloff, 0.0f,  0.05f);
 				ImGui::SliderFloat("Medium occlusion",  &settings.volOcclusion,     0.0f,  3.0f);
 				ImGui::SliderInt  ("Medium steps",      &settings.volSteps,         8,     128);
+				tipFor("Samples along each quarter-resolution ray, for the calls' medium and for the sunbeams (Light). More steps resolve narrower beams and cost proportionally more.");
 				ImGui::SliderInt  ("Medium shadow steps", &settings.volShadowSteps, 0,    16);
 				ImGui::SliderFloat("Medium reach (m)",  &settings.volMaxDist,      20.0f, std::max(400.0f, boxSize.x > 0.0f ? 2.0f * std::sqrt(boxSize.x*boxSize.x + boxSize.y*boxSize.y + boxSize.z*boxSize.z) : 400.0f));
+				tipFor("How far each volumetric ray is marched. Haze beyond it is lit by the key light without canopy shade, so keep it past the far side of the cloud (it is set to 1.5 x the cloud's diagonal on load).");
 				ImGui::Separator();
 				ImGui::TextDisabled("Test source");
 				ImGui::Checkbox   ("Test source on",    &settings.testSourceOn);

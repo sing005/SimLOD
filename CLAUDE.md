@@ -19,6 +19,7 @@ cmake --build . --config Release
 
 - The policy flag is needed with CMake 4.x, because the fetched GLFW declares `cmake_minimum_required` < 3.5.
 - The CUDA `.cu` files cannot be syntax-checked with plain `nvcc`. NVRTC compiles them with device as the default execution space. To check them, run the built exe from the repo root for a few seconds and look for `=== COMPILING:` lines followed by errors in stdout.
+- Without a GPU (for example in a cloud session), the PyPI wheels `nvidia-cuda-nvrtc-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-curand-cu12` and `nvidia-cuda-cccl-cu12` (all 12.4) supply NVRTC and the headers. Merge the wheels' `include/` folders into one directory, then call `nvrtcCompileProgram` (for example through Python `ctypes`) with the options listed in `CudaModularProgram::compile()`. This compiles the `.cu` files without a GPU.
 
 - Build **Release** for normal use. Debug is much slower, but it is useful for host-side debugging. Release also writes `SimLOD.pdb`; keep it next to the exe so crash traces have line numbers.
 - Requires CUDA ≥ 12.0 (links `CUDA::nvJitLink`) and CMake ≥ 3.26. At runtime `CUDA_PATH` must point to a CUDA 12 toolkit, because NVRTC compiles the kernels against its headers.
@@ -34,7 +35,8 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 
 - Files load as if dropped on the window.
 - `--view` places the camera. The target is in the renderer frame, i.e. relative to the cloud's minimum corner.
-- `--set` accepts `hqs`, `splat`, `detail`, `adaptive`, `budget` and `vsync`.
+- `--set` accepts `hqs`, `splat`, `detail`, `adaptive`, `budget` and `vsync`; for the look `insects`, `grain`, `bloom`, `markers`, `pointsize`, `gain`, `exposure`, `whitefix` and `skycast`; for the haze and key light `haze`, `hazefall`, `hazefloor`, `hazesky`, `light`, `sunbeams` and `torch`; `radius` for the calls; and `keep` (load an evenly spaced fraction of each LAS/LAZ, for a cloud too large for the GPU).
+- `--render W H` renders at a fixed size; `--shots <list>` (one `name yaw pitch radius tx ty tz` per line) saves each view as a .bmp beside the list; `--hidden`, `--exit`, `--shot-delay s`, `--bench N` and `--calls <csv>` go with it.
 - Timings go to the run log as `[host] stage ms:` lines. Measure only after loading finishes: frame cost changes a lot while the octree is still being built.
 - Kill with `timeout N`. Stdout is buffered and lost on kill, but the log file is flushed every line.
 - `.laz` decompresses slowly (about 4 min for 54 M points). Convert to `.las` with `laspy` for repeated runs.
@@ -67,6 +69,12 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 3. `Stats` is read back with an unsynchronised `cuMemcpyDtoHAsync`, so host reads lag by a frame or more and a single read can be half-copied. Results the host must not miss use a request id that the kernel answers once and leaves in place (see `pickSeq` / `pickSeqDone`).
 
 `getUniforms()` runs for every kernel launch, so it must stay free of side effects such as allocation and flag clearing; those belong in `beginFrameState()`.
+
+**Haze, sunbeams and the composite.**
+- The haze (`fog*` uniforms) has a density that depends only on height, so `hazeOpticalDepth()` computes its optical depth along a ray in closed form. The composite applies its extinction and its ambient light exactly, at full resolution.
+- The key light's share of the haze is shaded by the canopy, so it varies along the ray. The volumetric pass marches it through the light grid, alongside the calls' medium, at quarter resolution.
+- `volBuf` holds RGB plus the distance to the surface each ray sees (`SKY_DISTANCE` for sky). The composite upsamples it with weights from that distance (joint bilateral), so lit haze does not spread across silhouettes.
+- The composite keeps the backdrop (sky, or the void below the horizon) apart from the scene light and grades only the scene. Anything added in front of the sky is graded the same as when it is in front of geometry.
 
 **Adaptive detail.**
 - `updateAdaptiveDetail()` steers `g_adaptReduce` from the render kernel's time against `settings.frameBudgetMs`.
