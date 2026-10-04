@@ -38,6 +38,7 @@ A point counts as blown out when either its darkest channel is at least 170 and 
 pip install -r tools/requirements-recolour.txt
 python tools/recolour_canopy.py data/samples/every100.laz out.laz
 python tools/recolour_canopy.py data/samples/every100.laz classes.laz --show classes   # false colour
+python tools/recolour_canopy.py data/samples/every100.laz out.laz --texture 1          # natural variation of colour
 python tools/recolour_eval.py data/samples/column_3m.laz --output out.laz              # the measurements
 ```
 
@@ -49,6 +50,7 @@ python tools/recolour_eval.py data/samples/column_3m.laz --output out.laz       
 4. **Classify structure** around blown points: a line of points is trunk or branch, and a less linear cluster is leaf material. The method follows LeWoS (Wang et al. 2020), with multi-scale linearity for thin branches.
 5. **Fill blown points** from well-exposed and repaired points within 15 cm, the same class first. A second pass reaches 30 cm.
 6. **Palette.** The remaining points take the colours of real points of the same class nearby, one colour per 0.3 m cellular patch.
+7. **Texture, optional (`--texture`).** Steps 3 and 5 average, so recoloured areas vary less than real foliage. This step adds back variation fitted to the gap measured on the scan. It is off by default (see *The texture option*).
 
 Every attribute other than red, green and blue is left unchanged, and so are the points that need no change. `--show classes` writes the structure classes as false colour (orange trunk/branch, green leaf, magenta pages). `--show paths` shows which step coloured each point.
 
@@ -109,6 +111,34 @@ The recoloured canopy is lighter and more saturated than the near-ground forest.
 
 After a run, 0.02 % of `every100.laz` still counts as blown out. That is the white paper of the two protected pages.
 
+## The texture option
+
+Without it, the recoloured canopy varies much less than well-exposed foliage at the same height. The shortfall is greatest between near neighbours: between points under 2 cm apart, recoloured points keep 9–24 % of the variation, and at 16–64 cm about half. The regression pulls towards the mean, and borrowing takes averages of neighbours.
+
+`--texture 1` adds variation back, measured on each run:
+
+1. A few tiles are recoloured without texture. On points at least 4 m above a simple ground model, the semivariance of colour is measured for well-exposed foliage near the washed-out areas and for the recoloured points. Semivariance is half the mean squared difference between two points, against their distance (Cressie 1993).
+2. The gap is fitted with a separate value for every point plus smooth lattice noise (after Perlin 1985) at 2, 5, 12 and 30 cm. Its colour direction is the gap's own, so lightness and chroma vary together, as they do in real foliage.
+   - Matching the variation scale by scale follows Heeger & Bergen (1995).
+   - Adding variation, instead of stretching the predicted colours, follows Maraun (2013), who shows that stretching misrepresents spatial structure.
+3. Each recoloured point gets the variation in proportion to its correction. It takes the full amount, else half, else none, so that no point becomes greyed or blown out by the tool's own tests.
+
+Fitting on all heights made the canopy two to three times too grainy, because understory foliage is grainier; hence the 4 m limit (`--texture-above`). The noise is computed in scan coordinates, so it continues across tile and slab boundaries, and the output is identical with any number of workers. A smaller value, such as `--texture 0.5`, restores that share of the missing variance.
+
+Measured with `recolour_eval.py --output` and `--blowout`:
+
+| | `column_3m.laz` | `every100.laz` |
+|---|---|---|
+| Lightness spread (IQR) at 8–12 m: default / `--texture 1` / well-exposed | 6.9 / 9.4 / 10.5 | 6.0 / 10.1 / 11.4 |
+| Canopy variation by distance, as a share of well-exposed foliage: default | 9–51 % | 16–48 % |
+| Same, with `--texture 1` | 69–128 % | 80–112 % |
+| Still greyed after a run (tool's own test): default / `--texture 1` | 0.03 % / 0.02 % | 0.04 % / 0.04 % |
+| Simulated blowout, 15 cm cubes, median error: default / `--texture 1` | 5.77 / 6.90 | |
+| Simulated blowout, 40 cm cubes, median error: default / `--texture 1` | 7.16 / 7.78 | |
+| Run time, column with 2 workers and thinned sample with 3: default / `--texture 1` | 0.7 / 1.5 min | 0.5 / 0.9 min |
+
+The added variation is not predicted from the scan, so each point's colour is less accurate. The cost on the simulated blowouts is the difference shown; the previous tool's errors there were 15.9 and 16.3.
+
 ## Survey pages in `every100.laz`
 
 Two pages pass every test in the thinned sample. Both are flat, about 29 × 22 cm, with paper returning a laser intensity of 43–53 and print about 1. The centres, in file coordinates, are:
@@ -124,7 +154,7 @@ They have not been checked against the survey. The column sample has none. Six s
 
 - **No labelled wood/leaf data for this forest.** The structure classes are judged by eye (`--show classes`). During development, with a simpler linearity score than the final classifier, adding the class changed neither the regression (4.62 against 4.63) nor borrowing. Well-exposed points of high and low linearity also had similar median colours (hue 113–119° against 109–115°). The script does not reproduce these two checks. In the thinned sample, trunks inside crowns are often classed as leaf; in the full-density column the trunk is found along its whole length.
 - **Pages that touch other near-white or grey surfaces can be missed.** A page pinned flush to a pale, achromatic surface, or hanging among blown-out leaves, may join up with them.
-- **Recoloured areas vary less than real foliage.** Their lightness spread is about half that of well-exposed points at the same height (see *Where the colours come from*).
+- **Recoloured areas vary less than real foliage**, unless `--texture` is used. By default their lightness spread is about half that of well-exposed points at the same height. With `--texture 1` the spread comes close to real foliage, but each point's colour is less accurate (see *The texture option*).
 - **The error tables and the built-in greyed-colour model were measured on `column_3m.laz`.** The model is refitted on each run. For another scan, run `recolour_eval.py` and update `_BORROW_A`, `_BORROW_B` and `_REG_ERR` if they differ much.
 
 ## Neighbour density

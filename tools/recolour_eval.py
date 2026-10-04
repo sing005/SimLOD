@@ -28,10 +28,12 @@ these parts:
   4. With --output: the share of points that are still blown or greyed by the
      tool's own tests, before and after; and, by height above ground, the
      median colour of the recoloured points against that of well-exposed
-     points near the ground and at the same height.
+     points near the ground and at the same height; and how much colour
+     varies with distance in the canopy, recoloured against well-exposed.
   5. With --blowout CUBE: well-exposed points inside random cubes of that
-     size are turned white, the tool (or --tool SCRIPT) is run on the result,
-     and its colours for those points are scored against the true ones.
+     size are turned white, the tool (or --tool SCRIPT, with --tool-args) is
+     run on the result, and its colours for those points are scored against
+     the true ones.
 """
 import argparse
 import os
@@ -98,17 +100,7 @@ def load(path, with_intensity=False):
     return xyz, rgb, t
 
 
-def height_above_ground(xyz, cell=2.0):
-    """Height above a simple ground model: the 2nd-percentile z of each 2 m cell (empty cells take the nearest)."""
-    x, y, z = (xyz[:, i].astype(np.float64) for i in range(3))
-    ix = np.floor(x / cell).astype(np.int64); iy = np.floor(y / cell).astype(np.int64)
-    key = (ix - ix.min()) * 1_000_003 + (iy - iy.min())
-    order = np.lexsort((z, key)); ks = key[order]
-    starts = np.r_[0, np.flatnonzero(np.diff(ks)) + 1]; ends = np.r_[starts[1:], len(ks)]
-    gz = z[order][starts + ((ends - starts) * 0.02).astype(int)]
-    cxy = np.stack([(ix[order][starts] + 0.5) * cell, (iy[order][starts] + 0.5) * cell], 1)
-    _, j = cKDTree(cxy).query(np.stack([x, y], 1), k=1, workers=-1)
-    return z - gz[j]
+height_above_ground = rc.height_above_ground
 
 
 HAG_BANDS = [(-1.0, 2.0), (2.0, 4.0), (4.0, 8.0), (8.0, 12.0), (12.0, 60.0)]
@@ -158,7 +150,7 @@ def part0(xyz, rgb, inten, a):
             print(f'   laser intensity against lightness L* within 10 cm: median correlation {np.median(cs):.3f} ({len(cs):,} neighbourhoods)')
 
 
-def part5(path, cube, tool, a, seed=7):
+def part5(path, cube, tool, a, seed=7, tool_args=()):
     las = laspy.read(path)
     xyz = np.stack([las.x, las.y, las.z], 1)
     rgb = np.stack([las.red, las.green, las.blue], 1).astype(np.int32)
@@ -179,7 +171,7 @@ def part5(path, cube, tool, a, seed=7):
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, 'blowout.las'); out = os.path.join(tmp, 'out.las')
         las.write(src)
-        subprocess.run([sys.executable, tool, src, out], check=True, stdout=subprocess.DEVNULL)
+        subprocess.run([sys.executable, tool, src, out, *tool_args], check=True, stdout=subprocess.DEVNULL)
         o = laspy.read(out)
     xo = np.stack([o.x, o.y, o.z], 1)
     dd, idx = cKDTree(xo).query(xyz[hid], k=1, workers=-1)
@@ -188,7 +180,7 @@ def part5(path, cube, tool, a, seed=7):
         co >>= 8
     de = rc.ciede2000(rc.srgb_to_lab(co), rc.srgb_to_lab(rgb[hid]))
     print(f'5. Simulated blowout, {cube} m cubes, {len(hid):,} well-exposed points turned white, recoloured by '
-          f'{os.path.basename(tool)}: median error {np.median(de):.2f}, {100 * np.mean(de < 5):.1f}% under 5')
+          f'{os.path.basename(tool)} {" ".join(tool_args)}: median error {np.median(de):.2f}, {100 * np.mean(de < 5):.1f}% under 5')
 
 
 def part1():
@@ -310,6 +302,17 @@ def part4(xyz, rgb, out_path, a, hag):
         if mt.sum() >= 500:
             line += f'\n              well-exposed, same height:  {lab_summary(lab0[mt])}  (n={mt.sum():,})'
         print(line)
+    # how colour varies with distance in the canopy (8 m and more above ground): recoloured against well-exposed
+    can = hag >= 8
+    T = trusted & can; R = changed & can
+    if T.sum() >= 1000 and R.sum() >= 1000:
+        ST, NT = rc.semivariance_sums(xyz[T], lab0[T]); SR, NR = rc.semivariance_sums(xyz[R], lab1[R])
+        cells = []
+        for i in range(len(NT)):
+            if NT[i] >= 200 and NR[i] >= 200:
+                gt = ST[i, 0, 0] / NT[i]; gr = SR[i, 0, 0] / NR[i]
+                cells.append(f'{rc.TEX_EDGES[i] * 100:.0f}-{rc.TEX_EDGES[i + 1] * 100:.0f} cm {100 * gr / gt:.0f}%')
+        print('   canopy colour variation by distance (L* semivariance), recoloured as a share of well-exposed: ' + ', '.join(cells))
 
 
 def main():
@@ -319,6 +322,7 @@ def main():
     ap.add_argument('--blowout', type=float, metavar='CUBE', help='also run the simulated blowout with cubes of this size, m')
     ap.add_argument('--tool', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'recolour_canopy.py'),
                     help='the recolour script --blowout runs (default: this version)')
+    ap.add_argument('--tool-args', default='', help='options passed to that script, for example "--texture 1"')
     e = ap.parse_args()
     a = rc.build_parser().parse_args(['in', 'out'])
     xyz, rgb, t, inten = load(e.input, with_intensity=True)
@@ -330,7 +334,7 @@ def main():
     if e.output:
         part4(xyz, rgb, e.output, a, hag)
     if e.blowout:
-        part5(e.input, e.blowout, e.tool, a)
+        part5(e.input, e.blowout, e.tool, a, tool_args=e.tool_args.split())
 
 
 if __name__ == '__main__':
