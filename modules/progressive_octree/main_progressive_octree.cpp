@@ -39,6 +39,15 @@ static_assert(sizeof(Uniforms) <= 4096, "Uniforms exceeds the 4 KB kernel-parame
 
 using namespace std;
 
+#ifdef _WIN32
+// Hybrid-graphics laptops: ask the NVIDIA driver to render this program on the
+// NVIDIA GPU, where CUDA can register the frame texture. NVIDIA, "Enabling High
+// Performance Graphics Rendering on Optimus Systems" (driver release 302 on).
+// Linking nvcuda.dll is a higher-priority method in the same document and
+// should already select it; the log's "OpenGL:" line shows which GPU is used.
+extern "C" { __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001; }
+#endif
+
 constexpr uint64_t PINNED_MEM_POOL_SIZE = 200;         // pool of pointers to batches of pinned memory
 // BATCH_STREAM_SIZE, the device upload ring, is in HostDeviceInterface.h
 constexpr uint64_t MAX_DECODED_AHEAD    = 50;          // batches the loaders may decode ahead of the kernel, in pinned host memory
@@ -419,11 +428,14 @@ vector<double> processFrameTimes;
 
 PinnedMemPool pinnedMemPool;
 
-// ---- run log (apply_insects.ps1) -----------------------------------------
+// ---- run log ---------------------------------------------------------------
 // Every [host] line is written to the console and to log/<timestamp>.log.
-// The directory is created on first use, next to the working directory.
+// The directory is created on first use, under the working directory; see
+// logLine for the fallbacks.
 #include <cstdarg>
+#include <chrono>
 #include <ctime>
+#include <iomanip>
 #include <cstring>
 #include <algorithm>
 #include <unordered_map>
@@ -435,12 +447,14 @@ static size_t        g_logBytes  = 0;
 static constexpr size_t LOG_MAX_BYTES = 20'000'000;   // one run; a 42 MB log was seen
 static constexpr int    LOG_KEEP_RUNS = 10;           // older log files are deleted
 
+static std::filesystem::path g_exeDir;   // set from argv[0] before the first log line
+
 // Delete all but the newest LOG_KEEP_RUNS - 1 logs, making room for this run's.
 // Names carry a sortable timestamp, so name order is age order.
-static void pruneOldLogs(){
+static void pruneOldLogs(const std::filesystem::path& dir){
 	std::error_code ec;
 	std::vector<std::filesystem::path> logs;
-	for(auto& e : std::filesystem::directory_iterator("log", ec)){
+	for(auto& e : std::filesystem::directory_iterator(dir, ec)){
 		auto name = e.path().filename().string();
 		if(e.is_regular_file() && name.rfind("simlod_", 0) == 0 && e.path().extension() == ".log"){
 			logs.push_back(e.path());
@@ -466,22 +480,50 @@ static void logLine(const char* fmt, ...){
 
 	if(!g_logOpened){
 		g_logOpened = true;
-		std::error_code ec;
-		std::filesystem::create_directories("log", ec);
-		pruneOldLogs();
-		std::time_t tt = std::time(nullptr);
+		auto wall = std::chrono::system_clock::now();
+		std::time_t tt = std::chrono::system_clock::to_time_t(wall);
+		int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(wall.time_since_epoch()).count() % 1000);
 		std::tm tmv{};
 	#ifdef _WIN32
 		localtime_s(&tmv, &tt);
 	#else
 		localtime_r(&tt, &tmv);
 	#endif
-		char name[256];
-		std::strftime(name, sizeof(name), "log/simlod_%Y-%m-%d_%H%M%S.log", &tmv);
-		g_logPath = name;
-		g_logFile.open(name);
+		// Milliseconds in the name: two runs started in the same second (a
+		// scripted --shots run, a relaunch) shared one name, and the second
+		// erased the first run's log.
+		char stamp[64], name[96];
+		std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H%M%S", &tmv);
+		snprintf(name, sizeof(name), "simlod_%s_%03d.log", stamp, ms);
+
+		// log/ under the working directory, as before. When that cannot be
+		// written (a read-only folder), next to the executable, then in the
+		// temp folder. The full path goes to the console, the log itself and
+		// the Display and debug panel, so the file can always be found:
+		// started from Visual Studio, the working directory is build/Release.
+		std::error_code ec;
+		std::vector<std::filesystem::path> dirs = {std::filesystem::path("log")};
+		if(!g_exeDir.empty()) dirs.push_back(g_exeDir / "log");
+		auto tmp = std::filesystem::temp_directory_path(ec);
+		if(!ec) dirs.push_back(tmp / "SimLOD" / "log");
+		for(const auto& dir : dirs){
+			std::filesystem::create_directories(dir, ec);
+			pruneOldLogs(dir);
+			auto path = std::filesystem::absolute(dir / name, ec);
+			if(ec) path = dir / name;
+			// Append, not truncate: the crash handler writes the stack trace
+			// through its own handle, and a truncating stream would write its
+			// later lines over the start of the trace.
+			g_logFile.open(path, std::ios::out | std::ios::app);
+			if(g_logFile.is_open()){
+				g_logPath = path.string();
+				break;
+			}
+		}
 		if(g_logFile.is_open()){
-			printf("[log ] writing to %s\n", name);
+			printf("[log ] writing to %s\n", g_logPath.c_str());
+		}else{
+			printf("[log ] cannot write a log file: tried ./log, next to the executable, and the temp folder\n");
 		}
 	}
 	if(g_logFile.is_open()){
@@ -528,6 +570,18 @@ static void tipFor(const char* text){
 		ImGui::EndTooltip();
 	}
 }
+
+// Native colour skips every step these controls set (nativeColour() in
+// render.cu), so while it is on they are drawn faint for the scope of one of
+// these. They stay editable, so the look can be prepared before turning it
+// off. With them drawn as usual, every setting but point size seemed broken.
+struct NativeColourDim{
+	bool active;
+	NativeColourDim() : active(settings.nativeColour){
+		if(active) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.4f);
+	}
+	~NativeColourDim(){ if(active) ImGui::PopStyleVar(); }
+};
 
 #include <csignal>
 
@@ -875,6 +929,26 @@ static bool fitSurveyFrame(){
 		2.0*(x*y + w*z),        w*w - x*x + y*y - z*z,  2.0*(y*z - w*x),
 		2.0*(x*z - w*y),        2.0*(y*z + w*x),        w*w - x*x - y*y + z*z
 	};
+
+	// Horn's method returns a proper rotation, so it cannot match a survey
+	// frame of the other handedness, such as columns typed as northing,
+	// easting against the file's easting, northing. With the markers close to
+	// one plane (checkerboards at similar heights; three markers always are)
+	// it matches one almost exactly by turning the vertical upside down. In a
+	// test with N and E swapped the rms was 0.000-0.21 m, and a call 12 m above
+	// the markers was placed 24 m away, below the ground. Both frames have z
+	// up, so a fit whose vertical points down is refused.
+	if(R[8] < 0.0){
+		logLine("[survey] fit refused: it turns the vertical upside down (R[2][2] = %.3f), which swapped or mirrored survey axes produce\n", R[8]);
+		notice("Survey fit refused: it would turn the vertical upside down. Check that the survey columns are in the file's order: x east, y north, z up.");
+		g_surveyValid = false;
+		return false;
+	}
+	// A level scan and a survey with measured heights share the vertical. A
+	// survey without heights over sloping ground does not: 2 m of rise across
+	// 30 m tilts the fit by 3.8 degrees, which moves a call 15 m up by 1 m.
+	double tiltDeg = std::acos(std::clamp(R[8], -1.0, 1.0)) * 180.0 / 3.14159265358979;
+
 	for(int k = 0; k < 9; k++) g_surveyR[k] = R[k];
 	g_surveyT[0] = cb[0] - (R[0]*ca[0] + R[1]*ca[1] + R[2]*ca[2]);
 	g_surveyT[1] = cb[1] - (R[3]*ca[0] + R[4]*ca[1] + R[5]*ca[2]);
@@ -897,12 +971,18 @@ static bool fitSurveyFrame(){
 	}
 	g_surveyRms = std::sqrt(sumSq / n);
 	double yawDeg = std::atan2(R[3], R[0]) * 180.0 / 3.14159265358979;
-	logLine("[survey] fit from %d pairs: yaw %.2f deg, t = (%.3f %.3f %.3f), rms %.3f m\n",
-		n, yawDeg, g_surveyT[0], g_surveyT[1], g_surveyT[2], g_surveyRms);
-	logLine("[survey] R = [%.6f %.6f %.6f; %.6f %.6f %.6f; %.6f %.6f %.6f]\n",
+	logLine("[survey] fit from %d pairs: yaw %.2f deg, tilt %.2f deg, t = (%.4f %.4f %.4f), rms %.3f m\n",
+		n, yawDeg, tiltDeg, g_surveyT[0], g_surveyT[1], g_surveyT[2], g_surveyRms);
+	// 12 decimals: applied to georeferenced coordinates (northings near 5.6e6)
+	// six decimals of R put a point up to about 3 m out
+	logLine("[survey] R = [%.12f %.12f %.12f; %.12f %.12f %.12f; %.12f %.12f %.12f]\n",
 		R[0],R[1],R[2],R[3],R[4],R[5],R[6],R[7],R[8]);
 	{
+		// Full double precision. At the stream's default 6 significant digits
+		// a translation of -5.63392e+06 was rounded to the nearest 10 m, the
+		// problem saveMarkersCsv below already avoids.
 		std::ofstream f("survey_transform.txt");
+		f << std::setprecision(17);
 		f << "# survey = R * file + t   (file = LAS coordinates)\n";
 		f << "pairs " << n << "\nrms_m " << g_surveyRms << "\nyaw_deg " << yawDeg << "\n";
 		f << "R " << R[0]<<" "<<R[1]<<" "<<R[2]<<" "<<R[3]<<" "<<R[4]<<" "<<R[5]<<" "<<R[6]<<" "<<R[7]<<" "<<R[8] << "\n";
@@ -911,6 +991,9 @@ static bool fitSurveyFrame(){
 	logLine("[survey] the markers spread %.2f m off their best line\n", spread);
 	if(spread < 1.0){
 		notice("Survey frame fitted from %d markers, but they lie close to one line (%.2f m off it): the rotation about it is uncertain. Add a marker away from that line.", n, spread);
+	}else if(tiltDeg > 2.0){
+		logLine("[survey] the fit tilts the vertical by %.2f deg; level scans and surveyed heights agree on it\n", tiltDeg);
+		notice("Survey frame fitted from %d markers, but it tilts the vertical by %.1f deg: check the survey heights (z) of the markers.", n, tiltDeg);
 	}else{
 		notice("Survey frame fitted from %d markers: yaw %.1f deg, rms %.3f m (see log)", n, yawDeg, g_surveyRms);
 	}
@@ -1467,6 +1550,29 @@ void initCuda(){
 
 	cuCtxGetDevice(&device);
 	cuDeviceGetAttribute(&numSMs, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+
+	// The GPU's own figures, so performance work can cite the machine it ran
+	// on rather than a datasheet (the laptop part differs from the desktop
+	// RTX A2000 in memory size and bus width).
+	{
+		char name[256] = {0};
+		cuDeviceGetName(name, sizeof(name), device);
+		int major = 0, minor = 0, memClockKHz = 0, busBits = 0, l2Bytes = 0, smClockKHz = 0, driver = 0;
+		size_t totalBytes = 0;
+		cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+		cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+		cuDeviceGetAttribute(&memClockKHz, CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, device);
+		cuDeviceGetAttribute(&busBits, CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, device);
+		cuDeviceGetAttribute(&l2Bytes, CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, device);
+		cuDeviceGetAttribute(&smClockKHz, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, device);
+		cuDeviceTotalMem(&totalBytes, device);
+		cuDriverGetVersion(&driver);
+		int nvrtcMajor = 0, nvrtcMinor = 0;
+		nvrtcVersion(&nvrtcMajor, &nvrtcMinor);
+		logLine("[host] GPU %s: compute %d.%d, %d SMs, %.0f MB, memory clock %d MHz, %d-bit bus, L2 %d KB, SM clock %d MHz; driver CUDA %d.%d, NVRTC %d.%d\n",
+			name, major, minor, numSMs, double(totalBytes) / 1e6, memClockKHz / 1000, busBits, l2Bytes / 1024, smClockKHz / 1000,
+			driver / 1000, (driver % 1000) / 10, nvrtcMajor, nvrtcMinor);
+	}
 }
 
 // A colour picker value (sRGB, 0..1) in linear light, by the same curve as
@@ -1748,7 +1854,11 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.sunbeams       = settings.sunbeams;
 		uniforms.sunAnisotropy  = std::clamp(settings.sunAnisotropy, -0.95f, 0.95f);   // g = 1 is a spike
 	}
-	uniforms.lightOn        = settings.lightOn ? 1 : 0;
+	// Only with its grid. Without one (no room for it, or no occupancy grid to
+	// build it from) lightAt reads full sun everywhere, so every point was lit
+	// at k = ambient + (1 - ambient) * intensity, 2.34 at the defaults, with no
+	// canopy shade, while the log and notice said the light was disabled.
+	uniforms.lightOn        = (settings.lightOn && g_lightGrid != 0) ? 1 : 0;
 	uniforms.nearClip       = settings.nearClip;
 	uniforms.mixR           = settings.mixColour[0];
 	uniforms.mixG           = settings.mixColour[1];
@@ -2921,8 +3031,22 @@ int main(int argc, char** argv){
 	// by zero and the like on every thread and writes a symbolised stack
 	// trace to the run log. The old SIGSEGV handler only covered the main
 	// thread and could not say where the fault was.
+	{
+		std::error_code ec;
+		auto exe = std::filesystem::absolute(argc > 0 ? argv[0] : "", ec);
+		if(!ec) g_exeDir = exe.parent_path();
+	}
 	logLine("[host] SimLOD starting\n");   // opens the run log, so its path is known
 	installCrashHandler(g_logPath.c_str());
+	{
+		// Where things are read from and written to. Hot reload and the run
+		// log both follow the working directory; started from Visual Studio
+		// it is build/Release, whose modules/ is the copy made at build time.
+		std::error_code ec;
+		logLine("[host] working directory %s\n", std::filesystem::current_path(ec).string().c_str());
+		logLine("[host] kernels from %s\n", std::filesystem::absolute("modules/progressive_octree", ec).string().c_str());
+		logLine("[host] run log %s\n", g_logPath.empty() ? "(none)" : g_logPath.c_str());
+	}
 	// (abort() and uncaught exceptions are handled there too, with a stack)
 
 	// --hidden: an invisible window for unattended runs; frames still render
@@ -2932,6 +3056,15 @@ int main(int argc, char** argv){
 	}
 
 	auto renderer = make_shared<GLRenderer>();
+	{
+		// Which GPU draws the window. On a hybrid-graphics laptop it must be
+		// the NVIDIA one, or CUDA cannot register the frame texture and every
+		// frame is skipped (see NvOptimusEnablement at the top of this file).
+		const char* vendor   = (const char*)glGetString(GL_VENDOR);
+		const char* glRender = (const char*)glGetString(GL_RENDERER);
+		const char* version  = (const char*)glGetString(GL_VERSION);
+		logLine("[host] OpenGL: %s, %s, %s\n", vendor ? vendor : "?", glRender ? glRender : "?", version ? version : "?");
+	}
 
 	// Fonts, before the first frame builds the atlas. The default font goes in
 	// first so it stays the default for every other window. ProggyTiny gets
@@ -3582,6 +3715,9 @@ int main(int argc, char** argv){
 			tipFor("Each point in the colour stored in the file. While this is on, the key light, torch, point shading, "
 				   "Fix blown-out canopy, eye dome lighting, haze, sunbeams, bloom and the whole Colour section are skipped. "
 				   "Turn it off for the look.");
+			if(settings.nativeColour){
+				ImGui::TextDisabled("The look is off: the faint settings below have no effect.");
+			}
 
 			// ---- CAMERA -------------------------------------------------------
 			if(ImGui::CollapsingHeader("Camera")){
@@ -3663,20 +3799,27 @@ int main(int argc, char** argv){
 			if(ImGui::CollapsingHeader("Points", ImGuiTreeNodeFlags_DefaultOpen)){
 				ImGui::SliderFloat("Point size (m)",   &settings.pointWorldSize, 0.0f, 0.30f, "%.3f");
 				tipFor("Splat diameter in metres, projected by depth. Near points large, far ones small.");
-				ImGui::SliderFloat("Point shading",    &settings.pointShading,   0.0f, 1.0f);
-				tipFor("Shades each splat as a small sphere lit from the upper left. 0 is a flat disc.");
+				{
+					NativeColourDim dim;
+					ImGui::SliderFloat("Point shading",    &settings.pointShading,   0.0f, 1.0f);
+					tipFor("Shades each splat as a small sphere lit from the upper left. 0 is a flat disc.");
+				}
 				ImGui::SliderFloat("Near clip (m)",    &settings.nearClip,       0.0f, 10.0f, "%.2f");
 				tipFor("Points closer to the camera than this are not drawn, so foliage right at the lens does not fill the frame.");
 				ImGui::Checkbox   ("Round splats",      &settings.roundSplats);
 				ImGui::Checkbox   ("High quality shading", &settings.useHighQualityShading);
 				tipFor("Blends the colours of all points within 1% of the nearest depth at each pixel, which smooths the speckle where points overlap. Draws every point twice, a depth pass and a colour pass, so it costs more than the standard path.");
 				ImGui::Separator();
-				ImGui::Checkbox   ("Eye dome lighting", &settings.enableEDL);
-				ImGui::SliderFloat("EDL strength",      &settings.edlStrength, 0.0f, 3.0f);
+				{
+					NativeColourDim dim;
+					ImGui::Checkbox   ("Eye dome lighting", &settings.enableEDL);
+					ImGui::SliderFloat("EDL strength",      &settings.edlStrength, 0.0f, 3.0f);
+				}
 			}
 
 			// ---- LIGHT --------------------------------------------------------
 			if(ImGui::CollapsingHeader("Light")){
+				NativeColourDim dim;
 				bool lm = false;
 				lm |= ImGui::Checkbox   ("Key light on",     &settings.lightOn);
 				tipFor("A directional light through the canopy, computed once per cell of the occupancy grid (Grid resolution, under Scan clean-up).");
@@ -3713,6 +3856,7 @@ int main(int argc, char** argv){
 				ImGui::SliderFloat("Horizon softness", &settings.horizonSoftness, 0.0f, 90.0f, "%.0f deg");
 				tipFor("Degrees the sky-to-void gradient spans. It was effectively 1 degree, which drew a hard line across the frame. 12 reads as atmosphere; 90 is a full gradient from zenith to nadir; 0 is a deliberate hard edge.");
 				ImGui::Separator();
+				NativeColourDim dim;   // the haze and everything below it; the sky colours above still apply
 				ImGui::SliderFloat("Depth haze",       &settings.fogDensity,     0.0f, 0.08f, "%.5f",
 						ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
 				tipFor("Distance blends toward the haze colour. The reference goes LIGHTER with distance, so keep the colour pale. The value is the haze's density per metre at and below the haze floor.");
@@ -3743,6 +3887,7 @@ int main(int argc, char** argv){
 
 			// ---- COLOUR -------------------------------------------------------
 			if(ImGui::CollapsingHeader("Colour", ImGuiTreeNodeFlags_DefaultOpen)){
+				NativeColourDim dim;
 				ImGui::SliderFloat("Exposure",         &settings.exposure,       0.1f, 16.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
 				tipFor("Overall brightness. Logarithmic: up to 16x, for scans whose colour was darkened to tame the sunlit canopy.");
 				ImGui::SliderFloat("Saturation",       &settings.saturation,     0.0f, 2.5f);
@@ -3786,6 +3931,9 @@ int main(int argc, char** argv){
 				ImGui::Text("clock %.1f s   active %d", g_showClock, g_activeEvents);
 				ImGui::Checkbox   ("Show event markers", &settings.showEventMarkers);
 				ImGui::Separator();
+				// Native colour draws each point's stored colour, without the
+				// calls' glow, bloom or medium; the event markers still show.
+				NativeColourDim dim;
 				ImGui::ColorEdit3 ("Emission colour",  settings.emissionColour, ImGuiColorEditFlags_NoInputs);
 				ImGui::SameLine(0.0f);
 				ImGui::Checkbox   ("by frequency",     &settings.emissionByFrequency);
@@ -3958,6 +4106,7 @@ int main(int argc, char** argv){
 				{
 					// The sliders rebuild the colour grid when let go, not on every
 					// frame of a drag: a rebuild recounts every point and relights.
+					NativeColourDim dim;
 					bool wf = ImGui::Checkbox("Fix blown-out canopy", &settings.whiteFix);
 					tipFor("The scanner's camera saturates in the sunlit canopy, so leaves and branches there come out white. This recolours those points from the nearest well-exposed points around them: green from foliage, brown from bark.");
 					ImGui::SliderFloat("White level",   &settings.whiteLevel,  100.0f, 250.0f, "%.0f");
@@ -4014,6 +4163,14 @@ int main(int argc, char** argv){
 				tipFor("Off freezes the level of detail and the culling at the current view, so you can move away and see which parts of the octree that view selected.");
 				ImGui::Checkbox   ("Colour by node",    &settings.colorByNode);
 				ImGui::Checkbox   ("Colour by LOD",     &settings.colorByLOD);
+				ImGui::Separator();
+				// The run log follows the working directory (build/Release when
+				// started from Visual Studio), so say where this one is.
+				ImGui::TextDisabled("Run log");
+				ImGui::TextWrapped("%s", g_logPath.empty() ? "(no log file could be written)" : g_logPath.c_str());
+				if(!g_logPath.empty() && ImGui::SmallButton("Copy log path")){
+					ImGui::SetClipboardText(g_logPath.c_str());
+				}
 			}
 
 			// if(ImGui::Button("Do Color Filtering!")){
