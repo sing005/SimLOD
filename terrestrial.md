@@ -76,6 +76,7 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 - A ray that hits no point (sky, or the void below the horizon) gets the haze, its ambient light and its sunbeams only with Haze over sky (`fogSky`) on. The march's dither is fixed per pixel; a per-frame one made the lit haze flicker.
 - `volBuf` holds RGB plus the distance to the surface each ray sees (`SKY_DISTANCE` for sky). The composite upsamples it with weights from that distance (joint bilateral), so lit haze does not spread across silhouettes.
 - The composite keeps the backdrop (sky, or the void below the horizon) apart from the scene light and grades only the scene. Anything added in front of the sky is graded the same as when it is in front of geometry.
+- The look must not change a point's hue by itself. The key light and the torch act on linear light, and `packLitColour()` scales all three channels together when the brightest passes 1. The tone curve is applied to each pixel's brightest channel, with the others scaled by the same factor. With a neutral grade (mix 1, temperature 0, saturation 1) the stored hue is kept; only Mix, Temperature, Saturation and Tint change it. Clipping or tone-mapping each channel on its own turned the scan's olive foliage yellow.
 
 **Adaptive detail.**
 - `updateAdaptiveDetail()` steers `g_adaptReduce` from the render kernel's time against `settings.frameBudgetMs`.

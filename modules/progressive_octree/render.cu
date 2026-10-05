@@ -407,6 +407,25 @@ inline bool nativeColour(){
 	return uniforms.nativeColour != 0;
 }
 
+// A lit colour back to the 8-bit sRGB a point is stored and blended in. Light
+// is added in linear light, as the haze's is, and when the brightest channel
+// passes 1 all three are scaled down together, so the colour keeps its hue.
+// Lighting used to multiply the sRGB bytes and clip each channel at 255 on
+// its own: on olive foliage red and green reached 255 while blue did not, and
+// sunlit leaves turned yellow. In full sun at the default strength that was
+// 42% of the foliage points in data/samples/every100.laz.
+inline uint32_t packLitColour(float r, float g, float b, uint32_t alphaBits){
+	float m = fmaxf(r, fmaxf(g, b));
+	if(m > 1.0f){
+		float s = 1.0f / m;
+		r *= s; g *= s; b *= s;
+	}
+	uint32_t ri = uint32_t(linearToSrgb(r) * 255.0f + 0.5f);
+	uint32_t gi = uint32_t(linearToSrgb(g) * 255.0f + 0.5f);
+	uint32_t bi = uint32_t(linearToSrgb(b) * 255.0f + 0.5f);
+	return alphaBits | (bi << 16) | (gi << 8) | ri;
+}
+
 // ---- torch -------------------------------------------------------------
 // A spotlight held at the camera and aimed through the mouse pixel. It adds
 // light in proportion to a point's own (repaired) colour, so a lit leaf stays
@@ -428,13 +447,11 @@ inline uint32_t applyTorch(uint32_t lit, uint32_t base, float px, float py, floa
 	float spot = t * t * (3.0f - 2.0f * t);
 	float rr = d / fmaxf(uniforms.torchRange, 0.1f);
 	float k = uniforms.torchIntensity * spot / (1.0f + rr * rr);
-	float r = float((lit      ) & 0xff) + k * float((base      ) & 0xff);
-	float g = float((lit >>  8) & 0xff) + k * float((base >>  8) & 0xff);
-	float b = float((lit >> 16) & 0xff) + k * float((base >> 16) & 0xff);
-	uint32_t ri = uint32_t(fminf(r, 255.0f));
-	uint32_t gi = uint32_t(fminf(g, 255.0f));
-	uint32_t bi = uint32_t(fminf(b, 255.0f));
-	return (lit & 0xff000000u) | (bi << 16) | (gi << 8) | ri;
+	// in linear light, limited without changing hue (packLitColour, above)
+	float r = srgbToLinear(float((lit      ) & 0xff)) + k * srgbToLinear(float((base      ) & 0xff));
+	float g = srgbToLinear(float((lit >>  8) & 0xff)) + k * srgbToLinear(float((base >>  8) & 0xff));
+	float b = srgbToLinear(float((lit >> 16) & 0xff)) + k * srgbToLinear(float((base >> 16) & 0xff));
+	return packLitColour(r, g, b, lit & 0xff000000u);
 }
 
 // ---- blown-out colour repair -------------------------------------------
@@ -580,20 +597,18 @@ inline uint32_t repairColour(uint32_t c, float px, float py, float pz){
 
 // Combine the key light with an ambient floor. Backlit foliage goes toward the
 // light colour; shadowed points keep their own colour at ambient strength.
+// Both act on linear light, so a point in full shade keeps the ambient share
+// of its light (0.109, about a third of its sRGB value), the level the haze
+// in shade darkens to.
 inline uint32_t applyKeyLight(uint32_t c, float trans){
 	if(nativeColour() || uniforms.lightOn == 0 || uniforms.lightIntensity <= 0.0f) return c;
-	// ambient floors the shadow; intensity scales the lit side. Capped so the
-	// brightest fully-lit point cannot exceed 2x its own colour, which is
-	// plenty and stops strength 4 turning foliage into flat yellow.
+	// ambient floors the shadow; intensity scales the lit side; at most 4x
 	float k = uniforms.ambient + (1.0f - uniforms.ambient) * trans * uniforms.lightIntensity;
 	if(k > 4.0f) k = 4.0f;
-	float r = float((c      ) & 0xff) * k * uniforms.lightR;
-	float g = float((c >>  8) & 0xff) * k * uniforms.lightG;
-	float b = float((c >> 16) & 0xff) * k * uniforms.lightB;
-	uint32_t ri = uint32_t(fminf(r, 255.0f));
-	uint32_t gi = uint32_t(fminf(g, 255.0f));
-	uint32_t bi = uint32_t(fminf(b, 255.0f));
-	return (c & 0xff000000u) | (bi << 16) | (gi << 8) | ri;
+	float r = srgbToLinear(float((c      ) & 0xff)) * k * uniforms.lightR;
+	float g = srgbToLinear(float((c >>  8) & 0xff)) * k * uniforms.lightG;
+	float b = srgbToLinear(float((c >> 16) & 0xff)) * k * uniforms.lightB;
+	return packLitColour(r, g, b, c & 0xff000000u);
 }
 
 // ---- haze and sunbeams ------------------------------------------------------
@@ -3283,9 +3298,20 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			g *= uniforms.exposure;
 			b *= uniforms.exposure;
 
-			r = acesToneMap(r);
-			g = acesToneMap(g);
-			b = acesToneMap(b);
+			{
+				// The curve on the brightest channel, the other two scaled by
+				// the same factor, so a colour keeps its hue as it brightens
+				// (tone mapping one brightness value and keeping the colour
+				// ratios, as Reinhard et al. 2002 do with luminance). Applied
+				// to each channel on its own, the curve compressed the largest
+				// channels most: at exposure 4 sunlit foliage moved 6 degrees
+				// of hue toward yellow, and bright glows went white. Keeping
+				// both curves behind a switch made this per-pixel loop spill
+				// registers, so there is only this one.
+				float m = fmaxf(r, fmaxf(g, b));
+				float s = m > 0.0f ? acesToneMap(m) / m : 0.0f;
+				r *= s; g *= s; b *= s;
+			}
 
 			// grain (apply_look.ps1): per pixel, per frame, applied after the
 			// tone curve so it reads as texture on the image, not as noise in

@@ -237,7 +237,7 @@ struct {
 	float lightColour[3]             = {1.0f, 1.0f, 1.0f};      // white
 	float lightIntensity             = 2.5f;
 	float ambient                    = 0.109f;   // shadowed points keep a third of their colour
-	float lightAbsorb                = 0.16f;   // per metre: 5 m of canopy passes ~14%
+	float lightAbsorb                = 0.16f;   // per metre: 5 m of canopy passes about 45% (exp(-0.8))
 	int   lightSteps                 = 40;
 	float sunbeams                   = 1.0f;    // key light in the haze; 0 = haze lit by ambient only
 	float sunAnisotropy              = 0.5f;    // forward scattering of the haze (Henyey-Greenstein g)
@@ -3900,7 +3900,7 @@ int main(int argc, char** argv){
 				ImGui::SliderFloat("Mix blue",         &settings.mixColour[2],   0.0f, 2.5f);
 				ImGui::SameLine(0.0f);
 				if(ImGui::SmallButton("reset##mix")){ settings.mixColour[0] = settings.mixColour[1] = settings.mixColour[2] = 1.0f; }
-				tipFor("Per-channel gain in linear light. 1.0 is neutral. Below removes a cast, above adds one.");
+				tipFor("Per-channel gain in linear light. 1.0 is neutral. Below removes a cast, above adds one. The scan's foliage is olive, red close to green, so red above green turns it yellow.");
 				ImGui::Separator();
 				ImGui::ColorEdit3 ("Tint colour",       settings.tintColour, ImGuiColorEditFlags_NoInputs);
 				ImGui::SliderFloat("Tint mix",          &settings.tintMix,     0.0f,  1.0f);
