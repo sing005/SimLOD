@@ -87,6 +87,8 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 
 **Runtime outputs.** These are written to the working directory and are git-ignored:
 - `log/simlod_<timestamp>.log`, written by `logLine()`.
+  - The folder is relative to the working directory, so started from Visual Studio the log is in `build/Release/log/`. If that folder cannot be written, the log goes next to the executable, then to the temp folder. The full path is in the `[host] run log` line at the top of every log and is shown under Display and debug.
+  - The first lines record the working directory, where the kernels are loaded from, the GPU (name, compute capability, SMs, memory, clocks, bus width, driver and NVRTC versions) and the OpenGL renderer.
   - Periodic status lines go through `logIfChanged()`.
   - Each run is capped at 20 MB, and only the newest 10 logs are kept.
   - `CrashHandler.cpp` appends a symbolised stack trace on any unhandled exception. Start any crash investigation there.
