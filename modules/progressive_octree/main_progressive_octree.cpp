@@ -1647,7 +1647,6 @@ static void resetToUnedited(){
 	// points
 	settings.pointWorldSize        = d.pointWorldSize;
 	settings.pointSize             = d.pointSize;
-	settings.maxSplatPx            = d.maxSplatPx;
 	settings.roundSplats           = d.roundSplats;
 	settings.useHighQualityShading = d.useHighQualityShading;
 	settings.pointShading          = d.pointShading;
