@@ -67,7 +67,9 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 - Fixed arrays in these structs, such as `MAX_EVENTS` and the 32-entry marker arrays, are bounds-checked on the host.
 
 **Per-frame flow.**
-1. `beginFrameState()` runs once per frame. It (re)allocates the voxel and light grids, settles the one-shot `g_gridRefill` / `g_lightDirty` requests into `g_frameGridRefill` / `g_frameLightDirty`, and updates adaptive detail.
+1. `beginFrameState()` runs once per frame. It (re)allocates the voxel, colour and light grids, settles the one-shot `g_gridRefill` / `g_lightDirty` requests into `g_frameGridRefill` / `g_frameLightDirty`, and updates adaptive detail.
+   - The light grid is held only while the key light is on.
+   - The colour grid (8 bytes a cell) is held only while Fix blown-out canopy is on, or while the bird's-eye view waits to be rebuilt with its colours. The next grid rebuild fills it.
 2. `renderCUDA()` and `updateOctree()` launch the kernels. Each calls `getUniforms()`, which copies `settings` and frame state into `Uniforms`.
 3. `Stats` is read back with an unsynchronised `cuMemcpyDtoHAsync`, so host reads lag by a frame or more and a single read can be half-copied. Results the host must not miss use a request id that the kernel answers once and leaves in place (see `pickSeq` / `pickSeqDone`).
 

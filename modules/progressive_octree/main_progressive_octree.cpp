@@ -756,8 +756,9 @@ float3 boxSize = float3{0.0, 0.0, 0.0};
 static CUdeviceptr g_voxelGrid  = 0;
 static int         g_gridResolution = 256;   // cells along the longest side
 static int         g_gridBuiltAtRes = 0;     // what the CURRENT counts were built with
-static CUdeviceptr g_lightGrid  = 0;         // apply_keylight.ps1: per-cell transmittance
-static CUdeviceptr g_colourGrid = 0;         // per-cell repair colour, uint64; same dimensions
+static CUdeviceptr g_lightGrid  = 0;         // per-cell transmittance toward the key light
+static CUdeviceptr g_colourGrid = 0;         // per-cell repair colour, uint64; same dimensions; held while needed
+static bool        g_colourGridFailed = false;   // no room at these dimensions: not retried every frame
 
 // ---- markers (apply_navigate.ps1) -----------------------------------------
 // Picked positions, renderer frame (translated by boxMin). Exported in FILE
@@ -1156,6 +1157,41 @@ static void ensureLightGrid(bool wanted){
 	logLine("[grid] light grid allocated, %.0f MB\n", double(lbytes) / 1e6);
 }
 
+// The colour repair grid: 8 bytes a cell, twice the occupancy grid's size.
+// Fix blown-out canopy reads it, and the bird's-eye view takes its colours
+// from it. It used to be allocated with the occupancy grid and held for as
+// long, whether or not either needed it; now it is held only while one of
+// them does (beginFrameState), and the next grid rebuild fills it. The key
+// light's grid, the occupancy grid's size, is allocated after this one, so
+// room is left for it while the light is off: the optional grid must not
+// cost the light.
+static void ensureColourGrid(bool wanted){
+	if(!wanted){
+		if(g_colourGrid != 0){
+			cuMemFree(g_colourGrid);
+			g_colourGrid = 0;
+			logLine("[grid] colour repair grid freed\n");
+		}
+		return;
+	}
+	if(g_colourGrid != 0 || g_colourGridFailed) return;
+	if(g_voxelGrid == 0 || g_gridX <= 0 || g_gridY <= 0 || g_gridZ <= 0) return;
+	size_t cbytes = size_t(g_gridX) * size_t(g_gridY) * size_t(g_gridZ) * sizeof(uint64_t);
+	size_t lightRoom = g_lightGrid != 0 ? 0 : g_gridBytes;
+	size_t freeMem = 0, totalMem = 0;
+	cuMemGetInfo(&freeMem, &totalMem);
+	if(cbytes + lightRoom + 64'000'000 < freeMem && cuMemAlloc(&g_colourGrid, cbytes) == CUDA_SUCCESS){
+		cuMemsetD8(g_colourGrid, 0, cbytes);
+		g_gridRefill = true;   // filled with the counts at the next rebuild
+		logLine("[grid] colour repair grid allocated, %.1f MB\n", double(cbytes) / 1e6);
+	}else{
+		g_colourGrid = 0;
+		g_colourGridFailed = true;
+		logLine("[grid] colour repair grid (%.0f MB) would not fit (%.0f MB free); blown-out points stay white\n",
+			double(cbytes) / 1e6, double(freeMem) / 1e6);
+	}
+}
+
 // kernel_render's scratch, per frame: the visible-node list (16.8 MB, from
 // HostDeviceInterface.h) and the 16 MB line list, then per pixel 45 B:
 // framebuffer 8, emission 12, bloom chain 4, quarter-resolution volumetrics
@@ -1310,24 +1346,9 @@ static void ensureVoxelGrid(){
 	g_gridX = gx; g_gridY = gy; g_gridZ = gz; g_cellSize = cell;
 	g_gridBuiltAtRes = R;
 
-	// Colour repair grid, twice the occupancy grid's size. Optional: without
-	// it blown-out points keep their white, nothing else is affected. The key
-	// light's grid (the occupancy grid's size) is allocated after this one,
-	// so leave room for it: the optional grid must not cost the light.
-	{
-		size_t cbytes = size_t(gx) * size_t(gy) * size_t(gz) * sizeof(uint64_t);
-		size_t lightRoom = bytes;
-		size_t freeMem = 0, totalMem = 0;
-		cuMemGetInfo(&freeMem, &totalMem);
-		if(cbytes + lightRoom + 64'000'000 < freeMem && cuMemAlloc(&g_colourGrid, cbytes) == CUDA_SUCCESS){
-			cuMemsetD8(g_colourGrid, 0, cbytes);
-			logLine("[grid] colour repair grid %.1f MB\n", double(cbytes) / 1e6);
-		}else{
-			g_colourGrid = 0;
-			logLine("[grid] colour repair grid (%.0f MB) would not fit (%.0f MB free); blown-out points stay white\n",
-				double(cbytes) / 1e6, double(freeMem) / 1e6);
-		}
-	}
+	// The colour repair grid, freed above with the old grid, is allocated
+	// again by ensureColourGrid, and only while it is needed.
+	g_colourGridFailed = false;   // new dimensions: worth another try
 	// The grid has just been zeroed, so whatever counts it held are gone. Say
 	// so, rather than setting g_gridBuiltAtRes and reporting it as current -
 	// which is what hid this: the resolution slider emptied the grid on every
@@ -1338,8 +1359,9 @@ static void ensureVoxelGrid(){
 }
 
 // ---- bird's-eye view -------------------------------------------------------
-// A plan view of the whole domain, built from the occupancy grid (and the
-// colour repair grid, when there is one) each time the grid is rebuilt: per
+// A plan view of the whole domain, built from the occupancy grid and the
+// colour repair grid (held for it while the view is rebuilt, when there is
+// room for it) each time the grid is rebuilt: per
 // column, the colour of the highest coloured cell, or a green shade from the
 // column's point count. The camera, its view direction and the markers are
 // drawn over it every frame.
@@ -1347,6 +1369,8 @@ static int    g_refillGen  = 0;     // bumped when a grid rebuild is launched
 static int    g_minimapGen = -1;    // the rebuild the minimap was made from
 static GLuint g_minimapTex = 0;
 static int    g_minimapW = 0, g_minimapH = 0;
+static bool   g_minimapColoured = false;   // the view was built with the colour grid
+static bool   g_birdsEyeDrawn   = false;   // drawn in the last settings window; read by beginFrameState
 
 static void buildMinimap(){
 	if(g_voxelGrid == 0 || g_gridX <= 0 || g_gridY <= 0 || g_gridZ <= 0) return;
@@ -1402,11 +1426,17 @@ static void buildMinimap(){
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
 	glBindTexture(GL_TEXTURE_2D, 0);
 	g_minimapW = W; g_minimapH = H;
+	g_minimapColoured = !col.empty();
 	logLine("[host] bird's-eye view rebuilt, %d x %d\n", W, H);
 }
 
 static void drawBirdsEye(shared_ptr<GLRenderer> renderer){
-	if(g_refillGen != g_minimapGen && !g_gridRefill && g_voxelGrid != 0){
+	g_birdsEyeDrawn = true;   // keeps the colour grid while this view needs it
+	// Rebuilt after each grid rebuild. While the colour grid is on its way
+	// (allocated next frame, then filled by a rebuild), wait for it rather
+	// than build the view twice, once without colour.
+	bool colourComing = g_colourGrid == 0 && !g_colourGridFailed;
+	if(g_refillGen != g_minimapGen && !g_gridRefill && g_voxelGrid != 0 && !colourComing){
 		buildMinimap();
 		g_minimapGen = g_refillGen;
 	}
@@ -1517,6 +1547,16 @@ static void beginFrameState(int width, int height){
 	// it crashed in the driver.
 	g_frameRenderable = width > 0 && height > 0 && ensureRenderBuffer(width, height);
 	ensureVoxelGrid();
+	// The colour grid serves Fix blown-out canopy, and the bird's-eye view
+	// (Camera) while that view waits to be rebuilt: held only while either
+	// needs it. Turning the fix on tries again after a failure.
+	bool birdsEyeShown = g_birdsEyeDrawn;   // drawn in last frame's settings window
+	g_birdsEyeDrawn = false;
+	static bool whiteFixWas = false;
+	if(settings.whiteFix && !whiteFixWas) g_colourGridFailed = false;
+	whiteFixWas = settings.whiteFix;
+	ensureColourGrid(settings.whiteFix
+		|| (birdsEyeShown && (g_gridRefill || g_minimapGen != g_refillGen || !g_minimapColoured)));
 	ensureLightGrid(settings.lightOn);
 
 	// kernel_render is the only one to act on the requests below; on a frame
@@ -4256,7 +4296,7 @@ int main(int argc, char** argv){
 					wf |= ImGui::IsItemDeactivatedAfterEdit();
 					tipFor("How far a blown-out cell looks for a colour. Each cell is the occupancy grid's cell size.");
 					if(wf) g_gridRefill = true;   // the colour grid is rebuilt with the counts
-					if(settings.whiteFix && g_colourGrid == 0 && g_voxelGrid != 0) ImGui::Text("   not enough GPU memory for the colour grid");
+					if(settings.whiteFix && g_colourGridFailed) ImGui::Text("   not enough GPU memory for the colour grid");
 				}
 				ImGui::Separator();
 				// Edit a copy and apply it on release: every applied value frees and
@@ -4266,7 +4306,9 @@ int main(int argc, char** argv){
 				if(!ImGui::IsAnyItemActive()) pendingGridRes = g_gridResolution;   // follow fallbacks
 				ImGui::SliderInt  ("Grid resolution",  &pendingGridRes, 64, 512);
 				if(ImGui::IsItemDeactivatedAfterEdit()) g_gridResolution = pendingGridRes;
-				tipFor("Cells along the cloud's longest side. Applied when you release the slider. Memory grows with the cube: 256 is ~20 MB, 512 ~156 MB.");
+				tipFor("Cells along the cloud's longest side. Applied when you release the slider. Memory grows with the cube: 256 is ~20 MB, 512 ~156 MB. "
+					   "The key light's grid takes as much again while the light is on, and the colour grid twice as much while Fix blown-out canopy is on "
+					   "(and briefly while the bird's-eye view is rebuilt).");
 				{
 					float longest = std::max(boxSize.x, std::max(boxSize.y, boxSize.z));
 					if(longest > 0.0f){
@@ -4277,6 +4319,7 @@ int main(int argc, char** argv){
 						int pz = std::min(R, int(boxSize.z / cell) + 1);
 						double mb = double(px) * double(py) * double(pz) * 4.0 / 1e6;
 						ImGui::Text("   %d x %d x %d @ %.3f m = %.0f MB", px, py, pz, cell, mb);
+						ImGui::Text("   + %.0f MB with the key light, + %.0f MB with Fix blown-out canopy", mb, 2.0 * mb);
 					}
 					if(g_gridRefill) ImGui::Text("   counts are stale - rebuilding on the next frame");
 				}
