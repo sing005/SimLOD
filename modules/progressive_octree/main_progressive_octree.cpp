@@ -1743,8 +1743,9 @@ static void resetToUnedited(){
 // and its playback, the test source, detail and speed (Max splat px among
 // them), the grids, the debug views and Show culled only, and Volume reach,
 // which is fitted to each cloud. The names are the file format: renaming one
-// loses that value from files saved before.
-using Settings = decltype(settings);
+// loses that value from files saved before. The settings type is written
+// decltype(settings) throughout: MSVC takes an alias of the unnamed struct as
+// its name and then refuses the struct's default values (error C7626).
 
 // The event radius fitted to a cloud when it loads: 12% of its longest side.
 static float fittedEventRadius(){
@@ -1758,7 +1759,7 @@ static float fittedEventRadius(){
 // panel allows. Colours are float[3]; switches take 0 and 1 as limits. The
 // calls' event radius and visual tail are globals rather than members of s.
 template<typename Section, typename Setting>
-static void forEachLookSetting(Settings& s, const Settings& d, Section&& section, Setting&& setting){
+static void forEachLookSetting(decltype(settings)& s, const decltype(settings)& d, Section&& section, Setting&& setting){
 	section("Points");
 	setting("point_size_m",           s.pointWorldSize,        d.pointWorldSize,        0.0f, 0.3f);
 	setting("point_shading",          s.pointShading,          d.pointShading,          0.0f, 1.0f);
@@ -1981,7 +1982,7 @@ static bool saveLook(const std::filesystem::path& path, std::string& error){
 			"# setting below to its starting value, so a setting left out of the file\n"
 			"# takes its starting value. Values are kept within the sliders' ranges, and\n"
 			"# unknown names are ignored. Text after # is a comment.\n";
-	Settings start{};
+	decltype(settings) start{};
 	forEachLookSetting(settings, start,
 		[&](const char* title){ text += "\n# "; text += title; text += "\n"; },
 		[&](const char* name, auto& value, const auto&, auto, auto){
@@ -2043,7 +2044,7 @@ static bool loadLook(const std::filesystem::path& path){
 	}
 
 	auto before = settings;
-	Settings start{};
+	decltype(settings) start{};
 	std::set<std::string> applied;
 	int total = 0;
 	forEachLookSetting(settings, start, [](const char*){},
