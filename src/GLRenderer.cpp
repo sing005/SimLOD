@@ -37,8 +37,12 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 	cout << "key: " << key << ", scancode: " << scancode << ", action: " << action << ", mods: " << mods << endl;
 
 	// Esc closes the viewer, except while a text field or slider has the
-	// keyboard: there Esc cancels the edit, and closing lost unsaved markers
-	if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS && !ImGui::GetIO().WantCaptureKeyboard) {
+	// keyboard (there Esc cancels the edit) or a popup is open, such as a
+	// colour picker: ImGui 1.81 counts neither popups nor non-modal windows in
+	// WantCaptureKeyboard, so Esc pressed to dismiss a picker closed the viewer
+	// and lost unsaved markers and the loaded cloud.
+	bool popupOpen = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup);   // reads the popup stack only
+	if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS && !ImGui::GetIO().WantCaptureKeyboard && !popupOpen) {
 		glfwSetWindowShouldClose(window, GLFW_TRUE);
 	}
 
