@@ -71,6 +71,14 @@ def convert(src, out_dir):
                     print(f"  {100.0 * done / header.point_count:5.1f}%", end="\r", flush=True)
                 if header.evlrs:        # LAS 1.4 extended VLRs; the writer does not copy them
                     writer.write_evlrs(header.evlrs)
+                # The input's bounds, not the points' own: laspy's writer resets
+                # them and grows them from the points written. SimLOD places its
+                # frame at the header's minimum corner, so with a header box
+                # looser than the points (the full Rotokare scans) the .las moved
+                # the frame, and --view and the haze floor meant something else
+                # than on the .laz. recolour_canopy.py keeps them the same way.
+                writer.header.mins = header.mins
+                writer.header.maxs = header.maxs
         except BaseException:
             if os.path.exists(part):
                 os.remove(part)
