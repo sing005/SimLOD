@@ -142,13 +142,18 @@ void* h_stats_pinned = nullptr;
 
 double t_drop_start = 0.0;
 
+// Settings. Everything that changes how the cloud is represented starts at the
+// value that changes nothing, the unedited baseline: each point in the colour
+// stored in the file, with nothing added and nothing hidden. Every effect is
+// built up from there. Reset to unedited (resetToUnedited) returns to these
+// values, and Show unedited draws the cloud as they would.
 struct {
 	bool useHighQualityShading       = true;
 	bool showBoundingBox             = false;
 	bool doUpdateVisibility          = true;
 	bool showPoints                  = true;
-	bool showMarkers                 = true;    // apply_markers2.ps1
-	bool markersOnly                 = false;   // apply_markers2.ps1: hide forest and insects
+	bool showMarkers                 = true;
+	bool markersOnly                 = false;   // hide the forest and insects
 	bool colorByNode                 = false;
 	bool colorByLOD                  = false;
 	bool autoFocusOnLoad             = true;
@@ -167,8 +172,8 @@ struct {
 	// Depth haze: distance goes LIGHTER. The slider is logarithmic: 0.001 is
 	// already a visible haze, 0.018 washes out past ~30 m. The colour is sRGB,
 	// like the other colour pickers (white is the same either way).
-	bool  enableFog                  = true;
-	float fogDensity                 = 0.00024f;
+	bool  enableFog                  = false;   // follows fogDensity > 0
+	float fogDensity                 = 0.0f;    // 0 = no haze
 	float fogR                       = 1.0f;    // white haze
 	float fogG                       = 1.0f;
 	float fogB                       = 1.0f;
@@ -176,12 +181,13 @@ struct {
 	float fogBase                    = 0.0f;    // metres above the lowest point
 	bool  fogSky                     = false;   // haze between the camera and the sky as well
 	bool  enableBloom                = false;
-	float bloomStrength              = 1.2f;
+	float bloomStrength              = 0.0f;    // 0 = no bloom
 	float bloomRadius                = 3.0f;   // now a mip level count, 0-5
-	bool  nativeColour               = true;   // each point in its stored colour; off for the look below
-	float exposure                   = 4.0f;   // low-key, as the reference
+	bool  showUnedited               = false;  // compare: draw the cloud as Reset to unedited leaves it
+	float exposure                   = 1.0f;
+	float toneCurve                  = 0.0f;   // 0 = none .. 1 = the ACES fit
 	float emissionGain               = 3.0f;
-	int   numInsects                 = 12273;
+	int   numInsects                 = 0;
 	int   insectSize                 = 2;
 	float insectGlow                 = 2.0f;
 	float insectSpeed                = 0.5f;
@@ -215,20 +221,19 @@ struct {
 	int   cullReach                  = 0;
 	bool  showCulledOnly             = false;
 
-	// apply_features.ps1
 	int64_t targetPoints             = 0;       // 0 = not yet set; filled from the cloud on load
-	float saturation                 = 2.5f;
-	float temperature                = 0.07f;  // blue-shifted blacks
+	float saturation                 = 1.0f;
+	float temperature                = 0.0f;   // negative cool, positive warm
 	float tintColour[3]              = {0.55f, 0.75f, 0.60f};
 	float tintMix                    = 0.0f;
 	float skyColour[3]               = {0.16f, 0.17f, 0.17f};   // dark grey
 
-	// look refinement (apply_look.ps1)
+	// look refinement
 	float pointWorldSize             = 0.085f;   // metres; 0 falls back to pointSize pixels
-	float pointShading               = 1.0f;
+	float pointShading               = 0.0f;     // 0 = flat disc
 	int   maxSplatPx                 = 24;
 	float grain                      = 0.0f;
-	float vignette                   = 0.402f;
+	float vignette                   = 0.0f;
 
 	// directional key light. Defaults: high and behind, as in the reference,
 	// warm-green light through the canopy.
@@ -239,13 +244,13 @@ struct {
 	float ambient                    = 0.109f;   // shadowed points keep a third of their colour
 	float lightAbsorb                = 0.16f;   // per metre: 5 m of canopy passes about 45% (exp(-0.8))
 	int   lightSteps                 = 40;
-	float sunbeams                   = 1.0f;    // key light in the haze; 0 = haze lit by ambient only
+	float sunbeams                   = 0.0f;    // key light in the haze; 0 = haze lit by ambient only
 	float sunAnisotropy              = 0.5f;    // forward scattering of the haze (Henyey-Greenstein g)
 
 	// key light switch, near clip, mixer, camera, lens, horizon, markers
-	bool  lightOn                    = true;   // key light switch
+	bool  lightOn                    = false;  // key light switch
 	float nearClip                   = 0.81f;
-	float mixColour[3]               = {1.075f, 1.267f, 1.495f};
+	float mixColour[3]               = {1.0f, 1.0f, 1.0f};
 	float eyeHeight                  = 3.37f;    // metres above the lowest point
 	float lookUpDeg                  = 17.05f;
 	int   lensMode                   = 0;       // 0 perspective, 1 fisheye
@@ -256,7 +261,7 @@ struct {
 
 	// blown-out colour repair (render.cu): the scanner's camera whites out the
 	// sunlit canopy; those points take the colour of their neighbourhood
-	bool  whiteFix                   = true;
+	bool  whiteFix                   = false;
 	float whiteLevel                 = 100.0f;  // darkest channel at least this ...
 	float whiteSpread                = 120.0f;  // ... and channels this close = blown out
 	int   whiteReach                 = 1;       // cells searched for colour
@@ -571,16 +576,16 @@ static void tipFor(const char* text){
 	}
 }
 
-// Native colour skips every step these controls set (nativeColour() in
-// render.cu), so while it is on they are drawn faint for the scope of one of
-// these. They stay editable, so the look can be prepared before turning it
-// off. With them drawn as usual, every setting but point size seemed broken.
-struct NativeColourDim{
+// Show unedited skips every step these controls set (showUnedited() in
+// render.cu), so while it is ticked they are drawn faint for the scope of one
+// of these. They stay editable. Drawn as usual, they seemed broken: every
+// setting but point size did nothing while the comparison was on.
+struct UneditedDim{
 	bool active;
-	NativeColourDim() : active(settings.nativeColour){
+	UneditedDim() : active(settings.showUnedited){
 		if(active) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.4f);
 	}
-	~NativeColourDim(){ if(active) ImGui::PopStyleVar(); }
+	~UneditedDim(){ if(active) ImGui::PopStyleVar(); }
 };
 
 #include <csignal>
@@ -1582,6 +1587,109 @@ static float srgbToLinear01(float c){
 	return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
 }
 
+// ---- Reset to unedited --------------------------------------------------------
+// Every setting that changes how the cloud is represented goes back to its
+// starting value: the switches and amounts to the unedited baseline (no light,
+// torch, haze, sunbeams, bloom, insects, point shading or eye dome lighting,
+// no canopy repair or cull, a neutral grade, no tone curve), and the settings
+// that only shape an effect once it is on (light direction and colour, haze
+// colour and floor, torch beam, insect size) to their starting values, so an
+// effect turned on again starts from the same place each time. Point size,
+// splat shape and high-quality shading go back to their starting values too,
+// and the points are shown again in their stored colours: Show points on,
+// Markers only and the debug colours off.
+// Kept: the camera, lens and near clip, the sky, the horizon and the colour
+// below it, markers and survey, calls and their playback, detail and speed,
+// the bounding box, voxel grid and Update visibility views, and the grids.
+static void resetToUnedited(){
+	const decltype(settings) d{};   // the starting values
+
+	// points
+	settings.pointWorldSize        = d.pointWorldSize;
+	settings.pointSize             = d.pointSize;
+	settings.maxSplatPx            = d.maxSplatPx;
+	settings.roundSplats           = d.roundSplats;
+	settings.useHighQualityShading = d.useHighQualityShading;
+	settings.pointShading          = d.pointShading;
+	settings.enableEDL             = d.enableEDL;
+	settings.edlStrength           = d.edlStrength;
+
+	// key light and torch
+	settings.lightOn        = d.lightOn;
+	settings.lightAzimuth   = d.lightAzimuth;
+	settings.lightElevation = d.lightElevation;
+	settings.lightIntensity = d.lightIntensity;
+	settings.ambient        = d.ambient;
+	settings.lightAbsorb    = d.lightAbsorb;
+	settings.lightSteps     = d.lightSteps;
+	for(int i = 0; i < 3; i++) settings.lightColour[i] = d.lightColour[i];
+	settings.torchOn        = d.torchOn;
+	settings.torchIntensity = d.torchIntensity;
+	settings.torchAngle     = d.torchAngle;
+	settings.torchRange     = d.torchRange;
+
+	// haze, sunbeams and the volume march. Volume reach follows the loaded
+	// cloud, as it is set on load.
+	settings.enableFog        = d.enableFog;
+	settings.fogDensity       = d.fogDensity;
+	settings.fogR             = d.fogR;
+	settings.fogG             = d.fogG;
+	settings.fogB             = d.fogB;
+	settings.fogHeightFalloff = d.fogHeightFalloff;
+	settings.fogBase          = d.fogBase;
+	settings.fogSky           = d.fogSky;
+	settings.sunbeams         = d.sunbeams;
+	settings.sunAnisotropy    = d.sunAnisotropy;
+	settings.volSteps         = d.volSteps;
+	float diag = std::sqrt(boxSize.x*boxSize.x + boxSize.y*boxSize.y + boxSize.z*boxSize.z);
+	settings.volMaxDist       = (diag > 0.0f && std::isfinite(diag)) ? diag * 1.5f : d.volMaxDist;
+
+	// colour
+	settings.exposure    = d.exposure;
+	settings.toneCurve   = d.toneCurve;
+	settings.saturation  = d.saturation;
+	settings.temperature = d.temperature;
+	for(int i = 0; i < 3; i++){
+		settings.mixColour[i]  = d.mixColour[i];
+		settings.tintColour[i] = d.tintColour[i];
+	}
+	settings.tintMix     = d.tintMix;
+	settings.grain       = d.grain;
+	settings.vignette    = d.vignette;
+
+	// bloom (under Calls)
+	settings.enableBloom   = d.enableBloom;
+	settings.bloomStrength = d.bloomStrength;
+	settings.bloomRadius   = d.bloomRadius;
+
+	// insects
+	settings.numInsects      = d.numInsects;
+	settings.insectSize      = d.insectSize;
+	settings.insectGlow      = d.insectGlow;
+	settings.insectSpeed     = d.insectSpeed;
+	settings.insectPlacement = d.insectPlacement;
+
+	// scan clean-up: canopy repair and stray-point cull
+	settings.whiteFix       = d.whiteFix;
+	settings.whiteLevel     = d.whiteLevel;
+	settings.whiteSpread    = d.whiteSpread;
+	settings.whiteReach     = d.whiteReach;
+	settings.tintMargin     = d.tintMargin;
+	settings.minNeighbours  = d.minNeighbours;
+	settings.cullReach      = d.cullReach;
+	settings.showCulledOnly = d.showCulledOnly;
+
+	// the points shown, in their stored colours
+	settings.showPoints  = d.showPoints;
+	settings.markersOnly = d.markersOnly;
+	settings.colorByNode = d.colorByNode;
+	settings.colorByLOD  = d.colorByLOD;
+
+	settings.showUnedited = false;   // the settings are the baseline now; keep their controls live
+	g_lightDirty = true;             // relit with the reset values when the light is next on
+	logLine("[host] settings reset to unedited\n");
+}
+
 Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	Uniforms uniforms;
 
@@ -1655,9 +1763,11 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.boxMax                   = boxSize;
 	uniforms.frameCounter             = frameCounter;
 	uniforms.showBoundingBox          = settings.showBoundingBox;
-	uniforms.showPoints               = settings.showPoints;
-	uniforms.colorByNode              = settings.colorByNode;
-	uniforms.colorByLOD               = settings.colorByLOD;
+	// Show unedited draws the points as Reset to unedited leaves them: shown,
+	// in their stored colours rather than the debug colours.
+	uniforms.showPoints               = settings.showPoints || settings.showUnedited;
+	uniforms.colorByNode              = settings.colorByNode && !settings.showUnedited;
+	uniforms.colorByLOD               = settings.colorByLOD && !settings.showUnedited;
 	uniforms.minNodeSize              = effectiveMinNodeSize();
 	uniforms.pointSize                = settings.pointSize;
 	uniforms.useHighQualityShading    = settings.useHighQualityShading;
@@ -1835,7 +1945,8 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.maxSplatPx       = effectiveMaxSplatPx();
 	uniforms.grain            = settings.grain;
 	uniforms.vignette         = settings.vignette;
-	uniforms.nativeColour     = settings.nativeColour ? 1 : 0;
+	uniforms.showUnedited     = settings.showUnedited ? 1 : 0;
+	uniforms.toneCurve        = std::clamp(settings.toneCurve, 0.0f, 1.0f);
 	{
 		double az = settings.lightAzimuth   * 3.14159265358979 / 180.0;
 		double el = settings.lightElevation * 3.14159265358979 / 180.0;
@@ -1953,7 +2064,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 			g_gridX, g_gridY, g_gridZ, g_cellSize, settings.numInsects, settings.insectPlacement);
 	}
 
-	if(settings.markersOnly){   // apply_markers2.ps1: the array on its own
+	if(settings.markersOnly && !settings.showUnedited){   // the marker array on its own
 		uniforms.showPoints = 0;
 		uniforms.numInsects = 0;
 	}
@@ -3226,9 +3337,10 @@ int main(int argc, char** argv){
 			else if(key == "torch")     settings.torchOn               = v != 0.0;   // aims at the frame centre
 			else if(key == "radius")  { g_eventRadiusArg = float(v); if(v > 0.0) g_eventRadius = float(v); }
 			else if(key == "exposure")  settings.exposure              = float(v);
-			else if(key == "native")    settings.nativeColour          = v != 0.0;   // 0 = the look
+			else if(key == "unedited" || key == "native") settings.showUnedited = v != 0.0;   // 1 = the unedited view; "native" was its old name
+			else if(key == "tone")      settings.toneCurve             = float(v);
 			else if(key == "keep")      loadKeepPer10k = uint32_t(std::clamp(v, 0.01, 1.0) * 10000.0 + 0.5);   // fraction of each file loaded
-			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze, hazefall, hazefloor, hazesky, light, sunbeams, whitefix, skycast, torch, radius, exposure, native, keep)\n", key);
+			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze, hazefall, hazefloor, hazesky, light, sunbeams, whitefix, skycast, torch, radius, exposure, tone, unedited, keep)\n", key);
 		}else if(iEndsWith(arg, "las") || iEndsWith(arg, "laz") || iEndsWith(arg, "simlod")){
 			std::error_code ec;
 			auto absolute = std::filesystem::absolute(arg, ec);   // dropped files are absolute too
@@ -3710,13 +3822,23 @@ int main(int argc, char** argv){
 			// Colour are open by default. Every control appears exactly once.
 			// =====================================================================
 
-			// ---- NATIVE COLOUR --------------------------------------------------
-			ImGui::Checkbox("Native colour", &settings.nativeColour);
-			tipFor("Each point in the colour stored in the file. While this is on, the key light, torch, point shading, "
-				   "Fix blown-out canopy, eye dome lighting, haze, sunbeams, bloom and the whole Colour section are skipped. "
-				   "Turn it off for the look.");
-			if(settings.nativeColour){
-				ImGui::TextDisabled("The look is off: the faint settings below have no effect.");
+			// ---- UNEDITED ---------------------------------------------------------
+			// Every setting below starts at the value that changes nothing, so
+			// the cloud starts as stored in the file. Reset returns there; Show
+			// unedited compares the current settings with it.
+			if(ImGui::Button("Reset to unedited")) resetToUnedited();
+			tipFor("Returns every setting that changes how the cloud is represented to its starting value: the cloud as stored in the file, "
+				   "with no light, torch, haze, sunbeams, bloom, insects, point shading, eye dome lighting, canopy repair or cull, "
+				   "a neutral grade and no tone curve. Point size, round splats and high-quality shading go back to their starting values, "
+				   "and the points are shown again in their stored colours (Show points on; Markers only, Colour by node and Colour by LOD off). "
+				   "Kept: the camera, lens and near clip, the sky and horizon, markers and survey, calls, detail and speed, "
+				   "and the bounding box, voxel grid and Update visibility.");
+			ImGui::SameLine();
+			ImGui::Checkbox("Show unedited", &settings.showUnedited);
+			tipFor("Draws the cloud as Reset to unedited would leave it, without changing your settings: tick to compare, untick to return to them. "
+				   "Point size, splat shape and high-quality shading stay as set, so the points keep their size and shape.");
+			if(settings.showUnedited){
+				ImGui::TextDisabled("Showing the unedited cloud: the faint settings have no effect until this is unticked.");
 			}
 
 			// ---- CAMERA -------------------------------------------------------
@@ -3800,7 +3922,7 @@ int main(int argc, char** argv){
 				ImGui::SliderFloat("Point size (m)",   &settings.pointWorldSize, 0.0f, 0.30f, "%.3f");
 				tipFor("Splat diameter in metres, projected by depth. Near points large, far ones small.");
 				{
-					NativeColourDim dim;
+					UneditedDim dim;
 					ImGui::SliderFloat("Point shading",    &settings.pointShading,   0.0f, 1.0f);
 					tipFor("Shades each splat as a small sphere lit from the upper left. 0 is a flat disc.");
 				}
@@ -3811,7 +3933,7 @@ int main(int argc, char** argv){
 				tipFor("Blends the colours of all points within 1% of the nearest depth at each pixel, which smooths the speckle where points overlap. Draws every point twice, a depth pass and a colour pass, so it costs more than the standard path.");
 				ImGui::Separator();
 				{
-					NativeColourDim dim;
+					UneditedDim dim;
 					ImGui::Checkbox   ("Eye dome lighting", &settings.enableEDL);
 					ImGui::SliderFloat("EDL strength",      &settings.edlStrength, 0.0f, 3.0f);
 				}
@@ -3819,7 +3941,7 @@ int main(int argc, char** argv){
 
 			// ---- LIGHT --------------------------------------------------------
 			if(ImGui::CollapsingHeader("Light")){
-				NativeColourDim dim;
+				UneditedDim dim;
 				bool lm = false;
 				lm |= ImGui::Checkbox   ("Key light on",     &settings.lightOn);
 				tipFor("A directional light through the canopy, computed once per cell of the occupancy grid (Grid resolution, under Scan clean-up).");
@@ -3856,7 +3978,7 @@ int main(int argc, char** argv){
 				ImGui::SliderFloat("Horizon softness", &settings.horizonSoftness, 0.0f, 90.0f, "%.0f deg");
 				tipFor("Degrees the sky-to-void gradient spans. It was effectively 1 degree, which drew a hard line across the frame. 12 reads as atmosphere; 90 is a full gradient from zenith to nadir; 0 is a deliberate hard edge.");
 				ImGui::Separator();
-				NativeColourDim dim;   // the haze and everything below it; the sky colours above still apply
+				UneditedDim dim;   // the haze and everything below it; the sky colours above still apply
 				ImGui::SliderFloat("Depth haze",       &settings.fogDensity,     0.0f, 0.08f, "%.5f",
 						ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
 				tipFor("Distance blends toward the haze colour. The reference goes LIGHTER with distance, so keep the colour pale. The value is the haze's density per metre at and below the haze floor.");
@@ -3887,9 +4009,13 @@ int main(int argc, char** argv){
 
 			// ---- COLOUR -------------------------------------------------------
 			if(ImGui::CollapsingHeader("Colour", ImGuiTreeNodeFlags_DefaultOpen)){
-				NativeColourDim dim;
+				UneditedDim dim;
 				ImGui::SliderFloat("Exposure",         &settings.exposure,       0.1f, 16.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-				tipFor("Overall brightness. Logarithmic: up to 16x, for scans whose colour was darkened to tame the sunlit canopy.");
+				tipFor("Overall brightness. 1 leaves it as stored. Logarithmic: up to 16x, for scans whose colour was darkened to tame the sunlit canopy.");
+				ImGui::SliderFloat("Tone curve",       &settings.toneCurve,      0.0f, 1.0f);
+				tipFor("0 leaves brightness as it is; a colour brighter than white is brought down to white whole, keeping its hue. "
+					   "1 is the ACES fit, a film-like curve that darkens the deepest shadows, lifts the mid-tones and compresses the highlights. "
+					   "It acts on each pixel's brightest channel and scales the other two with it, so hues are kept.");
 				ImGui::SliderFloat("Saturation",       &settings.saturation,     0.0f, 2.5f);
 				ImGui::SliderFloat("Temperature",      &settings.temperature,   -1.0f, 1.0f);
 				tipFor("Negative is cool, positive warm.");
@@ -3931,9 +4057,9 @@ int main(int argc, char** argv){
 				ImGui::Text("clock %.1f s   active %d", g_showClock, g_activeEvents);
 				ImGui::Checkbox   ("Show event markers", &settings.showEventMarkers);
 				ImGui::Separator();
-				// Native colour draws each point's stored colour, without the
-				// calls' glow, bloom or medium; the event markers still show.
-				NativeColourDim dim;
+				// The unedited view draws each point's stored colour, without
+				// the calls' glow, bloom or medium; the event markers still show.
+				UneditedDim dim;
 				ImGui::ColorEdit3 ("Emission colour",  settings.emissionColour, ImGuiColorEditFlags_NoInputs);
 				ImGui::SameLine(0.0f);
 				ImGui::Checkbox   ("by frequency",     &settings.emissionByFrequency);
@@ -3975,6 +4101,7 @@ int main(int argc, char** argv){
 
 			// ---- INSECTS ------------------------------------------------------
 			if(ImGui::CollapsingHeader("Insects")){
+				UneditedDim dim;   // no insects in the unedited view
 				ImGui::SliderInt  ("Count",            &settings.numInsects,   0, 30000);
 				ImGui::SliderInt  ("Size (px)",        &settings.insectSize,   1,     4);
 				ImGui::SliderFloat("Glow",             &settings.insectGlow,   0.0f, 6.0f);
@@ -3989,8 +4116,11 @@ int main(int argc, char** argv){
 				ImGui::Separator();
 				ImGui::Checkbox("Show markers", &settings.showMarkers);
 				ImGui::SameLine(0.0f);
-				ImGui::Checkbox("Markers only", &settings.markersOnly);
-				tipFor("Markers only hides the forest and the insects so the array can be seen on its own. Nothing is discarded.");
+				{
+					UneditedDim dim;   // the unedited view shows the forest
+					ImGui::Checkbox("Markers only", &settings.markersOnly);
+					tipFor("Markers only hides the forest and the insects so the array can be seen on its own. Nothing is discarded.");
+				}
 				ImGui::TextWrapped("Hover a checkerboard centre and press P. A magenta ball marks it. Coordinates below are FILE coordinates: the LAS frame, the one the mic survey must be matched to.");
 				if(!g_markers.empty()) ImGui::Separator();
 				int removeIdx = -1;
@@ -4096,17 +4226,20 @@ int main(int argc, char** argv){
 
 			// ---- SCAN CLEAN-UP ------------------------------------------------
 			if(ImGui::CollapsingHeader("Scan clean-up")){
-				ImGui::SliderInt  ("Min neighbours",   &settings.minNeighbours, 0, 60);
-				tipFor("Removes points whose grid cell holds fewer than this many. 0 is off. Scanner noise sits alone; leaves do not.");
-				ImGui::SliderInt  ("Cull reach",       &settings.cullReach,     0, 1);
-				tipFor("0 counts the point's own cell. 1 adds the six neighbours, which spares thin surfaces on a cell boundary.");
-				ImGui::Checkbox   ("Show culled only", &settings.showCulledOnly);
-				tipFor("Shows ONLY what would be removed. Raise Min neighbours until this is noise and nothing you want.");
+				{
+					UneditedDim dim;   // no cull in the unedited view
+					ImGui::SliderInt  ("Min neighbours",   &settings.minNeighbours, 0, 60);
+					tipFor("Removes points whose grid cell holds fewer than this many. 0 is off. Scanner noise sits alone; leaves do not.");
+					ImGui::SliderInt  ("Cull reach",       &settings.cullReach,     0, 1);
+					tipFor("0 counts the point's own cell. 1 adds the six neighbours, which spares thin surfaces on a cell boundary.");
+					ImGui::Checkbox   ("Show culled only", &settings.showCulledOnly);
+					tipFor("Shows ONLY what would be removed. Raise Min neighbours until this is noise and nothing you want.");
+				}
 				ImGui::Separator();
 				{
 					// The sliders rebuild the colour grid when let go, not on every
 					// frame of a drag: a rebuild recounts every point and relights.
-					NativeColourDim dim;
+					UneditedDim dim;
 					bool wf = ImGui::Checkbox("Fix blown-out canopy", &settings.whiteFix);
 					tipFor("The scanner's camera saturates in the sunlit canopy, so leaves and branches there come out white. This recolours those points from the nearest well-exposed points around them: green from foliage, brown from bark.");
 					ImGui::SliderFloat("White level",   &settings.whiteLevel,  100.0f, 250.0f, "%.0f");
@@ -4156,13 +4289,19 @@ int main(int argc, char** argv){
 				ImGui::Checkbox   ("Small menu text",   &g_smallMenuText);
 				tipFor("Draws this window in a 10-pixel font with tighter spacing, so more of it fits on screen. Off returns to the 13-pixel font.");
 				ImGui::Separator();
-				ImGui::Checkbox   ("Show points",       &settings.showPoints);
+				{
+					UneditedDim dim;   // the unedited view shows the points
+					ImGui::Checkbox   ("Show points",       &settings.showPoints);
+				}
 				ImGui::Checkbox   ("Show bounding box", &settings.showBoundingBox);
 				ImGui::Checkbox   ("Show voxel grid",   &settings.showVoxelGrid);
 				ImGui::Checkbox   ("Update visibility", &settings.doUpdateVisibility);
 				tipFor("Off freezes the level of detail and the culling at the current view, so you can move away and see which parts of the octree that view selected.");
-				ImGui::Checkbox   ("Colour by node",    &settings.colorByNode);
-				ImGui::Checkbox   ("Colour by LOD",     &settings.colorByLOD);
+				{
+					UneditedDim dim;   // the unedited view shows the stored colours
+					ImGui::Checkbox   ("Colour by node",    &settings.colorByNode);
+					ImGui::Checkbox   ("Colour by LOD",     &settings.colorByLOD);
+				}
 				ImGui::Separator();
 				// The run log follows the working directory (build/Release when
 				// started from Visual Studio), so say where this one is.

@@ -147,14 +147,15 @@ struct Uniforms{
 	float    skyG;
 	float    skyB;
 
-	// look refinement (apply_look.ps1)
+	// look refinement
 	float    pointWorldSize;    // splat diameter in metres; 0 = fixed pixel size
 	float    pointShading;      // 0 flat disc .. 1 fully shaded sphere
 	float    focalPx;           // height / (2 tan(fovy/2)), for projecting sizes
 	int      maxSplatPx;        // cap on projected splat size
 	float    grain;             // film grain amplitude
 	float    vignette;          // corner darkening 0..1
-	int      nativeColour;      // 1 = each point in its stored colour: no light, shading, repair, haze or grade
+	float    toneCurve;         // 0 none (brightness limited at white, hue kept) .. 1 the ACES fit
+	int      showUnedited;      // 1 = the unedited view: stored colours; no light, shading, repair, haze, grade, insects or cull
 
 	// directional key light
 	uint64_t lightGridPtr;      // per-cell transmittance toward the light, 0..1
