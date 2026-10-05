@@ -38,6 +38,20 @@ inline uint32_t strlen(const char* str){
 	return length;
 }
 
+// Calls f(i) for i in [0, size), grid-stride: thread t takes t, t + T, t + 2T,
+// ... for T threads in the grid, so the 32 threads of a warp work on 32
+// neighbouring items at each step and their memory accesses coalesce.
+// processRange (below) gives each thread a contiguous run instead, which puts
+// a warp's threads hundreds of items apart. In the composite this form also
+// needs fewer registers: kernel_render then spills nothing.
+template<typename Function>
+void processRangeStrided(int size, Function&& f){
+	int total = int(blockDim.x * gridDim.x);
+	for(int i = int(blockIdx.x * blockDim.x + threadIdx.x); i < size; i += total){
+		f(i);
+	}
+}
+
 // calls function <f> <size> times
 // calls are distributed over all available threads
 template<typename Function>
