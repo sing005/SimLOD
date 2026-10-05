@@ -200,17 +200,24 @@ inline bool projectPoint(float px, float py, float pz, int& sx, int& sy, float& 
 	return depth > 0.0f;
 }
 
-// ---- pixel to world ray (apply_navigate.ps1) -----------------------------
+// ---- pixel to world ray ---------------------------------------------------
 // The inverse of projectPoint: which direction does this pixel look along.
-// Used by the volumetric medium, by the sky/below-horizon split, and by the
-// marker picker. Was inline in the volumetric code; now shared.
+// Used by the volumetric medium, by the sky/below-horizon split, by the
+// marker picker and by the torch.
+//
+// The point unprojected is at NDC depth 0, about 2 near-plane distances in
+// front of the camera, not at the far plane. With near 0.1 m and far 2e6 m
+// the far point's w is below 1e-6, the size of float rounding in the inverse
+// matrix, so its sign was wrong for some pixels and the ray pointed backwards:
+// 1925 of 15000 rays over 600 camera positions in a float32 test, against
+// none at depth 0, with the same worst direction error (0.03 degrees).
 inline bool pixelRayDir(float px, float py, float3& dir){
 	float ndcx = (px / uniforms.width)  * 2.0f - 1.0f;
 	float ndcy = (py / uniforms.height) * 2.0f - 1.0f;
 	if(uniforms.lensMode == 0){
-		float4 farP = uniforms.transformInv * float4{ndcx, ndcy, 1.0f, 1.0f};
-		if(farP.w == 0.0f) return false;
-		float3 world = float3{farP.x / farP.w, farP.y / farP.w, farP.z / farP.w};
+		float4 nearP = uniforms.transformInv * float4{ndcx, ndcy, 0.0f, 1.0f};
+		if(!(nearP.w > 0.0f)) return false;
+		float3 world = float3{nearP.x / nearP.w, nearP.y / nearP.w, nearP.z / nearP.w};
 		dir = world - uniforms.camPos;
 		float len = sqrt(dir.x*dir.x + dir.y*dir.y + dir.z*dir.z);
 		if(len < 1e-6f) return false;
