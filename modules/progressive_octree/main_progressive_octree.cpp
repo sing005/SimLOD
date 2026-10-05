@@ -12,6 +12,9 @@
 #include <deque>
 #include <atomic>
 #include <optional>
+#include <charconv>
+#include <map>
+#include <set>
 #ifdef __cpp_lib_format
 #include <format>
 #else
@@ -30,6 +33,7 @@ using namespace fmt;
 #include "HostDeviceInterface.h"
 #include "ProggyTinyFont.h"
 #include "CrashHandler.h"
+#include "UserFolders.h"
 
 // Uniforms is passed to the kernels by value, and CUDA caps kernel parameters
 // at 4 KB. Growing past that fails at launch, not at compile time, without this.
@@ -622,8 +626,10 @@ static std::vector<ScheduledCall> g_calls;
 static bool   g_callsLoaded  = false;
 static double g_showClock    = 0.0;
 static bool   g_showPlaying  = false;
-static float  g_visualTail   = 1.2f;    // seconds the glow outlasts the call
-static float  g_eventRadius  = 4.0f;    // metres
+static const float VISUAL_TAIL_START  = 1.2f;   // seconds
+static const float EVENT_RADIUS_START = 4.0f;   // metres, until a cloud is loaded
+static float  g_visualTail   = VISUAL_TAIL_START;    // seconds the glow outlasts the call
+static float  g_eventRadius  = EVENT_RADIUS_START;   // metres
 static float  g_eventRadiusArg = 0.0f;  // --set radius=: replaces the fit to the cloud; 0 = fit
 static int    g_activeEvents = 0;        // for the GUI readout
 
@@ -1729,6 +1735,468 @@ static void resetToUnedited(){
 	logLine("[host] settings reset to unedited\n");
 }
 
+// ---- looks ----------------------------------------------------------------------
+// A look is every setting that decides how the image looks, kept in a text
+// file of name = value lines so it outlasts the session: Save look and Load
+// look at the top of the settings panel, --look on the command line. Left
+// out: the camera, lens and near clip, markers and survey, the call schedule
+// and its playback, the test source, detail and speed (Max splat px among
+// them), the grids, the debug views and Show culled only, and Volume reach,
+// which is fitted to each cloud. The names are the file format: renaming one
+// loses that value from files saved before.
+using Settings = decltype(settings);
+
+// The event radius fitted to a cloud when it loads: 12% of its longest side.
+static float fittedEventRadius(){
+	float longest = std::max(boxSize.x, std::max(boxSize.y, boxSize.z));
+	return (longest > 0.0f && std::isfinite(longest)) ? longest * 0.12f : EVENT_RADIUS_START;
+}
+
+// Calls section(title) for each panel, then setting(name, value, starting
+// value, lowest, highest) for each setting a look holds, in panel order. The
+// limits are the sliders' own, so a hand-edited file stays within what the
+// panel allows. Colours are float[3]; switches take 0 and 1 as limits. The
+// calls' event radius and visual tail are globals rather than members of s.
+template<typename Section, typename Setting>
+static void forEachLookSetting(Settings& s, const Settings& d, Section&& section, Setting&& setting){
+	section("Points");
+	setting("point_size_m",           s.pointWorldSize,        d.pointWorldSize,        0.0f, 0.3f);
+	setting("point_shading",          s.pointShading,          d.pointShading,          0.0f, 1.0f);
+	setting("round_splats",           s.roundSplats,           d.roundSplats,           0, 1);
+	setting("high_quality_shading",   s.useHighQualityShading, d.useHighQualityShading, 0, 1);
+	setting("eye_dome_lighting",      s.enableEDL,             d.enableEDL,             0, 1);
+	setting("edl_strength",           s.edlStrength,           d.edlStrength,           0.0f, 3.0f);
+
+	section("Light");
+	setting("key_light_on",           s.lightOn,               d.lightOn,               0, 1);
+	setting("light_azimuth_deg",      s.lightAzimuth,          d.lightAzimuth,          0.0f, 360.0f);
+	setting("light_elevation_deg",    s.lightElevation,        d.lightElevation,        0.0f, 89.0f);
+	setting("light_strength",         s.lightIntensity,        d.lightIntensity,        0.0f, 6.0f);
+	setting("light_colour",           s.lightColour,           d.lightColour,           0.0f, 1.0f);
+	setting("ambient",                s.ambient,               d.ambient,               0.0f, 1.0f);
+	setting("canopy_density",         s.lightAbsorb,           d.lightAbsorb,           0.0f, 1.5f);
+	setting("torch_on",               s.torchOn,               d.torchOn,               0, 1);
+	setting("torch_strength",         s.torchIntensity,        d.torchIntensity,        0.0f, 20.0f);
+	setting("torch_beam_deg",         s.torchAngle,            d.torchAngle,            2.0f, 60.0f);
+	setting("torch_reach_m",          s.torchRange,            d.torchRange,            1.0f, 60.0f);
+
+	section("Sky and haze");
+	setting("sky_colour",             s.skyColour,             d.skyColour,             0.0f, 1.0f);
+	setting("below_horizon_colour",   s.belowColour,           d.belowColour,           0.0f, 1.0f);
+	setting("horizon_softness_deg",   s.horizonSoftness,       d.horizonSoftness,       0.0f, 90.0f);
+	setting("depth_haze",             s.fogDensity,            d.fogDensity,            0.0f, 0.08f);
+	setting("haze_thins_with_height", s.fogHeightFalloff,      d.fogHeightFalloff,      0.0f, 0.5f);
+	setting("haze_floor_m",           s.fogBase,               d.fogBase,               0.0f, 1000.0f);
+	setting("haze_over_sky",          s.fogSky,                d.fogSky,                0, 1);
+	{
+		// three settings in the struct, one colour in the panel and the file
+		float haze[3] = {s.fogR, s.fogG, s.fogB};
+		const float hazeStart[3] = {d.fogR, d.fogG, d.fogB};
+		setting("haze_colour",        haze,                    hazeStart,               0.0f, 1.0f);
+		s.fogR = haze[0]; s.fogG = haze[1]; s.fogB = haze[2];
+	}
+	setting("sunbeams",               s.sunbeams,              d.sunbeams,              0.0f, 4.0f);
+	setting("forward_scatter",        s.sunAnisotropy,         d.sunAnisotropy,         0.0f, 0.9f);
+	setting("volume_steps",           s.volSteps,              d.volSteps,              8, 128);
+
+	section("Colour");
+	setting("exposure",               s.exposure,              d.exposure,              0.1f, 16.0f);
+	setting("tone_curve",             s.toneCurve,             d.toneCurve,             0.0f, 1.0f);
+	setting("saturation",             s.saturation,            d.saturation,            0.0f, 2.5f);
+	setting("temperature",            s.temperature,           d.temperature,          -1.0f, 1.0f);
+	setting("mix",                    s.mixColour,             d.mixColour,             0.0f, 2.5f);
+	setting("tint_colour",            s.tintColour,            d.tintColour,            0.0f, 1.0f);
+	setting("tint_mix",               s.tintMix,               d.tintMix,               0.0f, 1.0f);
+	setting("grain",                  s.grain,                 d.grain,                 0.0f, 0.15f);
+	setting("vignette",               s.vignette,              d.vignette,              0.0f, 1.0f);
+
+	section("Calls: glow, bloom and medium");
+	setting("emission_colour",        s.emissionColour,        d.emissionColour,        0.0f, 1.0f);
+	setting("emission_by_frequency",  s.emissionByFrequency,   d.emissionByFrequency,   0, 1);
+	setting("emission_gain",          s.emissionGain,          d.emissionGain,          0.0f, 12.0f);
+	setting("event_radius_m",         g_eventRadius,           fittedEventRadius(),     0.1f, 1000.0f);
+	setting("falloff_power",          s.falloffPower,          d.falloffPower,          0.5f, 8.0f);
+	setting("core_boost",             s.coreBoost,             d.coreBoost,             0.0f, 8.0f);
+	setting("visual_tail_s",          g_visualTail,            VISUAL_TAIL_START,       0.0f, 4.0f);
+	setting("bloom_strength",         s.bloomStrength,         d.bloomStrength,         0.0f, 4.0f);
+	setting("bloom_spread",           s.bloomRadius,           d.bloomRadius,           0.0f, 5.0f);
+	setting("volumetric_medium",      s.enableVolumetric,      d.enableVolumetric,      0, 1);
+	setting("medium_density",         s.volDensity,            d.volDensity,            0.0f, 0.12f);
+	setting("medium_scatter",         s.volScatter,            d.volScatter,            0.0f, 6.0f);
+	setting("medium_pools_low",       s.volHeightFalloff,      d.volHeightFalloff,      0.0f, 0.05f);
+	setting("medium_occlusion",       s.volOcclusion,          d.volOcclusion,          0.0f, 3.0f);
+	setting("medium_shadow_steps",    s.volShadowSteps,        d.volShadowSteps,        0, 16);
+
+	section("Insects");
+	setting("insects",                s.numInsects,            d.numInsects,            0, 30000);
+	setting("insect_size_px",         s.insectSize,            d.insectSize,            1, 4);
+	setting("insect_glow",            s.insectGlow,            d.insectGlow,            0.0f, 6.0f);
+	setting("insect_speed",           s.insectSpeed,           d.insectSpeed,           0.0f, 2.0f);
+	setting("insect_placement",       s.insectPlacement,       d.insectPlacement,       0, 1);
+
+	section("Scan clean-up");
+	setting("min_neighbours",         s.minNeighbours,         d.minNeighbours,         0, 60);
+	setting("cull_reach",             s.cullReach,             d.cullReach,             0, 1);
+	setting("fix_blown_out_canopy",   s.whiteFix,              d.whiteFix,              0, 1);
+	setting("white_level",            s.whiteLevel,            d.whiteLevel,            100.0f, 250.0f);
+	setting("white_spread",           s.whiteSpread,           d.whiteSpread,           5.0f, 120.0f);
+	setting("sky_cast",               s.tintMargin,            d.tintMargin,            0.0f, 60.0f);
+	setting("colour_reach_cells",     s.whiteReach,            d.whiteReach,            1, 8);
+}
+
+static void lookAssign(float& a, float b){ a = b; }
+static void lookAssign(int& a, int b){ a = b; }
+static void lookAssign(bool& a, bool b){ a = b; }
+static void lookAssign(float (&a)[3], const float (&b)[3]){ a[0] = b[0]; a[1] = b[1]; a[2] = b[2]; }
+
+// The shortest text that reads back as the same float, with a point for the
+// decimal whatever the system's region settings.
+static std::string lookFormat(float v){
+	char buf[32];
+	auto r = std::to_chars(buf, buf + sizeof(buf), v);
+	return std::string(buf, r.ptr);
+}
+static std::string lookFormat(int v){ return std::to_string(v); }
+static std::string lookFormat(bool v){ return v ? "1" : "0"; }
+static std::string lookFormat(const float (&v)[3]){
+	return lookFormat(v[0]) + " " + lookFormat(v[1]) + " " + lookFormat(v[2]);
+}
+
+// n numbers separated by spaces or commas, and nothing else. from_chars
+// ignores the locale, so "0,5" is refused rather than read as 0.
+static bool lookNumbers(const std::string& text, double* out, int n){
+	const char* p = text.data();
+	const char* end = p + text.size();
+	for(int i = 0; i < n; i++){
+		while(p < end && (*p == ' ' || *p == '\t' || (i > 0 && *p == ','))) p++;
+		if(p < end && *p == '+') p++;   // from_chars takes a minus but not a plus
+		auto r = std::from_chars(p, end, out[i]);
+		if(r.ec != std::errc() || !std::isfinite(out[i])) return false;
+		p = r.ptr;
+	}
+	while(p < end && (*p == ' ' || *p == '\t')) p++;
+	return p == end;
+}
+static bool lookParse(const std::string& text, float& v, float lo, float hi){
+	double x;
+	if(!lookNumbers(text, &x, 1)) return false;
+	v = std::clamp(float(x), lo, hi);
+	return true;
+}
+static bool lookParse(const std::string& text, int& v, int lo, int hi){
+	double x;
+	if(!lookNumbers(text, &x, 1)) return false;
+	v = int(std::lround(std::clamp(x, double(lo), double(hi))));
+	return true;
+}
+static bool lookParse(const std::string& text, bool& v, int, int){
+	std::string t = text;
+	for(char& c : t) c = char(std::tolower((unsigned char)c));
+	if(t == "1" || t == "on"  || t == "true"  || t == "yes"){ v = true;  return true; }
+	if(t == "0" || t == "off" || t == "false" || t == "no") { v = false; return true; }
+	return false;
+}
+static bool lookParse(const std::string& text, float (&v)[3], float lo, float hi){
+	double x[3];
+	if(!lookNumbers(text, x, 3)) return false;
+	for(int i = 0; i < 3; i++) v[i] = std::clamp(float(x[i]), lo, hi);
+	return true;
+}
+
+// Paths as UTF-8 for the log and the panel, and back: ImGui works in UTF-8,
+// and a std::string path on Windows would be read in the system code page,
+// which turns a macron in a look's name into something else.
+static std::string pathText(const std::filesystem::path& p){
+	auto u = p.u8string();
+	return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+}
+static std::filesystem::path pathFromUtf8(const std::string& s){
+	return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(s.data()), s.size()));
+}
+
+// Looks go in Documents\SimLOD\looks, so they outlast the build folder and,
+// unlike the run log, do not depend on the working directory. If that cannot
+// be made: next to the executable, then the working directory.
+static std::filesystem::path looksFolder(){
+	static std::filesystem::path chosen;
+	if(!chosen.empty()) return chosen;
+	std::vector<std::filesystem::path> dirs;
+	auto docs = documentsFolder();
+	if(!docs.empty()) dirs.push_back(docs / "SimLOD" / "looks");
+	if(!g_exeDir.empty()) dirs.push_back(g_exeDir / "looks");
+	std::error_code ec;
+	auto here = std::filesystem::absolute("looks", ec);
+	if(!ec) dirs.push_back(here);
+	for(const auto& dir : dirs){
+		std::filesystem::create_directories(dir, ec);
+		if(std::filesystem::is_directory(dir, ec)){
+			chosen = dir;
+			logLine("[look] looks folder: %s\n", pathText(dir).c_str());
+			break;
+		}
+	}
+	return chosen;
+}
+
+// A file name from what was typed: characters Windows does not allow in a
+// name become '_', spaces and dots at either end go, and the reserved device
+// names (CON, NUL, COM1 and so on) get a '_' in front. Other characters,
+// macrons among them, are kept as typed.
+static std::string lookFileName(const std::string& typed){
+	std::string s;
+	for(unsigned char c : typed){
+		s += (c < 32 || std::strchr("<>:\"/\\|?*", c) != nullptr) ? '_' : char(c);
+	}
+	size_t a = s.find_first_not_of(" .");
+	if(a == std::string::npos) return "";
+	size_t b = s.find_last_not_of(" .");
+	s = s.substr(a, b - a + 1);
+	std::string upper = s;
+	for(char& c : upper) c = char(std::toupper((unsigned char)c));
+	static const char* reserved[] = {"CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+	for(const char* r : reserved) if(upper == r) return "_" + s;
+	return s;
+}
+
+static std::string g_lookName;   // the last look saved or loaded, offered as the next name
+
+static bool saveLook(const std::filesystem::path& path, std::string& error){
+	std::string text;
+	{
+		std::time_t tt = std::time(nullptr);
+		std::tm tmv{};
+	#ifdef _WIN32
+		localtime_s(&tmv, &tt);
+	#else
+		localtime_r(&tt, &tmv);
+	#endif
+		char stamp[64];
+		std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M", &tmv);
+		text += "# SimLOD look, saved " + std::string(stamp) + "\n";
+	}
+	text += "# One setting per line, name = value. Colours are red, green and blue, from\n"
+			"# 0 to 1; switches are 1 (on) or 0 (off). Loading a look first returns every\n"
+			"# setting below to its starting value, so a setting left out of the file\n"
+			"# takes its starting value. Values are kept within the sliders' ranges, and\n"
+			"# unknown names are ignored. Text after # is a comment.\n";
+	Settings start{};
+	forEachLookSetting(settings, start,
+		[&](const char* title){ text += "\n# "; text += title; text += "\n"; },
+		[&](const char* name, auto& value, const auto&, auto, auto){
+			text += name; text += " = "; text += lookFormat(value); text += "\n";
+		});
+
+	// Written under another name and renamed when complete, so an interrupted
+	// save never leaves a short file in place of a good one.
+	std::filesystem::path part = path;
+	part += ".part";
+	std::error_code ec;
+	{
+		std::ofstream out(part);
+		out << text;
+		out.close();
+		if(!out){
+			error = "could not write " + pathText(part);
+			std::filesystem::remove(part, ec);
+			return false;
+		}
+	}
+	std::filesystem::rename(part, path, ec);
+	if(ec){
+		error = "could not write " + pathText(path) + ": " + ec.message();
+		std::filesystem::remove(part, ec);
+		return false;
+	}
+	return true;
+}
+
+static bool loadLook(const std::filesystem::path& path){
+	std::ifstream in(path);
+	if(!in){
+		logLine("[look] cannot open %s\n", pathText(path).c_str());
+		notice("Could not open the look %s", pathText(path.filename()).c_str());
+		return false;
+	}
+	auto trim = [](const std::string& s){
+		size_t a = s.find_first_not_of(" \t\r");
+		if(a == std::string::npos) return std::string();
+		size_t b = s.find_last_not_of(" \t\r");
+		return s.substr(a, b - a + 1);
+	};
+	std::map<std::string, std::string> values;   // a name given twice: the last one counts
+	std::vector<std::string> problems;
+	std::string line;
+	bool firstLine = true;
+	while(std::getline(in, line)){
+		// a byte order mark, which some editors write, would become part of the first name
+		if(firstLine && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
+		firstLine = false;
+		size_t hash = line.find('#');
+		if(hash != std::string::npos) line.erase(hash);
+		line = trim(line);
+		if(line.empty()) continue;
+		size_t eq = line.find('=');
+		if(eq == std::string::npos){ problems.push_back("no '=' in: " + line); continue; }
+		values[trim(line.substr(0, eq))] = trim(line.substr(eq + 1));
+	}
+
+	auto before = settings;
+	Settings start{};
+	std::set<std::string> applied;
+	int total = 0;
+	forEachLookSetting(settings, start, [](const char*){},
+		[&](const char* name, auto& value, const auto& startValue, auto lo, auto hi){
+			total++;
+			lookAssign(value, startValue);
+			auto it = values.find(name);
+			if(it == values.end()) return;
+			if(lookParse(it->second, value, lo, hi)) applied.insert(name);
+			else problems.push_back(std::string(name) + " = " + it->second + ": not a valid value, so its starting value is used");
+			values.erase(it);
+		});
+	for(const auto& kv : values) problems.push_back("unknown setting " + kv.first + ", ignored");
+
+	// A saved event radius is kept when a cloud loads, as --set radius= keeps
+	// one; without one, the radius is fitted to each cloud.
+	g_eventRadiusArg = applied.count("event_radius_m") ? g_eventRadius : 0.0f;
+	// switches the panel sets from an amount
+	settings.enableFog   = settings.fogDensity > 0.0f;
+	settings.enableBloom = settings.bloomStrength > 0.0f;
+	settings.showUnedited = false;   // show the look just loaded
+	g_lightDirty = true;
+	// the colour grid is built with these, so it must be built again
+	if(settings.whiteLevel != before.whiteLevel || settings.whiteSpread != before.whiteSpread
+	|| settings.tintMargin != before.tintMargin || settings.whiteReach != before.whiteReach){
+		g_gridRefill = true;
+	}
+
+	g_lookName = pathText(path.stem());
+	logLine("[look] loaded %s: %d of its %d settings from the file\n", pathText(path).c_str(), int(applied.size()), total);
+	for(const auto& p : problems) logLine("[look]   %s\n", p.c_str());
+	if(problems.empty()) notice("Look %s loaded", g_lookName.c_str());
+	else notice("Look %s loaded, with %d problem(s): see the run log", g_lookName.c_str(), int(problems.size()));
+	return true;
+}
+
+// --look: a file, or the name of a look in the looks folder
+static bool loadLookArg(const std::string& arg){
+	std::filesystem::path p(arg);   // argv is in the system code page, as a std::string path expects
+	std::vector<std::filesystem::path> tries = {p};
+	auto dir = looksFolder();
+	if(!dir.empty()){
+		tries.push_back(dir / p);
+		auto withTxt = dir / p;
+		withTxt += ".txt";
+		tries.push_back(withTxt);
+	}
+	std::error_code ec;
+	for(const auto& t : tries){
+		if(std::filesystem::is_regular_file(t, ec)) return loadLook(t);
+	}
+	logLine("[look] --look %s: no such file here or in %s\n", arg.c_str(), pathText(dir).c_str());
+	return false;
+}
+
+struct LookFile{
+	std::filesystem::path path;
+	std::string name;   // UTF-8, without .txt
+	std::string age;    // "3 h ago"
+};
+static std::vector<LookFile> g_lookFiles;   // listed when Load look opens
+static char g_lookNameBuf[128] = "";
+
+// Age rather than date: file_time_type converts to a calendar date
+// differently in MSVC's library and in GCC's.
+static std::string lookAge(std::filesystem::file_time_type t){
+	auto age = std::filesystem::file_time_type::clock::now() - t;
+	long long minutes = std::chrono::duration_cast<std::chrono::minutes>(age).count();
+	if(minutes < 1) return "just now";
+	if(minutes < 60) return std::to_string(minutes) + " min ago";
+	long long hours = minutes / 60;
+	if(hours < 48) return std::to_string(hours) + " h ago";
+	return std::to_string(hours / 24) + " days ago";
+}
+
+static void listLooks(){
+	g_lookFiles.clear();
+	auto dir = looksFolder();
+	if(dir.empty()) return;
+	std::error_code ec;
+	std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> found;
+	for(const auto& e : std::filesystem::directory_iterator(dir, ec)){
+		if(e.is_regular_file(ec) && e.path().extension() == ".txt") found.push_back({e.last_write_time(ec), e.path()});
+	}
+	std::sort(found.begin(), found.end(), [](const auto& a, const auto& b){ return a.first > b.first; });   // newest first
+	for(const auto& f : found) g_lookFiles.push_back({f.second, pathText(f.second.stem()), lookAge(f.first)});
+}
+
+static void drawSaveLookPopup(){
+	if(!ImGui::BeginPopupModal("Save look", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+	if(ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+	ImGui::SetNextItemWidth(260.0f);
+	bool enter = ImGui::InputText("Name", g_lookNameBuf, sizeof(g_lookNameBuf), ImGuiInputTextFlags_EnterReturnsTrue);
+	std::string name = lookFileName(g_lookNameBuf);
+	std::filesystem::path dir = looksFolder();
+	std::filesystem::path path;
+	if(!dir.empty() && !name.empty()) path = dir / pathFromUtf8(name + ".txt");
+	std::error_code ec;
+	bool exists = !path.empty() && std::filesystem::exists(path, ec);
+	if(dir.empty()){
+		ImGui::TextWrapped("No folder for looks could be made: Documents, beside SimLOD and the working folder were tried.");
+	}else if(name.empty()){
+		ImGui::TextDisabled("Type a name for the look.");
+	}else{
+		ImGui::TextDisabled("%s", pathText(path).c_str());
+		if(exists) ImGui::Text("A look with this name exists; saving replaces it.");
+	}
+	bool save = ImGui::Button(exists ? "Replace" : "Save") || enter;
+	ImGui::SameLine();
+	bool cancel = ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_Escape));
+	if(save && !path.empty()){
+		std::string error;
+		if(saveLook(path, error)){
+			g_lookName = name;
+			logLine("[look] saved %s\n", pathText(path).c_str());
+			notice("Look %s saved", name.c_str());
+		}else{
+			logLine("[look] not saved: %s\n", error.c_str());
+			notice("The look was not saved: %s", error.c_str());
+		}
+		ImGui::CloseCurrentPopup();
+	}else if(cancel){
+		ImGui::CloseCurrentPopup();
+	}
+	ImGui::EndPopup();
+}
+
+static void drawLoadLookPopup(){
+	if(!ImGui::BeginPopup("Load look")) return;
+	std::filesystem::path dir = looksFolder();
+	if(dir.empty()){
+		ImGui::TextDisabled("No folder for looks could be made.");
+	}else if(g_lookFiles.empty()){
+		ImGui::TextDisabled("No saved looks yet. Save look puts them in this folder:");
+	}
+	for(size_t i = 0; i < g_lookFiles.size(); i++){
+		const LookFile& f = g_lookFiles[i];
+		ImGui::PushID(int(i));
+		if(ImGui::Selectable(f.name.c_str(), false, 0, ImVec2(220.0f, 0.0f))) loadLook(f.path);   // closes the popup
+		ImGui::SameLine();
+		ImGui::TextDisabled("%s", f.age.c_str());
+		ImGui::PopID();
+	}
+	if(!dir.empty()){
+		ImGui::Separator();
+		ImGui::TextDisabled("%s", pathText(dir).c_str());
+		if(ImGui::SmallButton("Open folder")) openInFileBrowser(dir);
+		ImGui::SameLine();
+		if(ImGui::SmallButton("Copy path")) ImGui::SetClipboardText(pathText(dir).c_str());
+	}
+	ImGui::EndPopup();
+}
+
 Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	Uniforms uniforms;
 
@@ -1889,7 +2357,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		bool haveBox = boxSize.x > 0.0f && std::isfinite(boxMin.x);
 		if(haveBox && sizeChanged){
 			fittedSize = boxSize;
-			float longest = std::max(boxSize.x, std::max(boxSize.y, boxSize.z));
 			float diag    = std::sqrt(boxSize.x*boxSize.x + boxSize.y*boxSize.y + boxSize.z*boxSize.z);
 
 			// test source: centre of the cloud in plan, at 55% of its height
@@ -1897,7 +2364,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 			settings.testY = boxMin.y + boxSize.y * 0.5f;
 			settings.testZ = boxMin.z + boxSize.z * 0.55f;
 
-			g_eventRadius        = g_eventRadiusArg > 0.0f ? g_eventRadiusArg : longest * 0.12f;    // 12% of the longest side
+			g_eventRadius        = g_eventRadiusArg > 0.0f ? g_eventRadiusArg : fittedEventRadius();
 			settings.volMaxDist  = diag * 1.5f;        // rays can cross the whole cloud
 			logLine("[host] fitted to cloud: extent %.1f x %.1f x %.1f m, test source (%.1f, %.1f, %.1f), radius %.1f m, reach %.0f m\n",
 				boxSize.x, boxSize.y, boxSize.z, settings.testX, settings.testY, settings.testZ, g_eventRadius, settings.volMaxDist);
@@ -3346,6 +3813,10 @@ int main(int argc, char** argv){
 			benchFrames = std::max(0, std::atoi(argv[++i]));
 		}else if(arg == "--hidden"){
 			// applied before the window was created
+		}else if(arg == "--look" && i + 1 < argc){
+			// a saved look, as a file or by name in the looks folder; a --set
+			// after it changes it further
+			loadLookArg(argv[++i]);
 		}else if(arg == "--set" && i + 1 < argc){
 			// --set name=value, for the settings that matter most on a small GPU,
 			// and for repeatable screenshots
@@ -3880,6 +4351,27 @@ int main(int argc, char** argv){
 			if(settings.showUnedited){
 				ImGui::TextDisabled("Showing the unedited cloud: the faint settings have no effect until this is unticked.");
 			}
+
+			// ---- LOOKS ------------------------------------------------------------
+			// A look is the settings that decide how the image looks, kept in a
+			// text file so it outlasts the session (forEachLookSetting).
+			if(ImGui::Button("Save look...")){
+				snprintf(g_lookNameBuf, sizeof(g_lookNameBuf), "%s", g_lookName.empty() ? "look" : g_lookName.c_str());
+				ImGui::OpenPopup("Save look");
+			}
+			tipFor("Saves the settings that decide how the image looks to a text file, so the look can be loaded in a later session: "
+				   "Points, Light, Sky and haze, Colour, the calls' glow, bloom and medium, Insects, and Scan clean-up. "
+				   "Not saved: the camera, lens and near clip, markers and survey, the call schedule, detail and speed, Volume reach, and the debug views. "
+				   "The files go in Documents\\SimLOD\\looks; Load look shows the folder.");
+			ImGui::SameLine();
+			if(ImGui::Button("Load look...")){
+				listLooks();
+				ImGui::OpenPopup("Load look");
+			}
+			tipFor("Loads a saved look; the newest are listed first. Every setting a look holds first returns to its starting value, "
+				   "so a look loads the same way whatever was set before.");
+			drawSaveLookPopup();
+			drawLoadLookPopup();
 
 			// ---- CAMERA -------------------------------------------------------
 			if(ImGui::CollapsingHeader("Camera")){
