@@ -36,7 +36,10 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 - Files load as if dropped on the window.
 - `--view` places the camera. The target is in the renderer frame, i.e. relative to the cloud's minimum corner.
 - `--set` accepts `hqs`, `splat`, `detail`, `adaptive`, `budget` and `vsync`, and for the haze and key light `haze`, `hazefall`, `hazefloor`, `hazesky`, `light` and `sunbeams`.
-- `--set native=0` starts with the look. By default SimLOD starts in Native colour: each point in the colour stored in the file, with the key light, torch, point shading, Fix blown-out canopy, eye dome lighting, haze, sunbeams, bloom, the grade, exposure and the tone map all skipped (`nativeColour()` in `render.cu`). The checkbox is at the top of the settings panel.
+- SimLOD starts **unedited**: every setting that changes how the cloud is represented starts at the value that changes nothing. Each point shows the colour stored in the file, with no light, torch, haze, sunbeams, bloom, insects, point shading, eye dome lighting, canopy repair or cull, a neutral grade (exposure 1, saturation 1, temperature 0, mix 1) and no tone curve. Every effect is built up from there.
+  - **Reset to unedited**, at the top of the settings panel, returns to those values (`resetToUnedited()`). It also restores point size, splat shape and high-quality shading, and shows the points again in their stored colours (Show points on; Markers only, Colour by node and Colour by LOD off). It keeps the camera, lens and near clip, the sky and horizon, markers and survey, calls, detail and speed, and the bounding box, voxel grid and Update visibility.
+  - **Show unedited**, beside it, draws the cloud as the reset would leave it without changing the settings, for comparison (`showUnedited()` in `render.cu`; the host shows the points and leaves out the debug colours in `getUniforms()`). Point size, splat shape and high-quality shading stay as set.
+  - `--set unedited=1` starts with Show unedited ticked (`native` is the old name for it), and `--set tone=` sets the tone curve, from 0 (none) to 1 (the ACES fit).
 - Timings go to the run log as `[host] stage ms:` lines. Measure only after loading finishes: frame cost changes a lot while the octree is still being built.
 - Kill with `timeout N`. Stdout is buffered and lost on kill, but the log file is flushed every line.
 - `.laz` decompresses slowly (about 4 min for 54 M points). Convert to `.las` with `laspy` for repeated runs.
@@ -53,7 +56,7 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 
 **Kernel conventions.**
 - All kernels are launched with `cuLaunchCooperativeKernel` and synchronise across the whole grid with `grid.sync()`. Any early `return` before a `grid.sync()` must be uniform across all threads.
-- Work is split with `processRange` from `utils.h.cu`.
+- Work is split with `processRange` from `utils.h.cu`, which gives each thread a contiguous run of items. Per-pixel passes can use `processRangeStrided` instead: consecutive threads take consecutive items, so memory accesses coalesce. The composite uses it, and with it `kernel_render` spills no registers.
 
 **Hot reload.** `CudaModularProgram` (`include/CudaModularProgram.h`) watches each `.cu` file and recompiles it when it changes. This only works if the working directory is the repo root, because the files are loaded from `./modules/...`. It compiles for the present GPU's compute capability.
 
@@ -76,7 +79,7 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 - A ray that hits no point (sky, or the void below the horizon) gets the haze, its ambient light and its sunbeams only with Haze over sky (`fogSky`) on. The march's dither is fixed per pixel; a per-frame one made the lit haze flicker.
 - `volBuf` holds RGB plus the distance to the surface each ray sees (`SKY_DISTANCE` for sky). The composite upsamples it with weights from that distance (joint bilateral), so lit haze does not spread across silhouettes.
 - The composite keeps the backdrop (sky, or the void below the horizon) apart from the scene light and grades only the scene. Anything added in front of the sky is graded the same as when it is in front of geometry.
-- The look must not change a point's hue by itself. The key light and the torch act on linear light, and `packLitColour()` scales all three channels together when the brightest passes 1. The tone curve is applied to each pixel's brightest channel, with the others scaled by the same factor. With a neutral grade (mix 1, temperature 0, saturation 1) the stored hue is kept; only Mix, Temperature, Saturation and Tint change it. Clipping or tone-mapping each channel on its own turned the scan's olive foliage yellow.
+- The look must not change a point's hue by itself. The key light and the torch act on linear light, and `packLitColour()` scales all three channels together when the brightest passes 1. The tone curve (an amount from 0, none, to 1, the ACES fit) is applied to each pixel's brightest channel, with the others scaled by the same factor, and a colour brighter than white is brought down to it whole. With a neutral grade (mix 1, temperature 0, saturation 1) the stored hue is kept; only Mix, Temperature, Saturation and Tint change it. Clipping or tone-mapping each channel on its own turned the scan's olive foliage yellow.
 
 **Adaptive detail.**
 - `updateAdaptiveDetail()` steers `g_adaptReduce` from the render kernel's time against `settings.frameBudgetMs`.
@@ -137,4 +140,4 @@ The docstring gives the method. In order, the steps are:
   - A quick test on a full scan: `--crop 8 -4 12 0`, about 3.4 M points. A patch around the scanner such as `--crop -10 -10 10 10` holds half the scan.
   - `--workers N` processes tiles in parallel and gives identical output.
   - The rewritten tool has been run on the full WhiteCanopy scan (345.8 M points). The samples take about a minute each with one worker in a 4-core cloud session; the original version took about 15 minutes for a full scan on the 20-thread laptop.
-- Judge the results in SimLOD at 4K in Native colour, its default. The look's light, haze and grade change every colour, and Fix blown-out canopy is a separate, on-the-fly repair inside the viewer.
+- Judge the results in SimLOD at 4K unedited, as it starts or after Reset to unedited. Any light, haze or grade changes every colour, and Fix blown-out canopy is a separate, on-the-fly repair inside the viewer.

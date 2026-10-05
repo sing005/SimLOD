@@ -326,7 +326,20 @@ inline bool gridIsAirNearFoliage(int cx, int cy, int cz, int reach){
 	return false;
 }
 
-// ---- stray-point culling (apply_stray_cull.ps1) ------------------------
+// ---- the unedited view ---------------------------------------------------
+// Show unedited draws the cloud as Reset to unedited leaves it: each point in
+// the colour stored in the file, nothing added and nothing hidden. Every step
+// that changes the representation checks this: the blown-out repair, the
+// stray-point cull, the key light, the torch, splat shading, eye dome
+// lighting and the insects, and in the composite haze, sunbeams, bloom, the
+// grade, exposure and the tone curve. The host draws the points and leaves
+// out the debug colours (getUniforms). Point size, splat shape and
+// high-quality shading stay as set, so the points keep their size and shape.
+inline bool showUnedited(){
+	return uniforms.showUnedited != 0;
+}
+
+// ---- stray-point culling -------------------------------------------------
 // Scanner noise - dust, flying insects, leaves moving between passes, range
 // artefacts - lands as isolated points in open air. Real surfaces do not: a
 // leaf or a trunk puts many points in the same small volume.
@@ -339,10 +352,12 @@ inline bool gridIsAirNearFoliage(int cx, int cy, int cz, int reach){
 // for most noise. reach 1 adds the six axis neighbours, seven reads, which
 // keeps thin surfaces that straddle a cell boundary and would otherwise be
 // thinned along the seam.
+
 // The cull runs only with a threshold and a grid to count in. Without the
 // grid no point is stray, so Show culled only must not then hide them all.
 inline bool cullActive(){
-	return uniforms.minNeighbours > 0 && uniforms.useVoxelGrid && uniforms.voxelGridPtr != 0;
+	return uniforms.minNeighbours > 0 && uniforms.useVoxelGrid && uniforms.voxelGridPtr != 0
+		&& !showUnedited();
 }
 
 inline bool isStrayPoint(float px, float py, float pz){
@@ -398,15 +413,6 @@ inline float lightAt(float px, float py, float pz){
 	return c0 * (1.0f - tz) + c1 * tz;
 }
 
-// ---- native colour -----------------------------------------------------
-// Each point in the colour stored in the file. Every step that changes a
-// point's colour on the way to the screen checks this: the blown-out repair,
-// the key light, the torch, splat shading, eye dome lighting, and in the
-// composite haze, sunbeams, bloom, the grade, exposure and the tone map.
-inline bool nativeColour(){
-	return uniforms.nativeColour != 0;
-}
-
 // A lit colour back to the 8-bit sRGB a point is stored and blended in. Light
 // is added in linear light, as the haze's is, and when the brightest channel
 // passes 1 all three are scaled down together, so the colour keeps its hue.
@@ -435,7 +441,7 @@ float3 _torchDir   = {0.0f, 0.0f, 1.0f};   // set once per frame by thread 0
 int    _torchValid = 0;
 
 inline uint32_t applyTorch(uint32_t lit, uint32_t base, float px, float py, float pz){
-	if(nativeColour() || uniforms.torchOn == 0 || _torchValid == 0) return lit;
+	if(showUnedited() || uniforms.torchOn == 0 || _torchValid == 0) return lit;
 	float vx = px - uniforms.camPos.x, vy = py - uniforms.camPos.y, vz = pz - uniforms.camPos.z;
 	float d2 = vx*vx + vy*vy + vz*vz;
 	if(d2 < 1e-6f) return lit;
@@ -564,7 +570,7 @@ void finishColourGrid(){
 // Colour for a blown-out point at this position, or the point's own colour
 // if the grid has nothing nearby. Trilinear over the cells that have colour.
 inline uint32_t repairColour(uint32_t c, float px, float py, float pz){
-	if(nativeColour() || uniforms.colourGridPtr == 0 || !isBlownOut(c)) return c;
+	if(showUnedited() || uniforms.colourGridPtr == 0 || !isBlownOut(c)) return c;
 	const uint64_t* g = (const uint64_t*)uniforms.colourGridPtr;
 	float cs = uniforms.cellSize;
 	float fx = px / cs - 0.5f, fy = py / cs - 0.5f, fz = pz / cs - 0.5f;
@@ -601,7 +607,7 @@ inline uint32_t repairColour(uint32_t c, float px, float py, float pz){
 // of its light (0.109, about a third of its sRGB value), the level the haze
 // in shade darkens to.
 inline uint32_t applyKeyLight(uint32_t c, float trans){
-	if(nativeColour() || uniforms.lightOn == 0 || uniforms.lightIntensity <= 0.0f) return c;
+	if(showUnedited() || uniforms.lightOn == 0 || uniforms.lightIntensity <= 0.0f) return c;
 	// ambient floors the shadow; intensity scales the lit side; at most 4x
 	float k = uniforms.ambient + (1.0f - uniforms.ambient) * trans * uniforms.lightIntensity;
 	if(k > 4.0f) k = 4.0f;
@@ -639,7 +645,7 @@ constexpr float SKY_DISTANCE = 1.0e7f;
 // The key light changes nothing unless it is on with some strength; the same
 // test applyKeyLight makes.
 inline bool keyLightActive(){
-	return !nativeColour() && uniforms.lightOn != 0 && uniforms.lightIntensity > 0.0f;
+	return !showUnedited() && uniforms.lightOn != 0 && uniforms.lightIntensity > 0.0f;
 }
 
 inline float hazeDensityAt(float z){
@@ -833,7 +839,7 @@ inline float voxelSplatMetres(float nodeSize){
 // (ox,oy) is the pixel's offset within the R x R splat. Returns a multiplier;
 // 1.0 everywhere when shading is off or the splat is too small to show it.
 inline float splatShade(int ox, int oy, int R, float half){
-	if(nativeColour() || uniforms.pointShading <= 0.0f || R < 3) return 1.0f;
+	if(showUnedited() || uniforms.pointShading <= 0.0f || R < 3) return 1.0f;
 	float rr = float(R) * 0.5f;
 	float u  = (float(ox) - half) / rr;
 	float v  = (float(oy) - half) / rr;
@@ -2585,7 +2591,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	// give it a wander. Nothing is stored, initialised or updated, so changing
 	// the count costs nothing but the drawing. Drawn after the forest, so they
 	// depth-test against it correctly.
-	if(uniforms.numInsects > 0){
+	if(uniforms.numInsects > 0 && !showUnedited()){
 		processRange(0, uniforms.numInsects, [&](int idx){
 			uint32_t h0 = insectHash(uint32_t(idx) * 2654435761u + 17u);
 			uint32_t h1 = insectHash(h0 ^ 0x9e3779b9u);
@@ -2637,7 +2643,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	if(grid.thread_rank() == 0) stats->stageNs[2] = nanotime() - tStart;   // apply_stage_timers.ps1
 	// Skip the whole pass when EDL is off or its strength is zero. It reads
 	// four neighbouring pixels per pixel and was running regardless.
-	if(uniforms.enableEDL && uniforms.edlStrength > 0.0f && !nativeColour())
+	if(uniforms.enableEDL && uniforms.edlStrength > 0.0f && !showUnedited())
 	{ // tile-based EDL
 
 		struct Pixel{
@@ -2742,7 +2748,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	// of whatever lies behind it are applied in closed form in the composite;
 	// only the part that changes along the ray with the canopy's shade is
 	// marched here.
-	bool volEvents = !nativeColour() && uniforms.enableVolumetric && uniforms.numEvents > 0;
+	bool volEvents = !showUnedited() && uniforms.enableVolumetric && uniforms.numEvents > 0;
 	bool volSun    = sunbeamsOn();
 	if(volEvents || volSun){
 
@@ -2977,7 +2983,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			}
 		}
 
-		if(uniforms.enableBloom && !nativeColour()){
+		if(uniforms.enableBloom && !showUnedited()){
 
 			// level 0: 2x2 box from the emission buffer. Reads emission, not a
 			// luminance threshold, so only actual sources bloom.
@@ -3071,7 +3077,9 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		// front of the sky are graded the same as in front of the trunk beside
 		// it, and nothing changes colour at the silhouette.
 		bool volActive = (uniforms.enableVolumetric && uniforms.numEvents > 0) || sunbeamsOn();
-		processRange(0, W * H, [&](int pixelIndex){
+		// grid-stride: coalesced, and with the tone curve's amount the
+		// contiguous form made this loop reload two spilled registers a pixel
+		processRangeStrided(W * H, [&](int pixelIndex){
 
 			int x = pixelIndex % W;
 			int y = pixelIndex / W;
@@ -3128,11 +3136,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 				}
 			}
 
-			// ---- native colour -----------------------------------------
+			// ---- the unedited view ------------------------------------
 			// A point's pixel keeps the colour stored in the file, byte for
 			// byte, and the backdrop the colour it was given: none of the haze,
-			// light, bloom, grade, exposure or tone map below.
-			if(nativeColour()){
+			// light, bloom, grade, exposure or tone curve below.
+			if(showUnedited()){
 				uint32_t out;
 				if(isGeometry){
 					out = (p.color & 0x00ffffffu) | (255u << 24);
@@ -3299,18 +3307,25 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			b *= uniforms.exposure;
 
 			{
-				// The curve on the brightest channel, the other two scaled by
-				// the same factor, so a colour keeps its hue as it brightens
+				// The curve acts on the brightest channel, the other two scaled
+				// by the same factor, so a colour keeps its hue as it brightens
 				// (tone mapping one brightness value and keeping the colour
 				// ratios, as Reinhard et al. 2002 do with luminance). Applied
 				// to each channel on its own, the curve compressed the largest
 				// channels most: at exposure 4 sunlit foliage moved 6 degrees
-				// of hue toward yellow, and bright glows went white. Keeping
-				// both curves behind a switch made this per-pixel loop spill
-				// registers, so there is only this one.
+				// of hue toward yellow, and bright glows went white.
+				// Tone curve 0 leaves brightness as it is, the unedited
+				// baseline; 1 is the ACES fit. Either way, a colour brighter
+				// than white is brought down to it whole rather than clipped
+				// channel by channel. A switch between two curves made this
+				// per-pixel loop spill registers; one curve with an amount
+				// does not.
 				float m = fmaxf(r, fmaxf(g, b));
-				float s = m > 0.0f ? acesToneMap(m) / m : 0.0f;
-				r *= s; g *= s; b *= s;
+				if(m > 0.0f){
+					float s = 1.0f + uniforms.toneCurve * (acesToneMap(m) / m - 1.0f);
+					if(m * s > 1.0f) s = 1.0f / m;
+					r *= s; g *= s; b *= s;
+				}
 			}
 
 			// grain (apply_look.ps1): per pixel, per frame, applied after the
