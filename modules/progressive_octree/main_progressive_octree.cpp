@@ -3355,7 +3355,8 @@ int main(int argc, char** argv){
 	}
 
 	// --calls: load and play the schedule, as the Calls panel's Load and Play
-	// buttons do, with bloom on as opening that panel turns it on
+	// buttons do. Bloom follows Bloom strength, as in that panel: off at the
+	// unedited start, on with --set bloom=.
 	if(!argCalls.empty()){
 		loadCallSchedule(argCalls);
 		g_showClock   = 0.0;
