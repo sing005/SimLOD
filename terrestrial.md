@@ -36,6 +36,14 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 - Files load as if dropped on the window.
 - `--view` places the camera. The target is in the renderer frame, i.e. relative to the cloud's minimum corner.
 - `--set` accepts `hqs`, `splat`, `detail`, `adaptive`, `budget` and `vsync`, and for the haze and key light `haze`, `hazefall`, `hazefloor`, `hazesky`, `light` and `sunbeams`.
+- SimLOD starts **unedited**: every setting that changes how the cloud is represented starts at the value that changes nothing. Each point shows the colour stored in the file, with no light, torch, haze, sunbeams, bloom, insects, point shading, eye dome lighting, canopy repair or cull, a neutral grade (exposure 1, saturation 1, temperature 0, mix 1) and no tone curve. Every effect is built up from there.
+  - **Reset to unedited**, at the top of the settings panel, returns to those values (`resetToUnedited()`). It also restores point size, splat shape and high-quality shading, and shows the points again in their stored colours (Show points on; Markers only, Colour by node and Colour by LOD off). It keeps the camera, lens and near clip, the sky and horizon, markers and survey, calls, detail and speed, and the bounding box, voxel grid and Update visibility.
+  - **Show unedited**, beside it, draws the cloud as the reset would leave it without changing the settings, for comparison (`showUnedited()` in `render.cu`; the host shows the points and leaves out the debug colours in `getUniforms()`). Point size, splat shape and high-quality shading stay as set.
+  - `--set unedited=1` starts with Show unedited ticked (`native` is the old name for it), and `--set tone=` sets the tone curve, from 0 (none) to 1 (the ACES fit).
+- **Save look** and **Load look**, below the reset, keep a look in a text file of `name = value` lines: the settings `forEachLookSetting()` lists, which are Points, Light, Sky and haze, Colour, the calls' glow, bloom and medium, Insects and Scan clean-up.
+  - The files go in `Documents\SimLOD\looks` (`looksFolder()`). If that folder cannot be made, they go next to the exe, then in the working directory.
+  - Loading first returns every look setting to its starting value, so a setting missing from the file takes its starting value. Values are clamped to the sliders' ranges, and unknown names are logged and ignored. The names are the file format, so renaming one loses that value from older files.
+  - `--look <name or file>` loads one at start-up; a later `--set` changes it further. A look's event radius is kept when a cloud loads, as `--set radius=` is.
 - Timings go to the run log as `[host] stage ms:` lines. Measure only after loading finishes: frame cost changes a lot while the octree is still being built.
 - Kill with `timeout N`. Stdout is buffered and lost on kill, but the log file is flushed every line.
 - `.laz` decompresses slowly (about 4 min for 54 M points). Convert to `.las` with `laspy` for repeated runs.
@@ -52,7 +60,7 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 
 **Kernel conventions.**
 - All kernels are launched with `cuLaunchCooperativeKernel` and synchronise across the whole grid with `grid.sync()`. Any early `return` before a `grid.sync()` must be uniform across all threads.
-- Work is split with `processRange` from `utils.h.cu`.
+- Work is split with `processRange` from `utils.h.cu`, which gives each thread a contiguous run of items. Per-pixel passes can use `processRangeStrided` instead: consecutive threads take consecutive items, so memory accesses coalesce. The composite uses it, and with it `kernel_render` spills no registers.
 
 **Hot reload.** `CudaModularProgram` (`include/CudaModularProgram.h`) watches each `.cu` file and recompiles it when it changes. This only works if the working directory is the repo root, because the files are loaded from `./modules/...`. It compiles for the present GPU's compute capability.
 
@@ -63,7 +71,9 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 - Fixed arrays in these structs, such as `MAX_EVENTS` and the 32-entry marker arrays, are bounds-checked on the host.
 
 **Per-frame flow.**
-1. `beginFrameState()` runs once per frame. It (re)allocates the voxel and light grids, settles the one-shot `g_gridRefill` / `g_lightDirty` requests into `g_frameGridRefill` / `g_frameLightDirty`, and updates adaptive detail.
+1. `beginFrameState()` runs once per frame. It (re)allocates the voxel, colour and light grids, settles the one-shot `g_gridRefill` / `g_lightDirty` requests into `g_frameGridRefill` / `g_frameLightDirty`, and updates adaptive detail.
+   - The light grid is held only while the key light is on.
+   - The colour grid (8 bytes a cell) is held only while Fix blown-out canopy is on, or while the bird's-eye view waits to be rebuilt with its colours. The next grid rebuild fills it.
 2. `renderCUDA()` and `updateOctree()` launch the kernels. Each calls `getUniforms()`, which copies `settings` and frame state into `Uniforms`.
 3. `Stats` is read back with an unsynchronised `cuMemcpyDtoHAsync`, so host reads lag by a frame or more and a single read can be half-copied. Results the host must not miss use a request id that the kernel answers once and leaves in place (see `pickSeq` / `pickSeqDone`).
 
@@ -75,6 +85,7 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 - A ray that hits no point (sky, or the void below the horizon) gets the haze, its ambient light and its sunbeams only with Haze over sky (`fogSky`) on. The march's dither is fixed per pixel; a per-frame one made the lit haze flicker.
 - `volBuf` holds RGB plus the distance to the surface each ray sees (`SKY_DISTANCE` for sky). The composite upsamples it with weights from that distance (joint bilateral), so lit haze does not spread across silhouettes.
 - The composite keeps the backdrop (sky, or the void below the horizon) apart from the scene light and grades only the scene. Anything added in front of the sky is graded the same as when it is in front of geometry.
+- The look must not change a point's hue by itself. The key light and the torch act on linear light, and `packLitColour()` scales all three channels together when the brightest passes 1. The tone curve (an amount from 0, none, to 1, the ACES fit) is applied to each pixel's brightest channel, with the others scaled by the same factor, and a colour brighter than white is brought down to it whole. With a neutral grade (mix 1, temperature 0, saturation 1) the stored hue is kept; only Mix, Temperature, Saturation and Tint change it. Clipping or tone-mapping each channel on its own turned the scan's olive foliage yellow.
 
 **Adaptive detail.**
 - `updateAdaptiveDetail()` steers `g_adaptReduce` from the render kernel's time against `settings.frameBudgetMs`.
@@ -86,6 +97,8 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 
 **Runtime outputs.** These are written to the working directory and are git-ignored:
 - `log/simlod_<timestamp>.log`, written by `logLine()`.
+  - The folder is relative to the working directory, so started from Visual Studio the log is in `build/Release/log/`. If that folder cannot be written, the log goes next to the executable, then to the temp folder. The full path is in the `[host] run log` line at the top of every log and is shown under Display and debug.
+  - The first lines record the working directory, where the kernels are loaded from, the GPU (name, compute capability, SMs, memory, clocks, bus width, driver and NVRTC versions) and the OpenGL renderer.
   - Periodic status lines go through `logIfChanged()`.
   - Each run is capped at 20 MB, and only the newest 10 logs are kept.
   - `CrashHandler.cpp` appends a symbolised stack trace on any unhandled exception. Start any crash investigation there.
@@ -109,7 +122,7 @@ An offline Python tool, separate from the viewer. It rewrites the colour of two 
 The docstring gives the method. In order, the steps are:
 1. Detect blown-out and greyed points.
 2. Keep printed survey pages unchanged.
-3. Repair greyed points with a regression learnt per run.
+3. Repair greyed points with a regression learnt per run. Each point takes a share of the estimate set from held-out pairs (`_SHARE_W`, `_SHARE_K`); a share equal to the greyed weight left lightly greyed points too pale.
 4. Classify structure around blown points: a line of points is trunk or branch, a less linear cluster is leaf material.
 5. Borrow colour from points within 15 cm.
 6. Fill the rest with patches of real nearby colours.
@@ -122,13 +135,15 @@ The docstring gives the method. In order, the steps are:
   - It scores colour borrowing on hidden well-exposed points.
   - It scores the greyed-colour regression on held-out pairs.
   - It scores the whole tool on a simulated blowout. Use `--tool` to score another version, and `--tool-args "--texture 1"` to pass options.
-  - The error tables `_BORROW_A`, `_BORROW_B` and `_REG_ERR` in the tool come from its output.
+  - The error tables `_BORROW_A`, `_BORROW_B` and `_REG_ERR`, and the correction shares `_SHARE_K`, in the tool come from its output.
 - Diagnostics:
   - `--show classes` writes the structure classes as false colour: orange trunk/branch, green leaf, magenta pages.
   - `--show paths` shows which step coloured each point.
   - Detected page centres go to `OUT_pages.csv`, in the viewer's `markers.csv` format.
 - The full scans (3–4 GB, 346–455 M points) live only on the local machine.
-  - The tool streams them through 16 m ground tiles with a 0.6 m halo. Tiles over `--slab-points` (12 M) are cut into slabs, so a worker needs at most about 4.5 GB; memory is about 0.35 GB per million points processed at once.
+  - The tool streams them through 16 m ground tiles with a 0.6 m halo. A tile over `--slab-points` (12 M own points) is read from disk one slab at a time.
+  - Memory is about 0.32 GB per million points a worker holds at once: a slab's own points plus those within 0.6 m of it. Near the scanner the slabs are about 1 m wide and their context holds more points than they do, so the full scan needs up to about 27 M points, about 10 GB, per worker. The log reports this after the split.
+  - A quick test on a full scan: `--crop 8 -4 12 0`, about 3.4 M points. A patch around the scanner such as `--crop -10 -10 10 10` holds half the scan.
   - `--workers N` processes tiles in parallel and gives identical output.
-  - This version has not been run on a full scan. The samples take about a minute each with one worker in a 4-core cloud session; the previous version took about 15 minutes for a full scan on the 20-thread laptop.
-- Judge the results in SimLOD at 4K, with Scan clean-up > "Fix blown-out canopy" off. That checkbox is a separate, on-the-fly repair inside the viewer.
+  - The rewritten tool has been run on the full WhiteCanopy scan (345.8 M points). The samples take about a minute each with one worker in a 4-core cloud session; the original version took about 15 minutes for a full scan on the 20-thread laptop.
+- Judge the results in SimLOD at 4K unedited, as it starts or after Reset to unedited. Any light, haze or grade changes every colour, and Fix blown-out canopy is a separate, on-the-fly repair inside the viewer.

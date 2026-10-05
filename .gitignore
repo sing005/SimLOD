@@ -40,3 +40,6 @@ markers.csv
 *.las
 *.laz
 !data/samples/*.laz
+
+# Python bytecode (tools/recolour_eval.py imports the recolour tool)
+__pycache__/

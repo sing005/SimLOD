@@ -12,6 +12,9 @@
 #include <deque>
 #include <atomic>
 #include <optional>
+#include <charconv>
+#include <map>
+#include <set>
 #ifdef __cpp_lib_format
 #include <format>
 #else
@@ -30,6 +33,7 @@ using namespace fmt;
 #include "HostDeviceInterface.h"
 #include "ProggyTinyFont.h"
 #include "CrashHandler.h"
+#include "UserFolders.h"
 
 // Uniforms is passed to the kernels by value, and CUDA caps kernel parameters
 // at 4 KB. Growing past that fails at launch, not at compile time, without this.
@@ -38,6 +42,15 @@ static_assert(sizeof(Uniforms) <= 4096, "Uniforms exceeds the 4 KB kernel-parame
 #include "LasLoader.h"
 
 using namespace std;
+
+#ifdef _WIN32
+// Hybrid-graphics laptops: ask the NVIDIA driver to render this program on the
+// NVIDIA GPU, where CUDA can register the frame texture. NVIDIA, "Enabling High
+// Performance Graphics Rendering on Optimus Systems" (driver release 302 on).
+// Linking nvcuda.dll is a higher-priority method in the same document and
+// should already select it; the log's "OpenGL:" line shows which GPU is used.
+extern "C" { __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001; }
+#endif
 
 constexpr uint64_t PINNED_MEM_POOL_SIZE = 200;         // pool of pointers to batches of pinned memory
 // BATCH_STREAM_SIZE, the device upload ring, is in HostDeviceInterface.h
@@ -133,13 +146,18 @@ void* h_stats_pinned = nullptr;
 
 double t_drop_start = 0.0;
 
+// Settings. Everything that changes how the cloud is represented starts at the
+// value that changes nothing, the unedited baseline: each point in the colour
+// stored in the file, with nothing added and nothing hidden. Every effect is
+// built up from there. Reset to unedited (resetToUnedited) returns to these
+// values, and Show unedited draws the cloud as they would.
 struct {
 	bool useHighQualityShading       = true;
 	bool showBoundingBox             = false;
 	bool doUpdateVisibility          = true;
 	bool showPoints                  = true;
-	bool showMarkers                 = true;    // apply_markers2.ps1
-	bool markersOnly                 = false;   // apply_markers2.ps1: hide forest and insects
+	bool showMarkers                 = true;
+	bool markersOnly                 = false;   // hide the forest and insects
 	bool colorByNode                 = false;
 	bool colorByLOD                  = false;
 	bool autoFocusOnLoad             = true;
@@ -158,8 +176,8 @@ struct {
 	// Depth haze: distance goes LIGHTER. The slider is logarithmic: 0.001 is
 	// already a visible haze, 0.018 washes out past ~30 m. The colour is sRGB,
 	// like the other colour pickers (white is the same either way).
-	bool  enableFog                  = true;
-	float fogDensity                 = 0.00024f;
+	bool  enableFog                  = false;   // follows fogDensity > 0
+	float fogDensity                 = 0.0f;    // 0 = no haze
 	float fogR                       = 1.0f;    // white haze
 	float fogG                       = 1.0f;
 	float fogB                       = 1.0f;
@@ -167,11 +185,13 @@ struct {
 	float fogBase                    = 0.0f;    // metres above the lowest point
 	bool  fogSky                     = false;   // haze between the camera and the sky as well
 	bool  enableBloom                = false;
-	float bloomStrength              = 1.2f;
+	float bloomStrength              = 0.0f;    // 0 = no bloom
 	float bloomRadius                = 3.0f;   // now a mip level count, 0-5
-	float exposure                   = 4.0f;   // low-key, as the reference
+	bool  showUnedited               = false;  // compare: draw the cloud as Reset to unedited leaves it
+	float exposure                   = 1.0f;
+	float toneCurve                  = 0.0f;   // 0 = none .. 1 = the ACES fit
 	float emissionGain               = 3.0f;
-	int   numInsects                 = 12273;
+	int   numInsects                 = 0;
 	int   insectSize                 = 2;
 	float insectGlow                 = 2.0f;
 	float insectSpeed                = 0.5f;
@@ -205,20 +225,19 @@ struct {
 	int   cullReach                  = 0;
 	bool  showCulledOnly             = false;
 
-	// apply_features.ps1
 	int64_t targetPoints             = 0;       // 0 = not yet set; filled from the cloud on load
-	float saturation                 = 2.5f;
-	float temperature                = 0.07f;  // blue-shifted blacks
+	float saturation                 = 1.0f;
+	float temperature                = 0.0f;   // negative cool, positive warm
 	float tintColour[3]              = {0.55f, 0.75f, 0.60f};
 	float tintMix                    = 0.0f;
 	float skyColour[3]               = {0.16f, 0.17f, 0.17f};   // dark grey
 
-	// look refinement (apply_look.ps1)
+	// look refinement
 	float pointWorldSize             = 0.085f;   // metres; 0 falls back to pointSize pixels
-	float pointShading               = 1.0f;
+	float pointShading               = 0.0f;     // 0 = flat disc
 	int   maxSplatPx                 = 24;
 	float grain                      = 0.0f;
-	float vignette                   = 0.402f;
+	float vignette                   = 0.0f;
 
 	// directional key light. Defaults: high and behind, as in the reference,
 	// warm-green light through the canopy.
@@ -227,15 +246,15 @@ struct {
 	float lightColour[3]             = {1.0f, 1.0f, 1.0f};      // white
 	float lightIntensity             = 2.5f;
 	float ambient                    = 0.109f;   // shadowed points keep a third of their colour
-	float lightAbsorb                = 0.16f;   // per metre: 5 m of canopy passes ~14%
+	float lightAbsorb                = 0.16f;   // per metre: 5 m of canopy passes about 45% (exp(-0.8))
 	int   lightSteps                 = 40;
-	float sunbeams                   = 1.0f;    // key light in the haze; 0 = haze lit by ambient only
+	float sunbeams                   = 0.0f;    // key light in the haze; 0 = haze lit by ambient only
 	float sunAnisotropy              = 0.5f;    // forward scattering of the haze (Henyey-Greenstein g)
 
 	// key light switch, near clip, mixer, camera, lens, horizon, markers
-	bool  lightOn                    = true;   // key light switch
+	bool  lightOn                    = false;  // key light switch
 	float nearClip                   = 0.81f;
-	float mixColour[3]               = {1.075f, 1.267f, 1.495f};
+	float mixColour[3]               = {1.0f, 1.0f, 1.0f};
 	float eyeHeight                  = 3.37f;    // metres above the lowest point
 	float lookUpDeg                  = 17.05f;
 	int   lensMode                   = 0;       // 0 perspective, 1 fisheye
@@ -246,7 +265,7 @@ struct {
 
 	// blown-out colour repair (render.cu): the scanner's camera whites out the
 	// sunlit canopy; those points take the colour of their neighbourhood
-	bool  whiteFix                   = true;
+	bool  whiteFix                   = false;
 	float whiteLevel                 = 100.0f;  // darkest channel at least this ...
 	float whiteSpread                = 120.0f;  // ... and channels this close = blown out
 	int   whiteReach                 = 1;       // cells searched for colour
@@ -418,11 +437,14 @@ vector<double> processFrameTimes;
 
 PinnedMemPool pinnedMemPool;
 
-// ---- run log (apply_insects.ps1) -----------------------------------------
+// ---- run log ---------------------------------------------------------------
 // Every [host] line is written to the console and to log/<timestamp>.log.
-// The directory is created on first use, next to the working directory.
+// The directory is created on first use, under the working directory; see
+// logLine for the fallbacks.
 #include <cstdarg>
+#include <chrono>
 #include <ctime>
+#include <iomanip>
 #include <cstring>
 #include <algorithm>
 #include <unordered_map>
@@ -434,12 +456,14 @@ static size_t        g_logBytes  = 0;
 static constexpr size_t LOG_MAX_BYTES = 20'000'000;   // one run; a 42 MB log was seen
 static constexpr int    LOG_KEEP_RUNS = 10;           // older log files are deleted
 
+static std::filesystem::path g_exeDir;   // set from argv[0] before the first log line
+
 // Delete all but the newest LOG_KEEP_RUNS - 1 logs, making room for this run's.
 // Names carry a sortable timestamp, so name order is age order.
-static void pruneOldLogs(){
+static void pruneOldLogs(const std::filesystem::path& dir){
 	std::error_code ec;
 	std::vector<std::filesystem::path> logs;
-	for(auto& e : std::filesystem::directory_iterator("log", ec)){
+	for(auto& e : std::filesystem::directory_iterator(dir, ec)){
 		auto name = e.path().filename().string();
 		if(e.is_regular_file() && name.rfind("simlod_", 0) == 0 && e.path().extension() == ".log"){
 			logs.push_back(e.path());
@@ -465,22 +489,50 @@ static void logLine(const char* fmt, ...){
 
 	if(!g_logOpened){
 		g_logOpened = true;
-		std::error_code ec;
-		std::filesystem::create_directories("log", ec);
-		pruneOldLogs();
-		std::time_t tt = std::time(nullptr);
+		auto wall = std::chrono::system_clock::now();
+		std::time_t tt = std::chrono::system_clock::to_time_t(wall);
+		int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(wall.time_since_epoch()).count() % 1000);
 		std::tm tmv{};
 	#ifdef _WIN32
 		localtime_s(&tmv, &tt);
 	#else
 		localtime_r(&tt, &tmv);
 	#endif
-		char name[256];
-		std::strftime(name, sizeof(name), "log/simlod_%Y-%m-%d_%H%M%S.log", &tmv);
-		g_logPath = name;
-		g_logFile.open(name);
+		// Milliseconds in the name: two runs started in the same second (a
+		// scripted --shots run, a relaunch) shared one name, and the second
+		// erased the first run's log.
+		char stamp[64], name[96];
+		std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H%M%S", &tmv);
+		snprintf(name, sizeof(name), "simlod_%s_%03d.log", stamp, ms);
+
+		// log/ under the working directory, as before. When that cannot be
+		// written (a read-only folder), next to the executable, then in the
+		// temp folder. The full path goes to the console, the log itself and
+		// the Display and debug panel, so the file can always be found:
+		// started from Visual Studio, the working directory is build/Release.
+		std::error_code ec;
+		std::vector<std::filesystem::path> dirs = {std::filesystem::path("log")};
+		if(!g_exeDir.empty()) dirs.push_back(g_exeDir / "log");
+		auto tmp = std::filesystem::temp_directory_path(ec);
+		if(!ec) dirs.push_back(tmp / "SimLOD" / "log");
+		for(const auto& dir : dirs){
+			std::filesystem::create_directories(dir, ec);
+			pruneOldLogs(dir);
+			auto path = std::filesystem::absolute(dir / name, ec);
+			if(ec) path = dir / name;
+			// Append, not truncate: the crash handler writes the stack trace
+			// through its own handle, and a truncating stream would write its
+			// later lines over the start of the trace.
+			g_logFile.open(path, std::ios::out | std::ios::app);
+			if(g_logFile.is_open()){
+				g_logPath = path.string();
+				break;
+			}
+		}
 		if(g_logFile.is_open()){
-			printf("[log ] writing to %s\n", name);
+			printf("[log ] writing to %s\n", g_logPath.c_str());
+		}else{
+			printf("[log ] cannot write a log file: tried ./log, next to the executable, and the temp folder\n");
 		}
 	}
 	if(g_logFile.is_open()){
@@ -528,6 +580,18 @@ static void tipFor(const char* text){
 	}
 }
 
+// Show unedited skips every step these controls set (showUnedited() in
+// render.cu), so while it is ticked they are drawn faint for the scope of one
+// of these. They stay editable. Drawn as usual, they seemed broken: every
+// setting but point size did nothing while the comparison was on.
+struct UneditedDim{
+	bool active;
+	UneditedDim() : active(settings.showUnedited){
+		if(active) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.4f);
+	}
+	~UneditedDim(){ if(active) ImGui::PopStyleVar(); }
+};
+
 #include <csignal>
 
 // ---- CUDA error reporting (fix_crash_instrument.ps1) -----------------------
@@ -562,8 +626,10 @@ static std::vector<ScheduledCall> g_calls;
 static bool   g_callsLoaded  = false;
 static double g_showClock    = 0.0;
 static bool   g_showPlaying  = false;
-static float  g_visualTail   = 1.2f;    // seconds the glow outlasts the call
-static float  g_eventRadius  = 4.0f;    // metres
+static const float VISUAL_TAIL_START  = 1.2f;   // seconds
+static const float EVENT_RADIUS_START = 4.0f;   // metres, until a cloud is loaded
+static float  g_visualTail   = VISUAL_TAIL_START;    // seconds the glow outlasts the call
+static float  g_eventRadius  = EVENT_RADIUS_START;   // metres
 static float  g_eventRadiusArg = 0.0f;  // --set radius=: replaces the fit to the cloud; 0 = fit
 static int    g_activeEvents = 0;        // for the GUI readout
 
@@ -696,8 +762,9 @@ float3 boxSize = float3{0.0, 0.0, 0.0};
 static CUdeviceptr g_voxelGrid  = 0;
 static int         g_gridResolution = 256;   // cells along the longest side
 static int         g_gridBuiltAtRes = 0;     // what the CURRENT counts were built with
-static CUdeviceptr g_lightGrid  = 0;         // apply_keylight.ps1: per-cell transmittance
-static CUdeviceptr g_colourGrid = 0;         // per-cell repair colour, uint64; same dimensions
+static CUdeviceptr g_lightGrid  = 0;         // per-cell transmittance toward the key light
+static CUdeviceptr g_colourGrid = 0;         // per-cell repair colour, uint64; same dimensions; held while needed
+static bool        g_colourGridFailed = false;   // no room at these dimensions: not retried every frame
 
 // ---- markers (apply_navigate.ps1) -----------------------------------------
 // Picked positions, renderer frame (translated by boxMin). Exported in FILE
@@ -874,6 +941,26 @@ static bool fitSurveyFrame(){
 		2.0*(x*y + w*z),        w*w - x*x + y*y - z*z,  2.0*(y*z - w*x),
 		2.0*(x*z - w*y),        2.0*(y*z + w*x),        w*w - x*x - y*y + z*z
 	};
+
+	// Horn's method returns a proper rotation, so it cannot match a survey
+	// frame of the other handedness, such as columns typed as northing,
+	// easting against the file's easting, northing. With the markers close to
+	// one plane (checkerboards at similar heights; three markers always are)
+	// it matches one almost exactly by turning the vertical upside down. In a
+	// test with N and E swapped the rms was 0.000-0.21 m, and a call 12 m above
+	// the markers was placed 24 m away, below the ground. Both frames have z
+	// up, so a fit whose vertical points down is refused.
+	if(R[8] < 0.0){
+		logLine("[survey] fit refused: it turns the vertical upside down (R[2][2] = %.3f), which swapped or mirrored survey axes produce\n", R[8]);
+		notice("Survey fit refused: it would turn the vertical upside down. Check that the survey columns are in the file's order: x east, y north, z up.");
+		g_surveyValid = false;
+		return false;
+	}
+	// A level scan and a survey with measured heights share the vertical. A
+	// survey without heights over sloping ground does not: 2 m of rise across
+	// 30 m tilts the fit by 3.8 degrees, which moves a call 15 m up by 1 m.
+	double tiltDeg = std::acos(std::clamp(R[8], -1.0, 1.0)) * 180.0 / 3.14159265358979;
+
 	for(int k = 0; k < 9; k++) g_surveyR[k] = R[k];
 	g_surveyT[0] = cb[0] - (R[0]*ca[0] + R[1]*ca[1] + R[2]*ca[2]);
 	g_surveyT[1] = cb[1] - (R[3]*ca[0] + R[4]*ca[1] + R[5]*ca[2]);
@@ -896,12 +983,18 @@ static bool fitSurveyFrame(){
 	}
 	g_surveyRms = std::sqrt(sumSq / n);
 	double yawDeg = std::atan2(R[3], R[0]) * 180.0 / 3.14159265358979;
-	logLine("[survey] fit from %d pairs: yaw %.2f deg, t = (%.3f %.3f %.3f), rms %.3f m\n",
-		n, yawDeg, g_surveyT[0], g_surveyT[1], g_surveyT[2], g_surveyRms);
-	logLine("[survey] R = [%.6f %.6f %.6f; %.6f %.6f %.6f; %.6f %.6f %.6f]\n",
+	logLine("[survey] fit from %d pairs: yaw %.2f deg, tilt %.2f deg, t = (%.4f %.4f %.4f), rms %.3f m\n",
+		n, yawDeg, tiltDeg, g_surveyT[0], g_surveyT[1], g_surveyT[2], g_surveyRms);
+	// 12 decimals: applied to georeferenced coordinates (northings near 5.6e6)
+	// six decimals of R put a point up to about 3 m out
+	logLine("[survey] R = [%.12f %.12f %.12f; %.12f %.12f %.12f; %.12f %.12f %.12f]\n",
 		R[0],R[1],R[2],R[3],R[4],R[5],R[6],R[7],R[8]);
 	{
+		// Full double precision. At the stream's default 6 significant digits
+		// a translation of -5.63392e+06 was rounded to the nearest 10 m, the
+		// problem saveMarkersCsv below already avoids.
 		std::ofstream f("survey_transform.txt");
+		f << std::setprecision(17);
 		f << "# survey = R * file + t   (file = LAS coordinates)\n";
 		f << "pairs " << n << "\nrms_m " << g_surveyRms << "\nyaw_deg " << yawDeg << "\n";
 		f << "R " << R[0]<<" "<<R[1]<<" "<<R[2]<<" "<<R[3]<<" "<<R[4]<<" "<<R[5]<<" "<<R[6]<<" "<<R[7]<<" "<<R[8] << "\n";
@@ -910,6 +1003,9 @@ static bool fitSurveyFrame(){
 	logLine("[survey] the markers spread %.2f m off their best line\n", spread);
 	if(spread < 1.0){
 		notice("Survey frame fitted from %d markers, but they lie close to one line (%.2f m off it): the rotation about it is uncertain. Add a marker away from that line.", n, spread);
+	}else if(tiltDeg > 2.0){
+		logLine("[survey] the fit tilts the vertical by %.2f deg; level scans and surveyed heights agree on it\n", tiltDeg);
+		notice("Survey frame fitted from %d markers, but it tilts the vertical by %.1f deg: check the survey heights (z) of the markers.", n, tiltDeg);
 	}else{
 		notice("Survey frame fitted from %d markers: yaw %.1f deg, rms %.3f m (see log)", n, yawDeg, g_surveyRms);
 	}
@@ -1067,6 +1163,41 @@ static void ensureLightGrid(bool wanted){
 	logLine("[grid] light grid allocated, %.0f MB\n", double(lbytes) / 1e6);
 }
 
+// The colour repair grid: 8 bytes a cell, twice the occupancy grid's size.
+// Fix blown-out canopy reads it, and the bird's-eye view takes its colours
+// from it. It used to be allocated with the occupancy grid and held for as
+// long, whether or not either needed it; now it is held only while one of
+// them does (beginFrameState), and the next grid rebuild fills it. The key
+// light's grid, the occupancy grid's size, is allocated after this one, so
+// room is left for it while the light is off: the optional grid must not
+// cost the light.
+static void ensureColourGrid(bool wanted){
+	if(!wanted){
+		if(g_colourGrid != 0){
+			cuMemFree(g_colourGrid);
+			g_colourGrid = 0;
+			logLine("[grid] colour repair grid freed\n");
+		}
+		return;
+	}
+	if(g_colourGrid != 0 || g_colourGridFailed) return;
+	if(g_voxelGrid == 0 || g_gridX <= 0 || g_gridY <= 0 || g_gridZ <= 0) return;
+	size_t cbytes = size_t(g_gridX) * size_t(g_gridY) * size_t(g_gridZ) * sizeof(uint64_t);
+	size_t lightRoom = g_lightGrid != 0 ? 0 : g_gridBytes;
+	size_t freeMem = 0, totalMem = 0;
+	cuMemGetInfo(&freeMem, &totalMem);
+	if(cbytes + lightRoom + 64'000'000 < freeMem && cuMemAlloc(&g_colourGrid, cbytes) == CUDA_SUCCESS){
+		cuMemsetD8(g_colourGrid, 0, cbytes);
+		g_gridRefill = true;   // filled with the counts at the next rebuild
+		logLine("[grid] colour repair grid allocated, %.1f MB\n", double(cbytes) / 1e6);
+	}else{
+		g_colourGrid = 0;
+		g_colourGridFailed = true;
+		logLine("[grid] colour repair grid (%.0f MB) would not fit (%.0f MB free); blown-out points stay white\n",
+			double(cbytes) / 1e6, double(freeMem) / 1e6);
+	}
+}
+
 // kernel_render's scratch, per frame: the visible-node list (16.8 MB, from
 // HostDeviceInterface.h) and the 16 MB line list, then per pixel 45 B:
 // framebuffer 8, emission 12, bloom chain 4, quarter-resolution volumetrics
@@ -1221,24 +1352,9 @@ static void ensureVoxelGrid(){
 	g_gridX = gx; g_gridY = gy; g_gridZ = gz; g_cellSize = cell;
 	g_gridBuiltAtRes = R;
 
-	// Colour repair grid, twice the occupancy grid's size. Optional: without
-	// it blown-out points keep their white, nothing else is affected. The key
-	// light's grid (the occupancy grid's size) is allocated after this one,
-	// so leave room for it: the optional grid must not cost the light.
-	{
-		size_t cbytes = size_t(gx) * size_t(gy) * size_t(gz) * sizeof(uint64_t);
-		size_t lightRoom = bytes;
-		size_t freeMem = 0, totalMem = 0;
-		cuMemGetInfo(&freeMem, &totalMem);
-		if(cbytes + lightRoom + 64'000'000 < freeMem && cuMemAlloc(&g_colourGrid, cbytes) == CUDA_SUCCESS){
-			cuMemsetD8(g_colourGrid, 0, cbytes);
-			logLine("[grid] colour repair grid %.1f MB\n", double(cbytes) / 1e6);
-		}else{
-			g_colourGrid = 0;
-			logLine("[grid] colour repair grid (%.0f MB) would not fit (%.0f MB free); blown-out points stay white\n",
-				double(cbytes) / 1e6, double(freeMem) / 1e6);
-		}
-	}
+	// The colour repair grid, freed above with the old grid, is allocated
+	// again by ensureColourGrid, and only while it is needed.
+	g_colourGridFailed = false;   // new dimensions: worth another try
 	// The grid has just been zeroed, so whatever counts it held are gone. Say
 	// so, rather than setting g_gridBuiltAtRes and reporting it as current -
 	// which is what hid this: the resolution slider emptied the grid on every
@@ -1249,8 +1365,9 @@ static void ensureVoxelGrid(){
 }
 
 // ---- bird's-eye view -------------------------------------------------------
-// A plan view of the whole domain, built from the occupancy grid (and the
-// colour repair grid, when there is one) each time the grid is rebuilt: per
+// A plan view of the whole domain, built from the occupancy grid and the
+// colour repair grid (held for it while the view is rebuilt, when there is
+// room for it) each time the grid is rebuilt: per
 // column, the colour of the highest coloured cell, or a green shade from the
 // column's point count. The camera, its view direction and the markers are
 // drawn over it every frame.
@@ -1258,6 +1375,8 @@ static int    g_refillGen  = 0;     // bumped when a grid rebuild is launched
 static int    g_minimapGen = -1;    // the rebuild the minimap was made from
 static GLuint g_minimapTex = 0;
 static int    g_minimapW = 0, g_minimapH = 0;
+static bool   g_minimapColoured = false;   // the view was built with the colour grid
+static bool   g_birdsEyeDrawn   = false;   // drawn in the last settings window; read by beginFrameState
 
 static void buildMinimap(){
 	if(g_voxelGrid == 0 || g_gridX <= 0 || g_gridY <= 0 || g_gridZ <= 0) return;
@@ -1313,11 +1432,17 @@ static void buildMinimap(){
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
 	glBindTexture(GL_TEXTURE_2D, 0);
 	g_minimapW = W; g_minimapH = H;
+	g_minimapColoured = !col.empty();
 	logLine("[host] bird's-eye view rebuilt, %d x %d\n", W, H);
 }
 
 static void drawBirdsEye(shared_ptr<GLRenderer> renderer){
-	if(g_refillGen != g_minimapGen && !g_gridRefill && g_voxelGrid != 0){
+	g_birdsEyeDrawn = true;   // keeps the colour grid while this view needs it
+	// Rebuilt after each grid rebuild. While the colour grid is on its way
+	// (allocated next frame, then filled by a rebuild), wait for it rather
+	// than build the view twice, once without colour.
+	bool colourComing = g_colourGrid == 0 && !g_colourGridFailed;
+	if(g_refillGen != g_minimapGen && !g_gridRefill && g_voxelGrid != 0 && !colourComing){
 		buildMinimap();
 		g_minimapGen = g_refillGen;
 	}
@@ -1428,6 +1553,16 @@ static void beginFrameState(int width, int height){
 	// it crashed in the driver.
 	g_frameRenderable = width > 0 && height > 0 && ensureRenderBuffer(width, height);
 	ensureVoxelGrid();
+	// The colour grid serves Fix blown-out canopy, and the bird's-eye view
+	// (Camera) while that view waits to be rebuilt: held only while either
+	// needs it. Turning the fix on tries again after a failure.
+	bool birdsEyeShown = g_birdsEyeDrawn;   // drawn in last frame's settings window
+	g_birdsEyeDrawn = false;
+	static bool whiteFixWas = false;
+	if(settings.whiteFix && !whiteFixWas) g_colourGridFailed = false;
+	whiteFixWas = settings.whiteFix;
+	ensureColourGrid(settings.whiteFix
+		|| (birdsEyeShown && (g_gridRefill || g_minimapGen != g_refillGen || !g_minimapColoured)));
 	ensureLightGrid(settings.lightOn);
 
 	// kernel_render is the only one to act on the requests below; on a frame
@@ -1466,6 +1601,29 @@ void initCuda(){
 
 	cuCtxGetDevice(&device);
 	cuDeviceGetAttribute(&numSMs, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+
+	// The GPU's own figures, so performance work can cite the machine it ran
+	// on rather than a datasheet (the laptop part differs from the desktop
+	// RTX A2000 in memory size and bus width).
+	{
+		char name[256] = {0};
+		cuDeviceGetName(name, sizeof(name), device);
+		int major = 0, minor = 0, memClockKHz = 0, busBits = 0, l2Bytes = 0, smClockKHz = 0, driver = 0;
+		size_t totalBytes = 0;
+		cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+		cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+		cuDeviceGetAttribute(&memClockKHz, CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, device);
+		cuDeviceGetAttribute(&busBits, CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, device);
+		cuDeviceGetAttribute(&l2Bytes, CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, device);
+		cuDeviceGetAttribute(&smClockKHz, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, device);
+		cuDeviceTotalMem(&totalBytes, device);
+		cuDriverGetVersion(&driver);
+		int nvrtcMajor = 0, nvrtcMinor = 0;
+		nvrtcVersion(&nvrtcMajor, &nvrtcMinor);
+		logLine("[host] GPU %s: compute %d.%d, %d SMs, %.0f MB, memory clock %d MHz, %d-bit bus, L2 %d KB, SM clock %d MHz; driver CUDA %d.%d, NVRTC %d.%d\n",
+			name, major, minor, numSMs, double(totalBytes) / 1e6, memClockKHz / 1000, busBits, l2Bytes / 1024, smClockKHz / 1000,
+			driver / 1000, (driver % 1000) / 10, nvrtcMajor, nvrtcMinor);
+	}
 }
 
 // A colour picker value (sRGB, 0..1) in linear light, by the same curve as
@@ -1473,6 +1631,571 @@ void initCuda(){
 static float srgbToLinear01(float c){
 	c = std::clamp(c, 0.0f, 1.0f);
 	return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+// ---- Reset to unedited --------------------------------------------------------
+// Every setting that changes how the cloud is represented goes back to its
+// starting value: the switches and amounts to the unedited baseline (no light,
+// torch, haze, sunbeams, bloom, insects, point shading or eye dome lighting,
+// no canopy repair or cull, a neutral grade, no tone curve), and the settings
+// that only shape an effect once it is on (light direction and colour, haze
+// colour and floor, torch beam, insect size) to their starting values, so an
+// effect turned on again starts from the same place each time. Point size,
+// splat shape and high-quality shading go back to their starting values too,
+// and the points are shown again in their stored colours: Show points on,
+// Markers only and the debug colours off.
+// Kept: the camera, lens and near clip, the sky, the horizon and the colour
+// below it, markers and survey, calls and their playback, detail and speed,
+// the bounding box, voxel grid and Update visibility views, and the grids.
+static void resetToUnedited(){
+	const decltype(settings) d{};   // the starting values
+
+	// points
+	settings.pointWorldSize        = d.pointWorldSize;
+	settings.pointSize             = d.pointSize;
+	settings.roundSplats           = d.roundSplats;
+	settings.useHighQualityShading = d.useHighQualityShading;
+	settings.pointShading          = d.pointShading;
+	settings.enableEDL             = d.enableEDL;
+	settings.edlStrength           = d.edlStrength;
+
+	// key light and torch
+	settings.lightOn        = d.lightOn;
+	settings.lightAzimuth   = d.lightAzimuth;
+	settings.lightElevation = d.lightElevation;
+	settings.lightIntensity = d.lightIntensity;
+	settings.ambient        = d.ambient;
+	settings.lightAbsorb    = d.lightAbsorb;
+	settings.lightSteps     = d.lightSteps;
+	for(int i = 0; i < 3; i++) settings.lightColour[i] = d.lightColour[i];
+	settings.torchOn        = d.torchOn;
+	settings.torchIntensity = d.torchIntensity;
+	settings.torchAngle     = d.torchAngle;
+	settings.torchRange     = d.torchRange;
+
+	// haze, sunbeams and the volume march. Volume reach follows the loaded
+	// cloud, as it is set on load.
+	settings.enableFog        = d.enableFog;
+	settings.fogDensity       = d.fogDensity;
+	settings.fogR             = d.fogR;
+	settings.fogG             = d.fogG;
+	settings.fogB             = d.fogB;
+	settings.fogHeightFalloff = d.fogHeightFalloff;
+	settings.fogBase          = d.fogBase;
+	settings.fogSky           = d.fogSky;
+	settings.sunbeams         = d.sunbeams;
+	settings.sunAnisotropy    = d.sunAnisotropy;
+	settings.volSteps         = d.volSteps;
+	float diag = std::sqrt(boxSize.x*boxSize.x + boxSize.y*boxSize.y + boxSize.z*boxSize.z);
+	settings.volMaxDist       = (diag > 0.0f && std::isfinite(diag)) ? diag * 1.5f : d.volMaxDist;
+
+	// colour
+	settings.exposure    = d.exposure;
+	settings.toneCurve   = d.toneCurve;
+	settings.saturation  = d.saturation;
+	settings.temperature = d.temperature;
+	for(int i = 0; i < 3; i++){
+		settings.mixColour[i]  = d.mixColour[i];
+		settings.tintColour[i] = d.tintColour[i];
+	}
+	settings.tintMix     = d.tintMix;
+	settings.grain       = d.grain;
+	settings.vignette    = d.vignette;
+
+	// bloom (under Calls)
+	settings.enableBloom   = d.enableBloom;
+	settings.bloomStrength = d.bloomStrength;
+	settings.bloomRadius   = d.bloomRadius;
+
+	// insects
+	settings.numInsects      = d.numInsects;
+	settings.insectSize      = d.insectSize;
+	settings.insectGlow      = d.insectGlow;
+	settings.insectSpeed     = d.insectSpeed;
+	settings.insectPlacement = d.insectPlacement;
+
+	// scan clean-up: canopy repair and stray-point cull
+	settings.whiteFix       = d.whiteFix;
+	settings.whiteLevel     = d.whiteLevel;
+	settings.whiteSpread    = d.whiteSpread;
+	settings.whiteReach     = d.whiteReach;
+	settings.tintMargin     = d.tintMargin;
+	settings.minNeighbours  = d.minNeighbours;
+	settings.cullReach      = d.cullReach;
+	settings.showCulledOnly = d.showCulledOnly;
+
+	// the points shown, in their stored colours
+	settings.showPoints  = d.showPoints;
+	settings.markersOnly = d.markersOnly;
+	settings.colorByNode = d.colorByNode;
+	settings.colorByLOD  = d.colorByLOD;
+
+	settings.showUnedited = false;   // the settings are the baseline now; keep their controls live
+	g_lightDirty = true;             // relit with the reset values when the light is next on
+	logLine("[host] settings reset to unedited\n");
+}
+
+// ---- looks ----------------------------------------------------------------------
+// A look is every setting that decides how the image looks, kept in a text
+// file of name = value lines so it outlasts the session: Save look and Load
+// look at the top of the settings panel, --look on the command line. Left
+// out: the camera, lens and near clip, markers and survey, the call schedule
+// and its playback, the test source, detail and speed (Max splat px among
+// them), the grids, the debug views and Show culled only, and Volume reach,
+// which is fitted to each cloud. The names are the file format: renaming one
+// loses that value from files saved before. The settings type is written
+// decltype(settings) throughout: MSVC takes an alias of the unnamed struct as
+// its name and then refuses the struct's default values (error C7626).
+
+// The event radius fitted to a cloud when it loads: 12% of its longest side.
+static float fittedEventRadius(){
+	float longest = std::max(boxSize.x, std::max(boxSize.y, boxSize.z));
+	return (longest > 0.0f && std::isfinite(longest)) ? longest * 0.12f : EVENT_RADIUS_START;
+}
+
+// Calls section(title) for each panel, then setting(name, value, starting
+// value, lowest, highest) for each setting a look holds, in panel order. The
+// limits are the sliders' own, so a hand-edited file stays within what the
+// panel allows. Colours are float[3]; switches take 0 and 1 as limits. The
+// calls' event radius and visual tail are globals rather than members of s.
+template<typename Section, typename Setting>
+static void forEachLookSetting(decltype(settings)& s, const decltype(settings)& d, Section&& section, Setting&& setting){
+	section("Points");
+	setting("point_size_m",           s.pointWorldSize,        d.pointWorldSize,        0.0f, 0.3f);
+	setting("point_shading",          s.pointShading,          d.pointShading,          0.0f, 1.0f);
+	setting("round_splats",           s.roundSplats,           d.roundSplats,           0, 1);
+	setting("high_quality_shading",   s.useHighQualityShading, d.useHighQualityShading, 0, 1);
+	setting("eye_dome_lighting",      s.enableEDL,             d.enableEDL,             0, 1);
+	setting("edl_strength",           s.edlStrength,           d.edlStrength,           0.0f, 3.0f);
+
+	section("Light");
+	setting("key_light_on",           s.lightOn,               d.lightOn,               0, 1);
+	setting("light_azimuth_deg",      s.lightAzimuth,          d.lightAzimuth,          0.0f, 360.0f);
+	setting("light_elevation_deg",    s.lightElevation,        d.lightElevation,        0.0f, 89.0f);
+	setting("light_strength",         s.lightIntensity,        d.lightIntensity,        0.0f, 6.0f);
+	setting("light_colour",           s.lightColour,           d.lightColour,           0.0f, 1.0f);
+	setting("ambient",                s.ambient,               d.ambient,               0.0f, 1.0f);
+	setting("canopy_density",         s.lightAbsorb,           d.lightAbsorb,           0.0f, 1.5f);
+	setting("torch_on",               s.torchOn,               d.torchOn,               0, 1);
+	setting("torch_strength",         s.torchIntensity,        d.torchIntensity,        0.0f, 20.0f);
+	setting("torch_beam_deg",         s.torchAngle,            d.torchAngle,            2.0f, 60.0f);
+	setting("torch_reach_m",          s.torchRange,            d.torchRange,            1.0f, 60.0f);
+
+	section("Sky and haze");
+	setting("sky_colour",             s.skyColour,             d.skyColour,             0.0f, 1.0f);
+	setting("below_horizon_colour",   s.belowColour,           d.belowColour,           0.0f, 1.0f);
+	setting("horizon_softness_deg",   s.horizonSoftness,       d.horizonSoftness,       0.0f, 90.0f);
+	setting("depth_haze",             s.fogDensity,            d.fogDensity,            0.0f, 0.08f);
+	setting("haze_thins_with_height", s.fogHeightFalloff,      d.fogHeightFalloff,      0.0f, 0.5f);
+	setting("haze_floor_m",           s.fogBase,               d.fogBase,               0.0f, 1000.0f);
+	setting("haze_over_sky",          s.fogSky,                d.fogSky,                0, 1);
+	{
+		// three settings in the struct, one colour in the panel and the file
+		float haze[3] = {s.fogR, s.fogG, s.fogB};
+		const float hazeStart[3] = {d.fogR, d.fogG, d.fogB};
+		setting("haze_colour",        haze,                    hazeStart,               0.0f, 1.0f);
+		s.fogR = haze[0]; s.fogG = haze[1]; s.fogB = haze[2];
+	}
+	setting("sunbeams",               s.sunbeams,              d.sunbeams,              0.0f, 4.0f);
+	setting("forward_scatter",        s.sunAnisotropy,         d.sunAnisotropy,         0.0f, 0.9f);
+	setting("volume_steps",           s.volSteps,              d.volSteps,              8, 128);
+
+	section("Colour");
+	setting("exposure",               s.exposure,              d.exposure,              0.1f, 16.0f);
+	setting("tone_curve",             s.toneCurve,             d.toneCurve,             0.0f, 1.0f);
+	setting("saturation",             s.saturation,            d.saturation,            0.0f, 2.5f);
+	setting("temperature",            s.temperature,           d.temperature,          -1.0f, 1.0f);
+	setting("mix",                    s.mixColour,             d.mixColour,             0.0f, 2.5f);
+	setting("tint_colour",            s.tintColour,            d.tintColour,            0.0f, 1.0f);
+	setting("tint_mix",               s.tintMix,               d.tintMix,               0.0f, 1.0f);
+	setting("grain",                  s.grain,                 d.grain,                 0.0f, 0.15f);
+	setting("vignette",               s.vignette,              d.vignette,              0.0f, 1.0f);
+
+	section("Calls: glow, bloom and medium");
+	setting("emission_colour",        s.emissionColour,        d.emissionColour,        0.0f, 1.0f);
+	setting("emission_by_frequency",  s.emissionByFrequency,   d.emissionByFrequency,   0, 1);
+	setting("emission_gain",          s.emissionGain,          d.emissionGain,          0.0f, 12.0f);
+	setting("event_radius_m",         g_eventRadius,           fittedEventRadius(),     0.1f, 1000.0f);
+	setting("falloff_power",          s.falloffPower,          d.falloffPower,          0.5f, 8.0f);
+	setting("core_boost",             s.coreBoost,             d.coreBoost,             0.0f, 8.0f);
+	setting("visual_tail_s",          g_visualTail,            VISUAL_TAIL_START,       0.0f, 4.0f);
+	setting("bloom_strength",         s.bloomStrength,         d.bloomStrength,         0.0f, 4.0f);
+	setting("bloom_spread",           s.bloomRadius,           d.bloomRadius,           0.0f, 5.0f);
+	setting("volumetric_medium",      s.enableVolumetric,      d.enableVolumetric,      0, 1);
+	setting("medium_density",         s.volDensity,            d.volDensity,            0.0f, 0.12f);
+	setting("medium_scatter",         s.volScatter,            d.volScatter,            0.0f, 6.0f);
+	setting("medium_pools_low",       s.volHeightFalloff,      d.volHeightFalloff,      0.0f, 0.05f);
+	setting("medium_occlusion",       s.volOcclusion,          d.volOcclusion,          0.0f, 3.0f);
+	setting("medium_shadow_steps",    s.volShadowSteps,        d.volShadowSteps,        0, 16);
+
+	section("Insects");
+	setting("insects",                s.numInsects,            d.numInsects,            0, 30000);
+	setting("insect_size_px",         s.insectSize,            d.insectSize,            1, 4);
+	setting("insect_glow",            s.insectGlow,            d.insectGlow,            0.0f, 6.0f);
+	setting("insect_speed",           s.insectSpeed,           d.insectSpeed,           0.0f, 2.0f);
+	setting("insect_placement",       s.insectPlacement,       d.insectPlacement,       0, 1);
+
+	section("Scan clean-up");
+	setting("min_neighbours",         s.minNeighbours,         d.minNeighbours,         0, 60);
+	setting("cull_reach",             s.cullReach,             d.cullReach,             0, 1);
+	setting("fix_blown_out_canopy",   s.whiteFix,              d.whiteFix,              0, 1);
+	setting("white_level",            s.whiteLevel,            d.whiteLevel,            100.0f, 250.0f);
+	setting("white_spread",           s.whiteSpread,           d.whiteSpread,           5.0f, 120.0f);
+	setting("sky_cast",               s.tintMargin,            d.tintMargin,            0.0f, 60.0f);
+	setting("colour_reach_cells",     s.whiteReach,            d.whiteReach,            1, 8);
+}
+
+static void lookAssign(float& a, float b){ a = b; }
+static void lookAssign(int& a, int b){ a = b; }
+static void lookAssign(bool& a, bool b){ a = b; }
+static void lookAssign(float (&a)[3], const float (&b)[3]){ a[0] = b[0]; a[1] = b[1]; a[2] = b[2]; }
+
+// The shortest text that reads back as the same float, with a point for the
+// decimal whatever the system's region settings.
+static std::string lookFormat(float v){
+	char buf[32];
+	auto r = std::to_chars(buf, buf + sizeof(buf), v);
+	return std::string(buf, r.ptr);
+}
+static std::string lookFormat(int v){ return std::to_string(v); }
+static std::string lookFormat(bool v){ return v ? "1" : "0"; }
+static std::string lookFormat(const float (&v)[3]){
+	return lookFormat(v[0]) + " " + lookFormat(v[1]) + " " + lookFormat(v[2]);
+}
+
+// n numbers separated by spaces or commas, and nothing else. from_chars
+// ignores the locale, so "0,5" is refused rather than read as 0.
+static bool lookNumbers(const std::string& text, double* out, int n){
+	const char* p = text.data();
+	const char* end = p + text.size();
+	for(int i = 0; i < n; i++){
+		while(p < end && (*p == ' ' || *p == '\t' || (i > 0 && *p == ','))) p++;
+		if(p < end && *p == '+') p++;   // from_chars takes a minus but not a plus
+		auto r = std::from_chars(p, end, out[i]);
+		if(r.ec != std::errc() || !std::isfinite(out[i])) return false;
+		p = r.ptr;
+	}
+	while(p < end && (*p == ' ' || *p == '\t')) p++;
+	return p == end;
+}
+static bool lookParse(const std::string& text, float& v, float lo, float hi){
+	double x;
+	if(!lookNumbers(text, &x, 1)) return false;
+	v = std::clamp(float(x), lo, hi);
+	return true;
+}
+static bool lookParse(const std::string& text, int& v, int lo, int hi){
+	double x;
+	if(!lookNumbers(text, &x, 1)) return false;
+	v = int(std::lround(std::clamp(x, double(lo), double(hi))));
+	return true;
+}
+static bool lookParse(const std::string& text, bool& v, int, int){
+	std::string t = text;
+	for(char& c : t) c = char(std::tolower((unsigned char)c));
+	if(t == "1" || t == "on"  || t == "true"  || t == "yes"){ v = true;  return true; }
+	if(t == "0" || t == "off" || t == "false" || t == "no") { v = false; return true; }
+	return false;
+}
+static bool lookParse(const std::string& text, float (&v)[3], float lo, float hi){
+	double x[3];
+	if(!lookNumbers(text, x, 3)) return false;
+	for(int i = 0; i < 3; i++) v[i] = std::clamp(float(x[i]), lo, hi);
+	return true;
+}
+
+// Paths as UTF-8 for the log and the panel, and back: ImGui works in UTF-8,
+// and a std::string path on Windows would be read in the system code page,
+// which turns a macron in a look's name into something else.
+static std::string pathText(const std::filesystem::path& p){
+	auto u = p.u8string();
+	return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+}
+static std::filesystem::path pathFromUtf8(const std::string& s){
+	return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(s.data()), s.size()));
+}
+
+// Looks go in Documents\SimLOD\looks, so they outlast the build folder and,
+// unlike the run log, do not depend on the working directory. If that cannot
+// be made: next to the executable, then the working directory.
+static std::filesystem::path looksFolder(){
+	static std::filesystem::path chosen;
+	if(!chosen.empty()) return chosen;
+	std::vector<std::filesystem::path> dirs;
+	auto docs = documentsFolder();
+	if(!docs.empty()) dirs.push_back(docs / "SimLOD" / "looks");
+	if(!g_exeDir.empty()) dirs.push_back(g_exeDir / "looks");
+	std::error_code ec;
+	auto here = std::filesystem::absolute("looks", ec);
+	if(!ec) dirs.push_back(here);
+	for(const auto& dir : dirs){
+		std::filesystem::create_directories(dir, ec);
+		if(std::filesystem::is_directory(dir, ec)){
+			chosen = dir;
+			logLine("[look] looks folder: %s\n", pathText(dir).c_str());
+			break;
+		}
+	}
+	return chosen;
+}
+
+// A file name from what was typed: characters Windows does not allow in a
+// name become '_', spaces and dots at either end go, and the reserved device
+// names (CON, NUL, COM1 and so on) get a '_' in front. Other characters,
+// macrons among them, are kept as typed.
+static std::string lookFileName(const std::string& typed){
+	std::string s;
+	for(unsigned char c : typed){
+		s += (c < 32 || std::strchr("<>:\"/\\|?*", c) != nullptr) ? '_' : char(c);
+	}
+	size_t a = s.find_first_not_of(" .");
+	if(a == std::string::npos) return "";
+	size_t b = s.find_last_not_of(" .");
+	s = s.substr(a, b - a + 1);
+	std::string upper = s;
+	for(char& c : upper) c = char(std::toupper((unsigned char)c));
+	static const char* reserved[] = {"CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+	for(const char* r : reserved) if(upper == r) return "_" + s;
+	return s;
+}
+
+static std::string g_lookName;   // the last look saved or loaded, offered as the next name
+
+static bool saveLook(const std::filesystem::path& path, std::string& error){
+	std::string text;
+	{
+		std::time_t tt = std::time(nullptr);
+		std::tm tmv{};
+	#ifdef _WIN32
+		localtime_s(&tmv, &tt);
+	#else
+		localtime_r(&tt, &tmv);
+	#endif
+		char stamp[64];
+		std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M", &tmv);
+		text += "# SimLOD look, saved " + std::string(stamp) + "\n";
+	}
+	text += "# One setting per line, name = value. Colours are red, green and blue, from\n"
+			"# 0 to 1; switches are 1 (on) or 0 (off). Loading a look first returns every\n"
+			"# setting below to its starting value, so a setting left out of the file\n"
+			"# takes its starting value. Values are kept within the sliders' ranges, and\n"
+			"# unknown names are ignored. Text after # is a comment.\n";
+	decltype(settings) start{};
+	forEachLookSetting(settings, start,
+		[&](const char* title){ text += "\n# "; text += title; text += "\n"; },
+		[&](const char* name, auto& value, const auto&, auto, auto){
+			text += name; text += " = "; text += lookFormat(value); text += "\n";
+		});
+
+	// Written under another name and renamed when complete, so an interrupted
+	// save never leaves a short file in place of a good one.
+	std::filesystem::path part = path;
+	part += ".part";
+	std::error_code ec;
+	{
+		std::ofstream out(part);
+		out << text;
+		out.close();
+		if(!out){
+			error = "could not write " + pathText(part);
+			std::filesystem::remove(part, ec);
+			return false;
+		}
+	}
+	std::filesystem::rename(part, path, ec);
+	if(ec){
+		error = "could not write " + pathText(path) + ": " + ec.message();
+		std::filesystem::remove(part, ec);
+		return false;
+	}
+	return true;
+}
+
+static bool loadLook(const std::filesystem::path& path){
+	std::ifstream in(path);
+	if(!in){
+		logLine("[look] cannot open %s\n", pathText(path).c_str());
+		notice("Could not open the look %s", pathText(path.filename()).c_str());
+		return false;
+	}
+	auto trim = [](const std::string& s){
+		size_t a = s.find_first_not_of(" \t\r");
+		if(a == std::string::npos) return std::string();
+		size_t b = s.find_last_not_of(" \t\r");
+		return s.substr(a, b - a + 1);
+	};
+	std::map<std::string, std::string> values;   // a name given twice: the last one counts
+	std::vector<std::string> problems;
+	std::string line;
+	bool firstLine = true;
+	while(std::getline(in, line)){
+		// a byte order mark, which some editors write, would become part of the first name
+		if(firstLine && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
+		firstLine = false;
+		size_t hash = line.find('#');
+		if(hash != std::string::npos) line.erase(hash);
+		line = trim(line);
+		if(line.empty()) continue;
+		size_t eq = line.find('=');
+		if(eq == std::string::npos){ problems.push_back("no '=' in: " + line); continue; }
+		values[trim(line.substr(0, eq))] = trim(line.substr(eq + 1));
+	}
+
+	auto before = settings;
+	decltype(settings) start{};
+	std::set<std::string> applied;
+	int total = 0;
+	forEachLookSetting(settings, start, [](const char*){},
+		[&](const char* name, auto& value, const auto& startValue, auto lo, auto hi){
+			total++;
+			lookAssign(value, startValue);
+			auto it = values.find(name);
+			if(it == values.end()) return;
+			if(lookParse(it->second, value, lo, hi)) applied.insert(name);
+			else problems.push_back(std::string(name) + " = " + it->second + ": not a valid value, so its starting value is used");
+			values.erase(it);
+		});
+	for(const auto& kv : values) problems.push_back("unknown setting " + kv.first + ", ignored");
+
+	// A saved event radius is kept when a cloud loads, as --set radius= keeps
+	// one; without one, the radius is fitted to each cloud.
+	g_eventRadiusArg = applied.count("event_radius_m") ? g_eventRadius : 0.0f;
+	// switches the panel sets from an amount
+	settings.enableFog   = settings.fogDensity > 0.0f;
+	settings.enableBloom = settings.bloomStrength > 0.0f;
+	settings.showUnedited = false;   // show the look just loaded
+	g_lightDirty = true;
+	// the colour grid is built with these, so it must be built again
+	if(settings.whiteLevel != before.whiteLevel || settings.whiteSpread != before.whiteSpread
+	|| settings.tintMargin != before.tintMargin || settings.whiteReach != before.whiteReach){
+		g_gridRefill = true;
+	}
+
+	g_lookName = pathText(path.stem());
+	logLine("[look] loaded %s: %d of its %d settings from the file\n", pathText(path).c_str(), int(applied.size()), total);
+	for(const auto& p : problems) logLine("[look]   %s\n", p.c_str());
+	if(problems.empty()) notice("Look %s loaded", g_lookName.c_str());
+	else notice("Look %s loaded, with %d problem(s): see the run log", g_lookName.c_str(), int(problems.size()));
+	return true;
+}
+
+// --look: a file, or the name of a look in the looks folder
+static bool loadLookArg(const std::string& arg){
+	std::filesystem::path p(arg);   // argv is in the system code page, as a std::string path expects
+	std::vector<std::filesystem::path> tries = {p};
+	auto dir = looksFolder();
+	if(!dir.empty()){
+		tries.push_back(dir / p);
+		auto withTxt = dir / p;
+		withTxt += ".txt";
+		tries.push_back(withTxt);
+	}
+	std::error_code ec;
+	for(const auto& t : tries){
+		if(std::filesystem::is_regular_file(t, ec)) return loadLook(t);
+	}
+	logLine("[look] --look %s: no such file here or in %s\n", arg.c_str(), pathText(dir).c_str());
+	return false;
+}
+
+struct LookFile{
+	std::filesystem::path path;
+	std::string name;   // UTF-8, without .txt
+	std::string age;    // "3 h ago"
+};
+static std::vector<LookFile> g_lookFiles;   // listed when Load look opens
+static char g_lookNameBuf[128] = "";
+
+// Age rather than date: file_time_type converts to a calendar date
+// differently in MSVC's library and in GCC's.
+static std::string lookAge(std::filesystem::file_time_type t){
+	auto age = std::filesystem::file_time_type::clock::now() - t;
+	long long minutes = std::chrono::duration_cast<std::chrono::minutes>(age).count();
+	if(minutes < 1) return "just now";
+	if(minutes < 60) return std::to_string(minutes) + " min ago";
+	long long hours = minutes / 60;
+	if(hours < 48) return std::to_string(hours) + " h ago";
+	return std::to_string(hours / 24) + " days ago";
+}
+
+static void listLooks(){
+	g_lookFiles.clear();
+	auto dir = looksFolder();
+	if(dir.empty()) return;
+	std::error_code ec;
+	std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> found;
+	for(const auto& e : std::filesystem::directory_iterator(dir, ec)){
+		if(e.is_regular_file(ec) && e.path().extension() == ".txt") found.push_back({e.last_write_time(ec), e.path()});
+	}
+	std::sort(found.begin(), found.end(), [](const auto& a, const auto& b){ return a.first > b.first; });   // newest first
+	for(const auto& f : found) g_lookFiles.push_back({f.second, pathText(f.second.stem()), lookAge(f.first)});
+}
+
+static void drawSaveLookPopup(){
+	if(!ImGui::BeginPopupModal("Save look", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+	if(ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+	ImGui::SetNextItemWidth(260.0f);
+	bool enter = ImGui::InputText("Name", g_lookNameBuf, sizeof(g_lookNameBuf), ImGuiInputTextFlags_EnterReturnsTrue);
+	std::string name = lookFileName(g_lookNameBuf);
+	std::filesystem::path dir = looksFolder();
+	std::filesystem::path path;
+	if(!dir.empty() && !name.empty()) path = dir / pathFromUtf8(name + ".txt");
+	std::error_code ec;
+	bool exists = !path.empty() && std::filesystem::exists(path, ec);
+	if(dir.empty()){
+		ImGui::TextWrapped("No folder for looks could be made: Documents, beside SimLOD and the working folder were tried.");
+	}else if(name.empty()){
+		ImGui::TextDisabled("Type a name for the look.");
+	}else{
+		ImGui::TextDisabled("%s", pathText(path).c_str());
+		if(exists) ImGui::Text("A look with this name exists; saving replaces it.");
+	}
+	bool save = ImGui::Button(exists ? "Replace" : "Save") || enter;
+	ImGui::SameLine();
+	bool cancel = ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_Escape));
+	if(save && !path.empty()){
+		std::string error;
+		if(saveLook(path, error)){
+			g_lookName = name;
+			logLine("[look] saved %s\n", pathText(path).c_str());
+			notice("Look %s saved", name.c_str());
+		}else{
+			logLine("[look] not saved: %s\n", error.c_str());
+			notice("The look was not saved: %s", error.c_str());
+		}
+		ImGui::CloseCurrentPopup();
+	}else if(cancel){
+		ImGui::CloseCurrentPopup();
+	}
+	ImGui::EndPopup();
+}
+
+static void drawLoadLookPopup(){
+	if(!ImGui::BeginPopup("Load look")) return;
+	std::filesystem::path dir = looksFolder();
+	if(dir.empty()){
+		ImGui::TextDisabled("No folder for looks could be made.");
+	}else if(g_lookFiles.empty()){
+		ImGui::TextDisabled("No saved looks yet. Save look puts them in this folder:");
+	}
+	for(size_t i = 0; i < g_lookFiles.size(); i++){
+		const LookFile& f = g_lookFiles[i];
+		ImGui::PushID(int(i));
+		if(ImGui::Selectable(f.name.c_str(), false, 0, ImVec2(220.0f, 0.0f))) loadLook(f.path);   // closes the popup
+		ImGui::SameLine();
+		ImGui::TextDisabled("%s", f.age.c_str());
+		ImGui::PopID();
+	}
+	if(!dir.empty()){
+		ImGui::Separator();
+		ImGui::TextDisabled("%s", pathText(dir).c_str());
+		if(ImGui::SmallButton("Open folder")) openInFileBrowser(dir);
+		ImGui::SameLine();
+		if(ImGui::SmallButton("Copy path")) ImGui::SetClipboardText(pathText(dir).c_str());
+	}
+	ImGui::EndPopup();
 }
 
 Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
@@ -1548,9 +2271,11 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.boxMax                   = boxSize;
 	uniforms.frameCounter             = frameCounter;
 	uniforms.showBoundingBox          = settings.showBoundingBox;
-	uniforms.showPoints               = settings.showPoints;
-	uniforms.colorByNode              = settings.colorByNode;
-	uniforms.colorByLOD               = settings.colorByLOD;
+	// Show unedited draws the points as Reset to unedited leaves them: shown,
+	// in their stored colours rather than the debug colours.
+	uniforms.showPoints               = settings.showPoints || settings.showUnedited;
+	uniforms.colorByNode              = settings.colorByNode && !settings.showUnedited;
+	uniforms.colorByLOD               = settings.colorByLOD && !settings.showUnedited;
 	uniforms.minNodeSize              = effectiveMinNodeSize();
 	uniforms.pointSize                = settings.pointSize;
 	uniforms.useHighQualityShading    = settings.useHighQualityShading;
@@ -1633,7 +2358,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		bool haveBox = boxSize.x > 0.0f && std::isfinite(boxMin.x);
 		if(haveBox && sizeChanged){
 			fittedSize = boxSize;
-			float longest = std::max(boxSize.x, std::max(boxSize.y, boxSize.z));
 			float diag    = std::sqrt(boxSize.x*boxSize.x + boxSize.y*boxSize.y + boxSize.z*boxSize.z);
 
 			// test source: centre of the cloud in plan, at 55% of its height
@@ -1641,7 +2365,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 			settings.testY = boxMin.y + boxSize.y * 0.5f;
 			settings.testZ = boxMin.z + boxSize.z * 0.55f;
 
-			g_eventRadius        = g_eventRadiusArg > 0.0f ? g_eventRadiusArg : longest * 0.12f;    // 12% of the longest side
+			g_eventRadius        = g_eventRadiusArg > 0.0f ? g_eventRadiusArg : fittedEventRadius();
 			settings.volMaxDist  = diag * 1.5f;        // rays can cross the whole cloud
 			logLine("[host] fitted to cloud: extent %.1f x %.1f x %.1f m, test source (%.1f, %.1f, %.1f), radius %.1f m, reach %.0f m\n",
 				boxSize.x, boxSize.y, boxSize.z, settings.testX, settings.testY, settings.testZ, g_eventRadius, settings.volMaxDist);
@@ -1728,6 +2452,8 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.maxSplatPx       = effectiveMaxSplatPx();
 	uniforms.grain            = settings.grain;
 	uniforms.vignette         = settings.vignette;
+	uniforms.showUnedited     = settings.showUnedited ? 1 : 0;
+	uniforms.toneCurve        = std::clamp(settings.toneCurve, 0.0f, 1.0f);
 	{
 		double az = settings.lightAzimuth   * 3.14159265358979 / 180.0;
 		double el = settings.lightElevation * 3.14159265358979 / 180.0;
@@ -1746,7 +2472,11 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.sunbeams       = settings.sunbeams;
 		uniforms.sunAnisotropy  = std::clamp(settings.sunAnisotropy, -0.95f, 0.95f);   // g = 1 is a spike
 	}
-	uniforms.lightOn        = settings.lightOn ? 1 : 0;
+	// Only with its grid. Without one (no room for it, or no occupancy grid to
+	// build it from) lightAt reads full sun everywhere, so every point was lit
+	// at k = ambient + (1 - ambient) * intensity, 2.34 at the defaults, with no
+	// canopy shade, while the log and notice said the light was disabled.
+	uniforms.lightOn        = (settings.lightOn && g_lightGrid != 0) ? 1 : 0;
 	uniforms.nearClip       = settings.nearClip;
 	uniforms.mixR           = settings.mixColour[0];
 	uniforms.mixG           = settings.mixColour[1];
@@ -1841,7 +2571,7 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 			g_gridX, g_gridY, g_gridZ, g_cellSize, settings.numInsects, settings.insectPlacement);
 	}
 
-	if(settings.markersOnly){   // apply_markers2.ps1: the array on its own
+	if(settings.markersOnly && !settings.showUnedited){   // the marker array on its own
 		uniforms.showPoints = 0;
 		uniforms.numInsects = 0;
 	}
@@ -2919,8 +3649,22 @@ int main(int argc, char** argv){
 	// by zero and the like on every thread and writes a symbolised stack
 	// trace to the run log. The old SIGSEGV handler only covered the main
 	// thread and could not say where the fault was.
+	{
+		std::error_code ec;
+		auto exe = std::filesystem::absolute(argc > 0 ? argv[0] : "", ec);
+		if(!ec) g_exeDir = exe.parent_path();
+	}
 	logLine("[host] SimLOD starting\n");   // opens the run log, so its path is known
 	installCrashHandler(g_logPath.c_str());
+	{
+		// Where things are read from and written to. Hot reload and the run
+		// log both follow the working directory; started from Visual Studio
+		// it is build/Release, whose modules/ is the copy made at build time.
+		std::error_code ec;
+		logLine("[host] working directory %s\n", std::filesystem::current_path(ec).string().c_str());
+		logLine("[host] kernels from %s\n", std::filesystem::absolute("modules/progressive_octree", ec).string().c_str());
+		logLine("[host] run log %s\n", g_logPath.empty() ? "(none)" : g_logPath.c_str());
+	}
 	// (abort() and uncaught exceptions are handled there too, with a stack)
 
 	// --hidden: an invisible window for unattended runs; frames still render
@@ -2930,6 +3674,15 @@ int main(int argc, char** argv){
 	}
 
 	auto renderer = make_shared<GLRenderer>();
+	{
+		// Which GPU draws the window. On a hybrid-graphics laptop it must be
+		// the NVIDIA one, or CUDA cannot register the frame texture and every
+		// frame is skipped (see NvOptimusEnablement at the top of this file).
+		const char* vendor   = (const char*)glGetString(GL_VENDOR);
+		const char* glRender = (const char*)glGetString(GL_RENDERER);
+		const char* version  = (const char*)glGetString(GL_VERSION);
+		logLine("[host] OpenGL: %s, %s, %s\n", vendor ? vendor : "?", glRender ? glRender : "?", version ? version : "?");
+	}
 
 	// Fonts, before the first frame builds the atlas. The default font goes in
 	// first so it stays the default for every other window. ProggyTiny gets
@@ -3061,6 +3814,10 @@ int main(int argc, char** argv){
 			benchFrames = std::max(0, std::atoi(argv[++i]));
 		}else if(arg == "--hidden"){
 			// applied before the window was created
+		}else if(arg == "--look" && i + 1 < argc){
+			// a saved look, as a file or by name in the looks folder; a --set
+			// after it changes it further
+			loadLookArg(argv[++i]);
 		}else if(arg == "--set" && i + 1 < argc){
 			// --set name=value, for the settings that matter most on a small GPU,
 			// and for repeatable screenshots
@@ -3091,8 +3848,10 @@ int main(int argc, char** argv){
 			else if(key == "torch")     settings.torchOn               = v != 0.0;   // aims at the frame centre
 			else if(key == "radius")  { g_eventRadiusArg = float(v); if(v > 0.0) g_eventRadius = float(v); }
 			else if(key == "exposure")  settings.exposure              = float(v);
+			else if(key == "unedited" || key == "native") settings.showUnedited = v != 0.0;   // 1 = the unedited view; "native" was its old name
+			else if(key == "tone")      settings.toneCurve             = float(v);
 			else if(key == "keep")      loadKeepPer10k = uint32_t(std::clamp(v, 0.01, 1.0) * 10000.0 + 0.5);   // fraction of each file loaded
-			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze, hazefall, hazefloor, hazesky, light, sunbeams, whitefix, skycast, torch, radius, exposure, keep)\n", key);
+			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze, hazefall, hazefloor, hazesky, light, sunbeams, whitefix, skycast, torch, radius, exposure, tone, unedited, keep)\n", key);
 		}else if(iEndsWith(arg, "las") || iEndsWith(arg, "laz") || iEndsWith(arg, "simlod")){
 			std::error_code ec;
 			auto absolute = std::filesystem::absolute(arg, ec);   // dropped files are absolute too
@@ -3107,7 +3866,8 @@ int main(int argc, char** argv){
 	}
 
 	// --calls: load and play the schedule, as the Calls panel's Load and Play
-	// buttons do, with bloom on as opening that panel turns it on
+	// buttons do. Bloom follows Bloom strength, as in that panel: off at the
+	// unedited start, on with --set bloom=.
 	if(!argCalls.empty()){
 		loadCallSchedule(argCalls);
 		g_showClock   = 0.0;
@@ -3574,6 +4334,46 @@ int main(int argc, char** argv){
 			// Colour are open by default. Every control appears exactly once.
 			// =====================================================================
 
+			// ---- UNEDITED ---------------------------------------------------------
+			// Every setting below starts at the value that changes nothing, so
+			// the cloud starts as stored in the file. Reset returns there; Show
+			// unedited compares the current settings with it.
+			if(ImGui::Button("Reset to unedited")) resetToUnedited();
+			tipFor("Returns every setting that changes how the cloud is represented to its starting value: the cloud as stored in the file, "
+				   "with no light, torch, haze, sunbeams, bloom, insects, point shading, eye dome lighting, canopy repair or cull, "
+				   "a neutral grade and no tone curve. Point size, round splats and high-quality shading go back to their starting values, "
+				   "and the points are shown again in their stored colours (Show points on; Markers only, Colour by node and Colour by LOD off). "
+				   "Kept: the camera, lens and near clip, the sky and horizon, markers and survey, calls, detail and speed, "
+				   "and the bounding box, voxel grid and Update visibility.");
+			ImGui::SameLine();
+			ImGui::Checkbox("Show unedited", &settings.showUnedited);
+			tipFor("Draws the cloud as Reset to unedited would leave it, without changing your settings: tick to compare, untick to return to them. "
+				   "Point size, splat shape and high-quality shading stay as set, so the points keep their size and shape.");
+			if(settings.showUnedited){
+				ImGui::TextDisabled("Showing the unedited cloud: the faint settings have no effect until this is unticked.");
+			}
+
+			// ---- LOOKS ------------------------------------------------------------
+			// A look is the settings that decide how the image looks, kept in a
+			// text file so it outlasts the session (forEachLookSetting).
+			if(ImGui::Button("Save look...")){
+				snprintf(g_lookNameBuf, sizeof(g_lookNameBuf), "%s", g_lookName.empty() ? "look" : g_lookName.c_str());
+				ImGui::OpenPopup("Save look");
+			}
+			tipFor("Saves the settings that decide how the image looks to a text file, so the look can be loaded in a later session: "
+				   "Points, Light, Sky and haze, Colour, the calls' glow, bloom and medium, Insects, and Scan clean-up. "
+				   "Not saved: the camera, lens and near clip, markers and survey, the call schedule, detail and speed, Volume reach, and the debug views. "
+				   "The files go in Documents\\SimLOD\\looks; Load look shows the folder.");
+			ImGui::SameLine();
+			if(ImGui::Button("Load look...")){
+				listLooks();
+				ImGui::OpenPopup("Load look");
+			}
+			tipFor("Loads a saved look; the newest are listed first. Every setting a look holds first returns to its starting value, "
+				   "so a look loads the same way whatever was set before.");
+			drawSaveLookPopup();
+			drawLoadLookPopup();
+
 			// ---- CAMERA -------------------------------------------------------
 			if(ImGui::CollapsingHeader("Camera")){
 				drawBirdsEye(renderer);
@@ -3654,20 +4454,27 @@ int main(int argc, char** argv){
 			if(ImGui::CollapsingHeader("Points", ImGuiTreeNodeFlags_DefaultOpen)){
 				ImGui::SliderFloat("Point size (m)",   &settings.pointWorldSize, 0.0f, 0.30f, "%.3f");
 				tipFor("Splat diameter in metres, projected by depth. Near points large, far ones small.");
-				ImGui::SliderFloat("Point shading",    &settings.pointShading,   0.0f, 1.0f);
-				tipFor("Shades each splat as a small sphere lit from the upper left. 0 is a flat disc.");
+				{
+					UneditedDim dim;
+					ImGui::SliderFloat("Point shading",    &settings.pointShading,   0.0f, 1.0f);
+					tipFor("Shades each splat as a small sphere lit from the upper left. 0 is a flat disc.");
+				}
 				ImGui::SliderFloat("Near clip (m)",    &settings.nearClip,       0.0f, 10.0f, "%.2f");
 				tipFor("Points closer to the camera than this are not drawn, so foliage right at the lens does not fill the frame.");
 				ImGui::Checkbox   ("Round splats",      &settings.roundSplats);
 				ImGui::Checkbox   ("High quality shading", &settings.useHighQualityShading);
 				tipFor("Blends the colours of all points within 1% of the nearest depth at each pixel, which smooths the speckle where points overlap. Draws every point twice, a depth pass and a colour pass, so it costs more than the standard path.");
 				ImGui::Separator();
-				ImGui::Checkbox   ("Eye dome lighting", &settings.enableEDL);
-				ImGui::SliderFloat("EDL strength",      &settings.edlStrength, 0.0f, 3.0f);
+				{
+					UneditedDim dim;
+					ImGui::Checkbox   ("Eye dome lighting", &settings.enableEDL);
+					ImGui::SliderFloat("EDL strength",      &settings.edlStrength, 0.0f, 3.0f);
+				}
 			}
 
 			// ---- LIGHT --------------------------------------------------------
 			if(ImGui::CollapsingHeader("Light")){
+				UneditedDim dim;
 				bool lm = false;
 				lm |= ImGui::Checkbox   ("Key light on",     &settings.lightOn);
 				tipFor("A directional light through the canopy, computed once per cell of the occupancy grid (Grid resolution, under Scan clean-up).");
@@ -3704,6 +4511,7 @@ int main(int argc, char** argv){
 				ImGui::SliderFloat("Horizon softness", &settings.horizonSoftness, 0.0f, 90.0f, "%.0f deg");
 				tipFor("Degrees the sky-to-void gradient spans. It was effectively 1 degree, which drew a hard line across the frame. 12 reads as atmosphere; 90 is a full gradient from zenith to nadir; 0 is a deliberate hard edge.");
 				ImGui::Separator();
+				UneditedDim dim;   // the haze and everything below it; the sky colours above still apply
 				ImGui::SliderFloat("Depth haze",       &settings.fogDensity,     0.0f, 0.08f, "%.5f",
 						ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
 				tipFor("Distance blends toward the haze colour. The reference goes LIGHTER with distance, so keep the colour pale. The value is the haze's density per metre at and below the haze floor.");
@@ -3734,8 +4542,13 @@ int main(int argc, char** argv){
 
 			// ---- COLOUR -------------------------------------------------------
 			if(ImGui::CollapsingHeader("Colour", ImGuiTreeNodeFlags_DefaultOpen)){
+				UneditedDim dim;
 				ImGui::SliderFloat("Exposure",         &settings.exposure,       0.1f, 16.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-				tipFor("Overall brightness. Logarithmic: up to 16x, for scans whose colour was darkened to tame the sunlit canopy.");
+				tipFor("Overall brightness. 1 leaves it as stored. Logarithmic: up to 16x, for scans whose colour was darkened to tame the sunlit canopy.");
+				ImGui::SliderFloat("Tone curve",       &settings.toneCurve,      0.0f, 1.0f);
+				tipFor("0 leaves brightness as it is; a colour brighter than white is brought down to white whole, keeping its hue. "
+					   "1 is the ACES fit, a film-like curve that darkens the deepest shadows, lifts the mid-tones and compresses the highlights. "
+					   "It acts on each pixel's brightest channel and scales the other two with it, so hues are kept.");
 				ImGui::SliderFloat("Saturation",       &settings.saturation,     0.0f, 2.5f);
 				ImGui::SliderFloat("Temperature",      &settings.temperature,   -1.0f, 1.0f);
 				tipFor("Negative is cool, positive warm.");
@@ -3746,7 +4559,7 @@ int main(int argc, char** argv){
 				ImGui::SliderFloat("Mix blue",         &settings.mixColour[2],   0.0f, 2.5f);
 				ImGui::SameLine(0.0f);
 				if(ImGui::SmallButton("reset##mix")){ settings.mixColour[0] = settings.mixColour[1] = settings.mixColour[2] = 1.0f; }
-				tipFor("Per-channel gain in linear light. 1.0 is neutral. Below removes a cast, above adds one.");
+				tipFor("Per-channel gain in linear light. 1.0 is neutral. Below removes a cast, above adds one. The scan's foliage is olive, red close to green, so red above green turns it yellow.");
 				ImGui::Separator();
 				ImGui::ColorEdit3 ("Tint colour",       settings.tintColour, ImGuiColorEditFlags_NoInputs);
 				ImGui::SliderFloat("Tint mix",          &settings.tintMix,     0.0f,  1.0f);
@@ -3777,6 +4590,9 @@ int main(int argc, char** argv){
 				ImGui::Text("clock %.1f s   active %d", g_showClock, g_activeEvents);
 				ImGui::Checkbox   ("Show event markers", &settings.showEventMarkers);
 				ImGui::Separator();
+				// The unedited view draws each point's stored colour, without
+				// the calls' glow, bloom or medium; the event markers still show.
+				UneditedDim dim;
 				ImGui::ColorEdit3 ("Emission colour",  settings.emissionColour, ImGuiColorEditFlags_NoInputs);
 				ImGui::SameLine(0.0f);
 				ImGui::Checkbox   ("by frequency",     &settings.emissionByFrequency);
@@ -3818,6 +4634,7 @@ int main(int argc, char** argv){
 
 			// ---- INSECTS ------------------------------------------------------
 			if(ImGui::CollapsingHeader("Insects")){
+				UneditedDim dim;   // no insects in the unedited view
 				ImGui::SliderInt  ("Count",            &settings.numInsects,   0, 30000);
 				ImGui::SliderInt  ("Size (px)",        &settings.insectSize,   1,     4);
 				ImGui::SliderFloat("Glow",             &settings.insectGlow,   0.0f, 6.0f);
@@ -3832,8 +4649,11 @@ int main(int argc, char** argv){
 				ImGui::Separator();
 				ImGui::Checkbox("Show markers", &settings.showMarkers);
 				ImGui::SameLine(0.0f);
-				ImGui::Checkbox("Markers only", &settings.markersOnly);
-				tipFor("Markers only hides the forest and the insects so the array can be seen on its own. Nothing is discarded.");
+				{
+					UneditedDim dim;   // the unedited view shows the forest
+					ImGui::Checkbox("Markers only", &settings.markersOnly);
+					tipFor("Markers only hides the forest and the insects so the array can be seen on its own. Nothing is discarded.");
+				}
 				ImGui::TextWrapped("Hover a checkerboard centre and press P. A magenta ball marks it. Coordinates below are FILE coordinates: the LAS frame, the one the mic survey must be matched to.");
 				if(!g_markers.empty()) ImGui::Separator();
 				int removeIdx = -1;
@@ -3939,16 +4759,20 @@ int main(int argc, char** argv){
 
 			// ---- SCAN CLEAN-UP ------------------------------------------------
 			if(ImGui::CollapsingHeader("Scan clean-up")){
-				ImGui::SliderInt  ("Min neighbours",   &settings.minNeighbours, 0, 60);
-				tipFor("Removes points whose grid cell holds fewer than this many. 0 is off. Scanner noise sits alone; leaves do not.");
-				ImGui::SliderInt  ("Cull reach",       &settings.cullReach,     0, 1);
-				tipFor("0 counts the point's own cell. 1 adds the six neighbours, which spares thin surfaces on a cell boundary.");
-				ImGui::Checkbox   ("Show culled only", &settings.showCulledOnly);
-				tipFor("Shows ONLY what would be removed. Raise Min neighbours until this is noise and nothing you want.");
+				{
+					UneditedDim dim;   // no cull in the unedited view
+					ImGui::SliderInt  ("Min neighbours",   &settings.minNeighbours, 0, 60);
+					tipFor("Removes points whose grid cell holds fewer than this many. 0 is off. Scanner noise sits alone; leaves do not.");
+					ImGui::SliderInt  ("Cull reach",       &settings.cullReach,     0, 1);
+					tipFor("0 counts the point's own cell. 1 adds the six neighbours, which spares thin surfaces on a cell boundary.");
+					ImGui::Checkbox   ("Show culled only", &settings.showCulledOnly);
+					tipFor("Shows ONLY what would be removed. Raise Min neighbours until this is noise and nothing you want.");
+				}
 				ImGui::Separator();
 				{
 					// The sliders rebuild the colour grid when let go, not on every
 					// frame of a drag: a rebuild recounts every point and relights.
+					UneditedDim dim;
 					bool wf = ImGui::Checkbox("Fix blown-out canopy", &settings.whiteFix);
 					tipFor("The scanner's camera saturates in the sunlit canopy, so leaves and branches there come out white. This recolours those points from the nearest well-exposed points around them: green from foliage, brown from bark.");
 					ImGui::SliderFloat("White level",   &settings.whiteLevel,  100.0f, 250.0f, "%.0f");
@@ -3964,7 +4788,7 @@ int main(int argc, char** argv){
 					wf |= ImGui::IsItemDeactivatedAfterEdit();
 					tipFor("How far a blown-out cell looks for a colour. Each cell is the occupancy grid's cell size.");
 					if(wf) g_gridRefill = true;   // the colour grid is rebuilt with the counts
-					if(settings.whiteFix && g_colourGrid == 0 && g_voxelGrid != 0) ImGui::Text("   not enough GPU memory for the colour grid");
+					if(settings.whiteFix && g_colourGridFailed) ImGui::Text("   not enough GPU memory for the colour grid");
 				}
 				ImGui::Separator();
 				// Edit a copy and apply it on release: every applied value frees and
@@ -3974,7 +4798,9 @@ int main(int argc, char** argv){
 				if(!ImGui::IsAnyItemActive()) pendingGridRes = g_gridResolution;   // follow fallbacks
 				ImGui::SliderInt  ("Grid resolution",  &pendingGridRes, 64, 512);
 				if(ImGui::IsItemDeactivatedAfterEdit()) g_gridResolution = pendingGridRes;
-				tipFor("Cells along the cloud's longest side. Applied when you release the slider. Memory grows with the cube: 256 is ~20 MB, 512 ~156 MB.");
+				tipFor("Cells along the cloud's longest side. Applied when you release the slider. Memory grows with the cube: 256 is ~20 MB, 512 ~156 MB. "
+					   "The key light's grid takes as much again while the light is on, and the colour grid twice as much while Fix blown-out canopy is on "
+					   "(and briefly while the bird's-eye view is rebuilt).");
 				{
 					float longest = std::max(boxSize.x, std::max(boxSize.y, boxSize.z));
 					if(longest > 0.0f){
@@ -3985,6 +4811,7 @@ int main(int argc, char** argv){
 						int pz = std::min(R, int(boxSize.z / cell) + 1);
 						double mb = double(px) * double(py) * double(pz) * 4.0 / 1e6;
 						ImGui::Text("   %d x %d x %d @ %.3f m = %.0f MB", px, py, pz, cell, mb);
+						ImGui::Text("   + %.0f MB with the key light, + %.0f MB with Fix blown-out canopy", mb, 2.0 * mb);
 					}
 					if(g_gridRefill) ImGui::Text("   counts are stale - rebuilding on the next frame");
 				}
@@ -3998,13 +4825,27 @@ int main(int argc, char** argv){
 				ImGui::Checkbox   ("Small menu text",   &g_smallMenuText);
 				tipFor("Draws this window in a 10-pixel font with tighter spacing, so more of it fits on screen. Off returns to the 13-pixel font.");
 				ImGui::Separator();
-				ImGui::Checkbox   ("Show points",       &settings.showPoints);
+				{
+					UneditedDim dim;   // the unedited view shows the points
+					ImGui::Checkbox   ("Show points",       &settings.showPoints);
+				}
 				ImGui::Checkbox   ("Show bounding box", &settings.showBoundingBox);
 				ImGui::Checkbox   ("Show voxel grid",   &settings.showVoxelGrid);
 				ImGui::Checkbox   ("Update visibility", &settings.doUpdateVisibility);
 				tipFor("Off freezes the level of detail and the culling at the current view, so you can move away and see which parts of the octree that view selected.");
-				ImGui::Checkbox   ("Colour by node",    &settings.colorByNode);
-				ImGui::Checkbox   ("Colour by LOD",     &settings.colorByLOD);
+				{
+					UneditedDim dim;   // the unedited view shows the stored colours
+					ImGui::Checkbox   ("Colour by node",    &settings.colorByNode);
+					ImGui::Checkbox   ("Colour by LOD",     &settings.colorByLOD);
+				}
+				ImGui::Separator();
+				// The run log follows the working directory (build/Release when
+				// started from Visual Studio), so say where this one is.
+				ImGui::TextDisabled("Run log");
+				ImGui::TextWrapped("%s", g_logPath.empty() ? "(no log file could be written)" : g_logPath.c_str());
+				if(!g_logPath.empty() && ImGui::SmallButton("Copy log path")){
+					ImGui::SetClipboardText(g_logPath.c_str());
+				}
 			}
 
 			// if(ImGui::Button("Do Color Filtering!")){
