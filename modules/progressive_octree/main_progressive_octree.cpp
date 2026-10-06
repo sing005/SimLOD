@@ -52,7 +52,6 @@ using namespace std;
 extern "C" { __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001; }
 #endif
 
-constexpr uint64_t PINNED_MEM_POOL_SIZE = 200;         // pool of pointers to batches of pinned memory
 // BATCH_STREAM_SIZE, the device upload ring, is in HostDeviceInterface.h
 constexpr uint64_t MAX_DECODED_AHEAD    = 50;          // batches the loaders may decode ahead of the kernel, in pinned host memory
 constexpr uint64_t MAX_BATCH_SIZE       = 1'000'000;   // each loaded batch comprises <size> points
@@ -62,10 +61,7 @@ constexpr int MAX_LOADQUEUE_SIZE        = 300;         // stop loading from disk
 CudaPrint cudaprint;
 
 
-vector<string> paths = {
-	"NONE",
-	// "d:/dev/pointclouds/riegl/retz.las",
-};
+vector<string> paths;   // the point files of the current load
 
 struct PinnedMemorySlot {
 	void* memLocation;
@@ -279,6 +275,8 @@ struct {
 	bool  emissionByFrequency        = false;
 } settings;
 
+static void logLine(const char* fmt, ...);   // the run log, defined below
+
 struct PinnedMemPool{
 	mutex mtx_pool;
 	mutex mtx_register;
@@ -337,8 +335,8 @@ struct PinnedMemPool{
 		lock_guard<mutex> lock(mtx_pool);
 
 		if(pool.size() == 0){
-			printfmt("pool is empty, allocating additional pinned memory slots \n");
 			reserveSlot();
+			logLine("[load] pinned memory pool empty: grown to %d slots\n", int(registered.size()));
 		}
 
 		PinnedMemorySlot slot = pool.front();
@@ -372,8 +370,6 @@ struct PinnedMemPool{
 
 bool requestReset                  = false;
 bool requestBenchmark              = false;
-atomic_bool requestStepthrough     = false;
-atomic_bool requestStep            = false;
 bool requestColorFiltering         = false;
 float renderingDuration            = 0.0f;
 atomic_uint64_t numPointsUploaded  = 0;   // written by the uploader, read by the main thread's progress log
@@ -2692,7 +2688,6 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 		cntKernelUpdateDuration += 1.0;
 	}
 
-	requestStep = false;
 	numBatchesProcessed++;
 
 	// cuCtxSynchronize();
@@ -3045,6 +3040,41 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	logLine("[vram] %.0f MB free after allocating the octree pool\n", freeAfterInit / 1e6);
 }
 
+static bool isPointFile(const string& path){
+	return iEndsWith(path, ".las") || iEndsWith(path, ".laz") || iEndsWith(path, ".simlod");
+}
+
+// Why a point file cannot be loaded, or "" when it can.
+static string pointFileProblem(const string& path){
+	std::error_code ec;
+	if(!fs::is_regular_file(path, ec)) return "not found";
+	if(iEndsWith(path, ".las") || iEndsWith(path, ".laz")) return lasFileProblem(path);
+	if(iEndsWith(path, ".simlod")) return simlodFileProblem(path);
+	return "not a .las, .laz or .simlod file";
+}
+
+// The files that can be loaded. Each one that cannot is logged, and *refusal
+// says which, for the screen. A cut LAZ file used to crash the viewer inside
+// laszip, a cut LAS file loaded copies of other points, and a missing file was
+// left out without a message.
+static vector<string> loadablePointFiles(const vector<string>& files, string* refusal){
+	vector<string> loadable;
+	int numRefused = 0;
+	refusal->clear();
+	for(const string& file : files){
+		string problem = pointFileProblem(file);
+		if(problem.empty()){
+			loadable.push_back(file);
+			continue;
+		}
+		logLine("[load] not loading %s: %s\n", file.c_str(), problem.c_str());
+		if(numRefused++ == 0) *refusal = fs::path(file).filename().string() + ": " + problem;
+	}
+	if(numRefused > 1)       *refusal = std::to_string(numRefused) + " files not loaded (see the log), " + *refusal;
+	else if(numRefused == 1) *refusal = "Not loaded - " + *refusal;
+	return loadable;
+}
+
 void reload(){
 
 	printfmt("start loading \n");
@@ -3091,17 +3121,19 @@ void reload(){
 
 	// query bounding box and number of points in input files
 	// vector<PointBatch> batches;
-	for(string path : paths){
+	string refusal;
+	for(string path : loadablePointFiles(paths, &refusal)){
 
-		if(!fs::exists(path)) continue;
+		std::error_code ec;
+		uint64_t fileSize = fs::file_size(path, ec);
+		if(ec) continue;   // gone since the check
+		numBytesTotal += fileSize;
 
-		numBytesTotal += fs::file_size(path);
-
-		if(iEndsWith(path, "laz")){
+		if(iEndsWith(path, ".laz")){
 			lazInBatches = true;
 		}
 
-		if(iEndsWith(path, "las") || iEndsWith(path, "laz")){
+		if(iEndsWith(path, ".las") || iEndsWith(path, ".laz")){
 
 			LasHeader header = loadHeader(path);
 			numPointsTotal += keptBefore(header.numPoints);
@@ -3134,10 +3166,10 @@ void reload(){
 				numBatchesTotal++;
 			}
 
-		}else if(iEndsWith(path, "simlod")){
+		}else if(iEndsWith(path, ".simlod") && fileSize >= 24){
 
 			auto buffer = readBinaryFile(path, 0, 24);
-			uint64_t numPoints = (fs::file_size(path) - 24) / 16;
+			uint64_t numPoints = (fileSize - 24) / 16;
 
 			boxMin.x = std::min(boxMin.x, buffer->get<float>( 0));
 			boxMin.y = std::min(boxMin.y, buffer->get<float>( 4));
@@ -3165,6 +3197,8 @@ void reload(){
 
 		
 	}
+
+	if(!refusal.empty()) notice("%s", refusal.c_str());
 
 	// Markers stay put in FILE coordinates. Each cloud is shifted by its own
 	// minimum corner, so a marker kept in the renderer frame used to land in a
@@ -3226,9 +3260,8 @@ void stopLoadingAtCapacity(){
 		batchesToProcess.clear();
 	}
 
-	// The uploader holds mtx_uploader for all but ~100 ns of each ~100 us pass
-	// and std::mutex is not fair, so ask it to back off outside the lock first,
-	// as reset() does. Without this the main thread could wait indefinitely.
+	// The uploader takes mtx_uploader on every pass while it works, and
+	// std::mutex is not fair, so ask it to back off first, as reset() does.
 	resetInProgress = true;
 	{
 		// same lock order as the uploader: mtx_uploader, then the pinned queue
@@ -3337,12 +3370,20 @@ void spawnLoader(size_t i, int maxLazThreads) {
 			// }
 
 			if (everythingIsDone || processingLagsBehind || resetInProgress.load()) {
-				std::this_thread::sleep_for(1ms);
+				// Nothing left to load until the next drop: sleep longer, and
+				// free the LAS read buffer. The loaders used to wake 1000
+				// times a second each for the whole session.
+				if(everythingIsDone && !resetInProgress.load()){
+					releaseLasReadBuffer();
+					std::this_thread::sleep_for(20ms);
+				}else{
+					std::this_thread::sleep_for(1ms);
+				}
 				continue;
 			}
 
 			// lock thread's own mutex
-			lock_guard<mutex> lock_loader(*mtx_loader[i]);
+			unique_lock<mutex> lock_loader(*mtx_loader[i]);
 
 			PointBatch batch;
 
@@ -3355,7 +3396,7 @@ void spawnLoader(size_t i, int maxLazThreads) {
 				// Tested and counted under this lock, so the cap is exact. Capped
 				// threads used to retry without sleeping and kept this mutex busy
 				// for the threads that were decoding.
-				if(next.count > 0 && iEndsWith(next.file, "laz") && numThreadsLoading >= uint64_t(maxLazThreads)){
+				if(next.count > 0 && iEndsWith(next.file, ".laz") && numThreadsLoading >= uint64_t(maxLazThreads)){
 					mtx_batchesToProcess.unlock();
 					std::this_thread::sleep_for(1ms);
 					continue;
@@ -3367,8 +3408,9 @@ void spawnLoader(size_t i, int maxLazThreads) {
 				if(batch.count > 0) numThreadsLoading++;
 			}
 			mtx_batchesToProcess.unlock();
+			bool tookBatch = batch.count > 0;
 
-			if (batch.count > 0) {
+			if (tookBatch) {
 				// load points in batch
 
 				// Taken only with work in hand. Idle loaders took and returned a
@@ -3381,11 +3423,18 @@ void spawnLoader(size_t i, int maxLazThreads) {
 				double t_start = now();
 				// printfmt("start loading batch {} at {:.3f} \n", batchID, t_start);
 
-				if(iEndsWith(batch.file, "las")){
+				if(iEndsWith(batch.file, ".las")){
 					void* target = (void*)pinnedPoints;
 
 					double translation[3] = {-boxMin.x, -boxMin.y, -boxMin.z};
-					loadLasNative(batch.file, batch.lasHeader, batch.first, batch.count, target, translation);
+					if(!loadLasNative(batch.file, batch.lasHeader, batch.first, batch.count, target, translation)){
+						logLine("[load] cannot read points %llu to %llu of %s; skipped\n",
+							(unsigned long long)batch.first, (unsigned long long)(batch.first + batch.count), batch.file.c_str());
+						skipUnreadableBatch(batch);
+						pinnedMemPool.release(pinnedMemSlot);
+						numThreadsLoading--;
+						continue;
+					}
 					numBytesLoaded += batch.count * batch.lasHeader.bytesPerPoint;
 					if(loadKeepPer10k < 10000){   // --set keep: compact what is kept
 						int kept = 0;
@@ -3402,7 +3451,7 @@ void spawnLoader(size_t i, int maxLazThreads) {
 					lock_guard<mutex> lock_batchesInPinnedMemory(mtx_batchesInPinnedMemory);
 					batchesInPinnedMemory.push_back(batch);
 
-				}else if(iEndsWith(batch.file, "laz")){
+				}else if(iEndsWith(batch.file, ".laz")){
 					laszip_POINTER laszip_reader = nullptr;
 					laszip_header* header = nullptr;
 					laszip_point* laz_point = nullptr;
@@ -3433,12 +3482,18 @@ void spawnLoader(size_t i, int maxLazThreads) {
 
 					laszip_get_header_pointer(laszip_reader, &header);
 					laszip_get_point_pointer(laszip_reader, &laz_point);
-					laszip_seek_point(laszip_reader, batch.first);
+
+					// A failed seek or read leaves the whole batch out: the
+					// points it gave would not be the file's.
+					bool readFailed = laszip_seek_point(laszip_reader, batch.first) != 0;
 
 					int kept = 0;
-					for (int i = 0; i < batch.count; i++) {
+					for (int i = 0; i < batch.count && !readFailed; i++) {
 						double XYZ[3];
-						laszip_read_point(laszip_reader);
+						if(laszip_read_point(laszip_reader) != 0){
+							readFailed = true;
+							break;
+						}
 						if(!keepPoint(uint64_t(batch.first) + i)) continue;   // --set keep
 						laszip_get_coordinates(laszip_reader, XYZ);
 
@@ -3460,6 +3515,19 @@ void spawnLoader(size_t i, int maxLazThreads) {
 
 						pinnedPoints[kept++] = point;
 					}
+					if(readFailed){
+						laszip_CHAR* err = nullptr;
+						laszip_get_error(laszip_reader, &err);
+						logLine("[load] cannot read points %llu to %llu of %s: %s; skipped\n",
+							(unsigned long long)batch.first, (unsigned long long)(batch.first + batch.count), batch.file.c_str(),
+							err ? err : "unknown laszip error");
+						laszip_close_reader(laszip_reader);
+						laszip_destroy(laszip_reader);
+						skipUnreadableBatch(batch);
+						pinnedMemPool.release(pinnedMemSlot);
+						numThreadsLoading--;
+						continue;
+					}
 					batch.count = kept;
 
 					laszip_close_reader(laszip_reader);
@@ -3471,13 +3539,20 @@ void spawnLoader(size_t i, int maxLazThreads) {
 
 					lock_guard<mutex> lock_batchesInPinnedMemory(mtx_batchesInPinnedMemory);
 					batchesInPinnedMemory.push_back(batch);
-				}else if(iEndsWith(batch.file, "simlod")){
+				}else if(iEndsWith(batch.file, ".simlod")){
 					
 					batch.pinnedMem = pinnedMemSlot;
 
 					// At least on windows, this uses winapi to do unbuffered loading to maximize SSD perf
-					uint64_t padding;
-					loadFileNative(batch.file, 24llu + 16llu * uint64_t(batch.first), 16llu * batch.count, pinnedMemSlot.memLocation, &padding);
+					uint64_t padding = 0;
+					if(!loadFileNative(batch.file, 24llu + 16llu * uint64_t(batch.first), 16llu * batch.count, pinnedMemSlot.memLocation, &padding)){
+						logLine("[load] cannot read points %llu to %llu of %s; skipped\n",
+							(unsigned long long)batch.first, (unsigned long long)(batch.first + batch.count), batch.file.c_str());
+						skipUnreadableBatch(batch);
+						pinnedMemPool.release(pinnedMemSlot);
+						numThreadsLoading--;
+						continue;
+					}
 					batch.pinnedMem.memOffset = padding;
 
 					numBytesLoaded += 16llu * batch.count;
@@ -3494,7 +3569,10 @@ void spawnLoader(size_t i, int maxLazThreads) {
 				numThreadsLoading--;
 			}
 
-			std::this_thread::sleep_for(1ms);
+			// An empty queue stays empty until the next load. Not while
+			// holding this loader's mutex, which reset() waits for.
+			lock_loader.unlock();
+			std::this_thread::sleep_for(tookBatch ? 1ms : 20ms);
 		}
 
 		});
@@ -3505,20 +3583,13 @@ void spawnLoader(size_t i, int maxLazThreads) {
 // - Asynchronously schedules uploads in stream_upload
 // - After every async copy, it also asynchronously updates the number of uploaded points
 void spawnUploader(shared_ptr<GLRenderer> renderer) {
-	double timestamp = now();
 
-	thread t([&]() {
+	thread t([]() {
 		installThreadTerminateHandler();
 
 		vector<PinnedMemorySlot> availableSlots;
 
 		while (true) {
-
-			double t_start = now();
-			double spintime = 0.0001;
-
-			// actually seems to wait way, way longer than 100ns.
-			// std::this_thread::sleep_for(100ns);
 
 			// go to sleep if reset is in progress
 			if (resetInProgress.load()) {
@@ -3526,21 +3597,30 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 				continue;
 			}
 
-			// this lock ensures that we don't reset and upload at the same time
-			lock_guard<mutex> lock_uploader(mtx_uploader);
-
-			// spin instead of sleep, because sleep takes too long
-			while (now() < t_start + spintime) {
-				// do some spinning to avoid attempting locks too often
-			}
-
-			if(requestStepthrough){
-				if(requestStep){
-					requestStep = false;
-				}else{
+			// Every batch uploaded and no upload in flight: nothing to do
+			// until the next load. This thread used to spin here, keeping a
+			// core busy for the whole session.
+			if (batchStreamUploadIndex == numBatchesTotal) {
+				bool uploadsInFlight;
+				{
+					lock_guard<mutex> lock_pinnedMemoryInUpload(mtx_pinnedMemoryInUpload);
+					uploadsInFlight = !pinnedMemoryInUpload.empty();
+				}
+				if (!uploadsInFlight) {
+					std::this_thread::sleep_for(20ms);
 					continue;
 				}
 			}
+
+			// Spin for 100 us between passes, to avoid attempting locks too
+			// often: sleep_for(100us) seems to wait way, way longer. Outside
+			// the lock, which reset() and stopLoadingAtCapacity() wait for.
+			double t_start = now();
+			while (now() < t_start + 0.0001) {
+			}
+
+			// this lock ensures that we don't reset and upload at the same time
+			lock_guard<mutex> lock_uploader(mtx_uploader);
 
 			// reclaim all pinned memory slots that are no longer needed and give them back to the pool
 			mtx_pinnedMemoryInUpload.lock();
@@ -3566,8 +3646,6 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 
 			if (everythingIsDone) continue;
 			if (ringFull) continue;
-
-			auto t_00 = now();
 
 			// acquire work, or keep spinning if there is none
 			PointBatch batch;
@@ -3617,8 +3695,6 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 
 		});
 	t.detach();
-
-	setThreadPriorityHigh(t);
 }
 
 // ---- screenshots from the command line ------------------------------------
@@ -3778,7 +3854,12 @@ int main(int argc, char** argv){
 	initCuda();
 	initCudaProgram(renderer);
 
-	pinnedMemPool.reserveSlots(PINNED_MEM_POOL_SIZE);
+	// Loaders stop taking batches once MAX_DECODED_AHEAD decoded batches wait
+	// for the kernel, so at most that many slots, plus one per loader taking a
+	// batch as the limit is reached, are in use. 200 slots (3.4 GB of RAM that
+	// cannot be paged out) used to be reserved, of which about 70 were ever
+	// used. acquire() adds a slot if the pool runs out.
+	pinnedMemPool.reserveSlots(int(MAX_DECODED_AHEAD) + numThreads + 2);
 
 	mtx_loader.reserve(numThreads);
 	for(int i = 0; i < numThreads; i++){
@@ -3884,7 +3965,7 @@ int main(int argc, char** argv){
 			else if(key == "tone")      settings.toneCurve             = float(v);
 			else if(key == "keep")      loadKeepPer10k = uint32_t(std::clamp(v, 0.01, 1.0) * 10000.0 + 0.5);   // fraction of each file loaded
 			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze, hazefall, hazefloor, hazesky, light, sunbeams, whitefix, skycast, torch, radius, exposure, tone, unedited, keep)\n", key);
-		}else if(iEndsWith(arg, "las") || iEndsWith(arg, "laz") || iEndsWith(arg, "simlod")){
+		}else if(isPointFile(arg)){
 			std::error_code ec;
 			auto absolute = std::filesystem::absolute(arg, ec);   // dropped files are absolute too
 			argFiles.push_back(ec ? arg : absolute.string());
@@ -3921,7 +4002,7 @@ int main(int argc, char** argv){
 	// here with real files deadlocked against the already-running loaders.
 	bool startCameraPending = false;
 	if(!argFiles.empty()){
-		paths = argFiles;   // replaces the "NONE" placeholder
+		paths = argFiles;
 		requestReset = true;
 		startCameraPending = true;
 	}
@@ -3948,19 +4029,22 @@ int main(int argc, char** argv){
 		for(auto file : files){
 			logLine("[load] dropped: %s\n", file.c_str());
 
-			if(iEndsWith(file, "las") || iEndsWith(file, "laz")){
-				pointCloudFiles.push_back(file);
-			}else if(iEndsWith(file, "simlod")){
+			if(isPointFile(file)){
 				pointCloudFiles.push_back(file);
 			}
 		}
 
-		// a stray CSV or folder must not clear the scene (and a reload of the
-		// full scan takes minutes)
+		// A stray CSV or folder must not clear the scene (and a reload of the
+		// full scan takes minutes), nor a point file that cannot be loaded.
+		bool anyPointFiles = !pointCloudFiles.empty();
+		string refusal;
+		pointCloudFiles = loadablePointFiles(pointCloudFiles, &refusal);
 		if(pointCloudFiles.empty()){
-			notice("No .las, .laz or .simlod in the drop - keeping the current cloud");
+			if(anyPointFiles) notice("%s - keeping the current cloud", refusal.c_str());
+			else notice("No .las, .laz or .simlod in the drop - keeping the current cloud");
 			return;
 		}
+		if(!refusal.empty()) notice("%s", refusal.c_str());
 
 		paths = pointCloudFiles;
 

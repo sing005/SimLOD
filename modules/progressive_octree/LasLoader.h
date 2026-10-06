@@ -54,4 +54,20 @@ inline LasHeader loadHeader(string file){
 	return header;
 }
 
-void loadLasNative(string file, LasHeader header, uint64_t firstPoint, uint64_t numPoints, void* target, double translation[3]);
+// Why a .las or .laz file cannot be loaded, or "" when it can. Run before the
+// file's batches are queued: a cut LAZ file crashed the viewer inside laszip,
+// and a cut LAS file loaded copies of other points without a message.
+string lasFileProblem(const string& path);
+
+// Reads bytes [firstByte, firstByte + numBytes) of a file into buffer. On
+// Windows the read bypasses the file cache, so it starts at the sector boundary
+// at or before firstByte: the data begins *padding bytes into the buffer, which
+// must hold numBytes + 2 x sectorSize. False if the file cannot be opened, or
+// the read fails or ends before the last byte asked for.
+bool readFileRange(const string& file, uint64_t sectorSize, uint64_t firstByte, uint64_t numBytes, void* buffer, uint64_t* padding);
+
+// Reads and converts numPoints points from firstPoint on; false if they could not be read.
+bool loadLasNative(string file, LasHeader header, uint64_t firstPoint, uint64_t numPoints, void* target, double translation[3]);
+
+// Frees the calling thread's read buffer; the next LAS batch allocates it again.
+void releaseLasReadBuffer();

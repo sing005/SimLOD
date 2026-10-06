@@ -9,11 +9,6 @@ EventQueue *EventQueue::instance = new EventQueue();
 	#include "windows.h"
 	#include "psapi.h"
 
-void setThreadPriorityHigh(thread& t){
-	auto handle = t.native_handle();
-	SetThreadPriority(handle, THREAD_PRIORITY_ABOVE_NORMAL);
-}
-
 void toClipboard(string str) {
 	const char* output = str.c_str();
 	const size_t len = strlen(output) + 1;
@@ -235,10 +230,6 @@ uint64_t getPhysicalSectorSize(string path) {
 	return 16384;
 }
 
-
-void setThreadPriorityHigh(thread& t){
-	// TODO
-}
 
 int parseLine(char* line){
     // This assumes that a digit will be found and the line ends in " Kb".

@@ -59,8 +59,6 @@ constexpr auto fseek_64_all_platforms = _fseeki64;
 #endif
 
 
-void setThreadPriorityHigh(thread& t);
-
 struct MemoryData {
 	size_t virtual_total = 0;
 	size_t virtual_used = 0;
