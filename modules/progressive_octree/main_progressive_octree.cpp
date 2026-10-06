@@ -3866,6 +3866,9 @@ int main(int argc, char** argv){
 			logLine("%s\n", line.c_str());
 		}
 	};
+	for(int i = 1; i < argc; i++){
+		if(string(argv[i]) == "--no-kernel-cache") kernelCacheEnabled = false;   // compile the kernels, as every start did
+	}
 	initCuda();
 	initCudaProgram(renderer);
 
@@ -3942,6 +3945,8 @@ int main(int argc, char** argv){
 			benchFrames = std::max(0, std::atoi(argv[++i]));
 		}else if(arg == "--hidden"){
 			// applied before the window was created
+		}else if(arg == "--no-kernel-cache"){
+			// applied before the kernels were built
 		}else if(arg == "--look" && i + 1 < argc){
 			// a saved look, as a file or by name in the looks folder; a --set
 			// after it changes it further
