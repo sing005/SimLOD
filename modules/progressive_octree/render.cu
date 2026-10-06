@@ -5,7 +5,6 @@
 // License: MIT https://github.com/mrdoob/three.js/blob/dev/LICENSE
 
 #include <cooperative_groups.h>
-#include <curand_kernel.h>
 
 #include "utils.h.cu"
 #include "builtin_types.h"

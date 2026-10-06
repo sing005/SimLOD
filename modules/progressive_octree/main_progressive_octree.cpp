@@ -2951,8 +2951,6 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	cuda_program_update = new CudaModularProgram({
 		.modules = {
 			"./modules/progressive_octree/progressive_octree_voxels.cu",
-			  //"./modules/progressive_octree/progressive_octree_mno.cu",
-			"./modules/progressive_octree/utils.cu",
 		},
 		.kernels = {"kernel_construct"}
 	});
@@ -2960,7 +2958,6 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	cuda_program_reset = new CudaModularProgram({
 		.modules = {
 			"./modules/progressive_octree/reset.cu",
-			"./modules/progressive_octree/utils.cu",
 		},
 		.kernels = {"kernel"}
 	});
@@ -2968,7 +2965,6 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	cuda_program_render = new CudaModularProgram({
 		.modules = {
 			"./modules/progressive_octree/render.cu",
-			"./modules/progressive_octree/utils.cu",
 		},
 		.kernels = {"kernel_render"}
 	});
