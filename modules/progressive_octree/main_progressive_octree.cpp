@@ -127,9 +127,20 @@ CUdeviceptr cptr_frameStart;
 CUgraphicsResource cugl_colorbuffer;
 GLuint g_registeredFrameTexture = 0;   // the texture cugl_colorbuffer is registered for; 0 = none
 
+// What the frame in the frame texture was drawn from, so that renderCUDA can
+// tell when the next frame would come out the same (sameAsLastDrawn).
+static struct {
+	bool        valid = false;
+	Uniforms    key;                  // frameKey of its uniforms
+	CUfunction  kernel = nullptr;
+	GLuint      texture = 0;
+	CUdeviceptr renderBuffer = 0;
+} g_lastDrawn;
+
 // Called before a resize replaces the frame texture, so CUDA lets go of it
 // before OpenGL deletes it. GL may give the new texture the same name.
 static void releaseFrameTexture(){
+	g_lastDrawn.valid = false;
 	if(g_registeredFrameTexture == 0) return;
 	cuGraphicsUnregisterResource(cugl_colorbuffer);
 	g_registeredFrameTexture = 0;
@@ -172,6 +183,7 @@ struct {
 	bool  adaptiveDetail             = true;    // coarsen LOD when frames exceed the budget
 	float frameBudgetMs              = 33.0f;   // render-kernel time to aim for (30 fps)
 	bool  vsync                      = true;    // cap at display refresh: saves power and heat
+	bool  skipUnchanged              = true;    // keep the last frame while nothing that changes it has changed
 	int pointSize                    = 1;
 	float fovy                       = 90.0f;
 	bool enableEDL                   = false;   // reference has no outlines (apply_look.ps1)
@@ -1555,7 +1567,9 @@ static int   effectiveMaxSplatPx(){
 }
 
 static bool g_frameRenderable = false;   // the render buffer holds this frame's size
-static bool g_frameDrawn      = false;   // set by renderCUDA: kernel_render was launched this frame
+static bool g_frameDrawn      = false;   // set by renderCUDA: the frame texture holds this frame
+static bool g_drawEveryFrame  = false;   // --bench: every frame is drawn, to be timed
+static float g_keptShare      = 0.0f;    // share of recent frames kept unchanged, for the settings window
 
 static void beginFrameState(int width, int height){
 	// A minimised window reports 0 x 0: nothing to draw (loading goes on).
@@ -2209,6 +2223,9 @@ static void drawLoadLookPopup(){
 
 Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	Uniforms uniforms;
+	// Every byte, padding and unused event slots too: renderCUDA compares
+	// frames' uniforms byte for byte.
+	memset(&uniforms, 0, sizeof(uniforms));
 
 	glm::mat4 world;
 	glm::mat4 view = renderer->camera->view;
@@ -2750,6 +2767,30 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 // 	requestColorFiltering = false;
 // }
 
+// The uniforms of a frame, with the clock and the frame number cleared where
+// the kernel does not read them: the clock moves only the insects, and the
+// frame number changes only the grain. The unedited view draws neither.
+static void frameKey(const Uniforms& uniforms, Uniforms* key){
+	memcpy(key, &uniforms, sizeof(Uniforms));
+	bool unedited = uniforms.showUnedited != 0;
+	if(uniforms.numInsects <= 0 || unedited) key->time = 0.0f;
+	if(!(uniforms.grain > 0.0f) || unedited) key->frameCounter = 0;
+}
+
+// True when kernel_render would draw the frame already in the frame texture.
+// Besides the uniforms, only these change what it draws: the octree, during a
+// load; the grids, in a rebuild (beginFrameState asks for one when they are
+// reallocated or emptied); the kernel, on a hot reload; and the texture and
+// buffers, on a resize. Any doubt draws the frame.
+static bool sameAsLastDrawn(const Uniforms& uniforms, CUfunction kernel, GLuint texture){
+	if(!settings.skipUnchanged || g_drawEveryFrame || !g_lastDrawn.valid) return false;
+	if(!lastBatchFinishedDevice || g_frameGridRefill || g_frameLightDirty) return false;
+	if(kernel != g_lastDrawn.kernel || texture != g_lastDrawn.texture || cptr_renderbuffer != g_lastDrawn.renderBuffer) return false;
+	Uniforms key;
+	frameKey(uniforms, &key);
+	return memcmp(&key, &g_lastDrawn.key, sizeof(Uniforms)) == 0;
+}
+
 // kernel_render did not run: put back the requests beginFrameState took for
 // this frame, for the next frame that is drawn
 static void keepFrameRequests(){
@@ -2806,6 +2847,18 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 		g_registeredFrameTexture = frameTexture;
 	}
 
+	// Nothing that reaches the kernel has changed since the frame in the
+	// texture was drawn, so that frame stays. A still view was drawn again
+	// on every frame, keeping the GPU busy for most of each frame whenever
+	// full detail cost more than the budget.
+	CUfunction kernel = cuda_program_render->kernels["kernel_render"];
+	bool kept = sameAsLastDrawn(uniforms, kernel, frameTexture);
+	g_keptShare += 0.02f * ((kept ? 1.0f : 0.0f) - g_keptShare);   // about the last 50 frames
+	if(kept){
+		g_frameDrawn = true;   // the texture holds this frame
+		return;
+	}
+
 	// map OpenGL resources to CUDA
 	vector<CUgraphicsResource> dynamic_resources = {cugl_colorbuffer};
 	cuGraphicsMapResources(static_cast<int>(dynamic_resources.size()), dynamic_resources.data(), ((CUstream)CU_STREAM_DEFAULT));
@@ -2821,8 +2874,7 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	int workgroupSize = 256;   // kernel_render's __launch_bounds__ in render.cu assumes 256
 	
 	int maxActiveBlocksPerSM;
-	cuOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocksPerSM, 
-		cuda_program_render->kernels["kernel_render"], workgroupSize, 0);
+	cuOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocksPerSM, kernel, workgroupSize, 0);
 	
 	int numGroups = maxActiveBlocksPerSM * numSMs;
 	
@@ -2842,12 +2894,19 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	// returns once the bytes are staged, so the local may then go out of scope.
 	cuMemcpyHtoDAsync(uniformsSymbol, &uniforms, sizeof(Uniforms), 0);
 
-	auto res_launch = cuLaunchCooperativeKernel(cuda_program_render->kernels["kernel_render"],
+	auto res_launch = cuLaunchCooperativeKernel(kernel,
 		numGroups, 1, 1,
 		workgroupSize, 1, 1,
 		0, 0, args);
 
 	g_frameDrawn = res_launch == CUDA_SUCCESS;
+	g_lastDrawn.valid = g_frameDrawn;
+	if(g_frameDrawn){
+		frameKey(uniforms, &g_lastDrawn.key);
+		g_lastDrawn.kernel       = kernel;
+		g_lastDrawn.texture      = frameTexture;
+		g_lastDrawn.renderBuffer = cptr_renderbuffer;
+	}
 	if(g_frameDrawn && g_frameGridRefill) g_refillGen++;   // the bird's-eye view follows the grid
 	logLaunch("render", res_launch);
 	if(!g_frameDrawn) keepFrameRequests();
@@ -4021,6 +4080,7 @@ int main(int argc, char** argv){
 		settings.enableBloom = settings.bloomStrength > 0.0f;
 		logLine("[calls] %s: %d calls, %s\n", argCalls.c_str(), int(g_calls.size()), g_callsLoaded ? "playing" : "none loaded");
 	}
+	g_drawEveryFrame = benchFrames > 0;   // --bench times frames, so none is skipped
 	if(!shots.empty()){
 		logLine("[shot] %d screenshot(s) after loading, %.1f s each%s\n", int(shots.size()), shotDelay, exitAfterShots ? ", then exit" : "");
 		GLRenderer::inputLocked = true;   // a stray click or scroll would move the shots' camera
@@ -4906,6 +4966,12 @@ int main(int argc, char** argv){
 				}
 				ImGui::Checkbox("VSync", &settings.vsync);
 				tipFor("Caps the frame rate at the display refresh. Saves GPU power and heat, which matters on a laptop GPU; turn it off only to measure raw speed.");
+				ImGui::Checkbox("Skip unchanged frames", &settings.skipUnchanged);
+				tipFor("Keeps the last frame while nothing that would change it has changed: the camera, a setting, a load, the calls or the insects. Saves GPU power on a still view. Turn it off if the view ever fails to update.");
+				if(settings.skipUnchanged){
+					ImGui::SameLine(0.0f);
+					ImGui::Text("%.0f%% of recent frames kept", 100.0f * g_keptShare);
+				}
 				ImGui::SliderInt  ("Max splat px",     &settings.maxSplatPx,     2, 64);
 				tipFor("Cap on how large a near point may be drawn. Lower if the frame rate drops when the camera is close to foliage.");
 			}
