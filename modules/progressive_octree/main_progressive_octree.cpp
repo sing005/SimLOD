@@ -2734,8 +2734,27 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 
 	Uniforms uniforms = getUniforms(renderer);
 
-	static bool registered = false;
-	static GLuint registeredHandle = -1;
+	// kernel_render reads the uniforms from constant memory (render.cu).
+	// Find that symbol in the current module; a hot reload replaces the
+	// module, and with it the symbol's address.
+	static CUmodule uniformsModule = nullptr;
+	static CUdeviceptr uniformsSymbol = 0;
+	if(uniformsModule != cuda_program_render->mod){
+		size_t bytes = 0;
+		uniformsModule = cuda_program_render->mod;
+		if(cuModuleGetGlobal(&uniformsSymbol, &bytes, uniformsModule, "uniforms") != CUDA_SUCCESS || bytes != sizeof(Uniforms)){
+			uniformsSymbol = 0;
+			logLine("[host] the render kernel has no uniforms of %zu bytes (found %zu); frames are skipped\n", sizeof(Uniforms), bytes);
+		}
+	}
+	if(uniformsSymbol == 0){
+		// kernel_render cannot run: keep the requests beginFrameState took
+		if(g_frameGridRefill) g_gridRefill = true;
+		if(g_frameLightDirty) g_lightDirty = true;
+		g_frameGridRefill = false;
+		g_frameLightDirty = false;
+		return;
+	}
 
 	CUresult registered_res = cuGraphicsGLRegisterImage(
 		&cugl_colorbuffer,
@@ -2787,6 +2806,11 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	};
 
 	
+	// On the stream the kernel runs on, so the copy follows the previous
+	// frame's kernel and precedes this one. From pageable memory the call
+	// returns once the bytes are staged, so the local may then go out of scope.
+	cuMemcpyHtoDAsync(uniformsSymbol, &uniforms, sizeof(Uniforms), 0);
+
 	auto res_launch = cuLaunchCooperativeKernel(cuda_program_render->kernels["kernel_render"],
 		numGroups, 1, 1,
 		workgroupSize, 1, 1,

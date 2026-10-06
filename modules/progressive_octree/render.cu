@@ -21,7 +21,12 @@
 namespace cg = cooperative_groups;
 
 Allocator* allocator;
-Uniforms uniforms;
+// The frame's settings, in constant memory: the host copies them to this
+// symbol before each launch (renderCUDA). As a device global written by
+// thread 0 they were reloaded from global memory after every atomic, two to
+// five loads per splat pixel; constant memory is read-only on the device, so
+// the compiler need not reload it.
+__constant__ Uniforms uniforms;
 Lines* _lines = nullptr;
 float* _emission = nullptr;   // RGB per pixel, added by apply_emission.ps1
 PointCodec g_codec;           // decodes the octree's stored points; set with uniforms each frame
@@ -136,10 +141,13 @@ inline float eventFalloff(float d, float r){
 	return feather + core * 4.0f;
 }
 
+inline bool showUnedited();   // defined below, before cullActive
+
 inline void evalEmission(float px, float py, float pz,
 						 float& emR, float& emG, float& emB)
 {
 	emR = 0.0f; emG = 0.0f; emB = 0.0f;
+	if(showUnedited()) return;   // the unedited view shows no glow, so none is accumulated
 	for(int e = 0; e < uniforms.numEvents; e++){
 		float dx = px - uniforms.eventX[e];
 		float dy = py - uniforms.eventY[e];
@@ -526,7 +534,7 @@ void finishColourGrid(){
 	const uint32_t* occ = (const uint32_t*)uniforms.voxelGridPtr;
 	int numCells = uniforms.gridX * uniforms.gridY * uniforms.gridZ;
 
-	processRange(0, numCells, [&](int i){
+	processRangeStrided(numCells, [&](int i){
 		uint64_t v = cg64[i];
 		uint64_t n = v & 0x3ffull;
 		if(n == 0){ cg64[i] = 0; return; }
@@ -538,7 +546,7 @@ void finishColourGrid(){
 	grid.sync();
 
 	int reach = uniforms.whiteReach;
-	processRange(0, numCells, [&](int i){
+	processRangeStrided(numCells, [&](int i){
 		if(cg64[i] != 0 || occ[i] == 0) return;   // has colour, or nothing to colour
 		int x = i % uniforms.gridX;
 		int y = (i / uniforms.gridX) % uniforms.gridY;
@@ -873,8 +881,8 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 	if(!projectPoint(point.x, point.y, point.z, x, y, depth)) return;   // apply_fisheye.ps1
 	if(depth < uniforms.nearClip) return;
 
-	if(x > 1 && x < uniforms.width  - 2.0)
-	if(y > 1 && y < uniforms.height - 2.0)
+	if(x > 1 && x < uniforms.width  - 2.0f)   // 2.0f: a double literal made this a double-precision test per point
+	if(y > 1 && y < uniforms.height - 2.0f)
 	{
 		// stray-point culling (apply_stray_cull.ps1). Up to seven grid reads,
 		// so it runs only for points that land on screen; projection is
@@ -986,8 +994,8 @@ inline bool hqsAcceptPoint(const Point& point, Node* node, float minWorldSize,
                            int& x, int& y, float& depth, int& R, uint32_t& color){
 	if(!projectPoint(point.x, point.y, point.z, x, y, depth)) return false;   // apply_fisheye.ps1
 	if(!(depth > 0.0f) || depth < uniforms.nearClip) return false;
-	if(!(x > 1 && x < uniforms.width  - 2.0)) return false;
-	if(!(y > 1 && y < uniforms.height - 2.0)) return false;
+	if(!(x > 1 && x < uniforms.width  - 2.0f)) return false;   // as drawPoint: single precision
+	if(!(y > 1 && y < uniforms.height - 2.0f)) return false;
 
 	// stray-point culling, after the cheaper on-screen test (apply_stray_cull.ps1)
 	bool stray = isStrayPoint(point.x, point.y, point.z);
@@ -1129,7 +1137,7 @@ void refillVoxelGrid(Node* nodes){
 	auto block = cg::this_thread_block();
 
 	// zero first: a refill must not add to whatever was already there
-	processRange(0, uniforms.gridX * uniforms.gridY * uniforms.gridZ, [&](int i){
+	processRangeStrided(uniforms.gridX * uniforms.gridY * uniforms.gridZ, [&](int i){
 		((uint32_t*)uniforms.voxelGridPtr)[i] = 0;
 		if(uniforms.colourGridPtr != 0) ((uint64_t*)uniforms.colourGridPtr)[i] = 0;
 	});
@@ -1216,7 +1224,11 @@ void drawNodes(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 	grid.sync();
 }
 
-void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
+// fb_depth (4 B a pixel) and fb_color (16 B: red, green, blue and a count)
+// are allocated by kernel_render and passed in. Allocated here, through the
+// allocator global, the compiler could not tell they were in global memory,
+// and the depth test and colour sums used generic atomics.
+void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_t* fb_depth, uint32_t* fb_color){
 
 	if(!uniforms.showPoints) return;
 
@@ -1238,13 +1250,11 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 	}
 
 	int numPixels = int(uniforms.width) * int(uniforms.height);
-	uint32_t* fb_depth = allocator->alloc<uint32_t*>(1 * numPixels * sizeof(uint32_t));
-	uint32_t* fb_color = allocator->alloc<uint32_t*>(4 * numPixels * sizeof(uint32_t));
 
-	processRange(numPixels, [&](int pixelID){
+	processRangeStrided(numPixels, [&](int pixelID){
 		fb_depth[pixelID] = 0x7f800000;
 	});
-	processRange(numPixels, [&](int pixelID){
+	processRangeStrided(numPixels, [&](int pixelID){
 		fb_color[4 * pixelID + 0] = 0;
 		fb_color[4 * pixelID + 1] = 0;
 		fb_color[4 * pixelID + 2] = 0;
@@ -1509,10 +1519,14 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 						if(depth < fbDepth * 1.01f)
 						{
 							float sh = splatShade(ox, oy, R, half);   // apply_look.ps1
-							atomicAdd(&fb_color[4 * pixelID + 0], uint32_t(float(rgba[0]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 1], uint32_t(float(rgba[1]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 2], uint32_t(float(rgba[2]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 3], 1);
+							// The four sums as two 64-bit adds, (green << 32 | red)
+							// and (count << 32 | blue): the same layout in memory.
+							// A field carries into the next only after 16.8 M
+							// contributions to one pixel, where the 32-bit sums
+							// used to wrap.
+							unsigned long long* c64 = (unsigned long long*)&fb_color[4 * pixelID];
+							atomicAdd(&c64[0], (unsigned long long)uint32_t(float(rgba[0]) * sh) | ((unsigned long long)uint32_t(float(rgba[1]) * sh) << 32));
+							atomicAdd(&c64[1], (unsigned long long)uint32_t(float(rgba[2]) * sh) | (1ull << 32));
 						}
 					}
 				}
@@ -1621,10 +1635,14 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 						if(depth < fbDepth * 1.01f)
 						{
 							float sh = splatShade(ox, oy, R, half);   // apply_look.ps1
-							atomicAdd(&fb_color[4 * pixelID + 0], uint32_t(float(rgba[0]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 1], uint32_t(float(rgba[1]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 2], uint32_t(float(rgba[2]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 3], 1);
+							// The four sums as two 64-bit adds, (green << 32 | red)
+							// and (count << 32 | blue): the same layout in memory.
+							// A field carries into the next only after 16.8 M
+							// contributions to one pixel, where the 32-bit sums
+							// used to wrap.
+							unsigned long long* c64 = (unsigned long long*)&fb_color[4 * pixelID];
+							atomicAdd(&c64[0], (unsigned long long)uint32_t(float(rgba[0]) * sh) | ((unsigned long long)uint32_t(float(rgba[1]) * sh) << 32));
+							atomicAdd(&c64[1], (unsigned long long)uint32_t(float(rgba[2]) * sh) | (1ull << 32));
 						}
 					}
 
@@ -1636,12 +1654,12 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 	grid.sync();
 
 	// RESOLVE
-	processRange(numPixels, [&](int pixelID){
+	processRangeStrided(numPixels, [&](int pixelID){
 		
-		uint32_t R = fb_color[4 * pixelID + 0];
-		uint32_t G = fb_color[4 * pixelID + 1];
-		uint32_t B = fb_color[4 * pixelID + 2];
-		uint32_t C = fb_color[4 * pixelID + 3];
+		// one 16-byte load: the Allocator aligns every buffer to 16 bytes,
+		// and a pixel's four sums take 16
+		ulonglong2 v = ((const ulonglong2*)fb_color)[pixelID];
+		uint32_t R = uint32_t(v.x), G = uint32_t(v.x >> 32), B = uint32_t(v.y), C = uint32_t(v.y >> 32);
 
 		if(C == 0) return;
 
@@ -2193,13 +2211,11 @@ void compute_visibility_add(
 
 // The host launches this with 256-thread blocks (workgroupSize in renderCUDA),
 // as many as fit on each SM, and every stage of the frame shares those
-// threads. Two blocks fit only at 128 registers per thread or fewer. The
-// kernel used about 120 on every generation measured (Maxwell 52, Volta 70,
-// Turing 75, Ampere 86, Ada 89) until the haze composite pushed the compiler
-// toward 140, which would halve the threads drawing points even with the
-// haze off. The bound keeps two blocks; the few registers the composite
-// gives up are spilled there, once per pixel, not in the point loops.
-// Pascal already ran one block (about 130 registers) and is left unbounded.
+// threads. Two blocks fit only at 128 registers per thread or fewer. With the
+// uniforms in constant memory the kernel needs 117 at compute 8.6 and 8.9
+// (NVRTC 12.4) and spills nothing; the bound stays so that a later change
+// cannot quietly halve the threads drawing points. Pascal ran one block
+// (about 130 registers) and is left unbounded.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600 && __CUDA_ARCH__ < 700
 #define RENDER_LAUNCH_BOUNDS
 #else
@@ -2226,11 +2242,9 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		*frameStartTimestamp = nanotime();
 	}
 
-	// One thread copies the ~2 KB uniforms into the device global. Every thread
-	// used to do it, which on an 80k-thread launch meant ~150 MB of redundant
-	// global stores per frame.
+	// The uniforms are already in constant memory, copied by the host before
+	// the launch. Thread 0 sets up the per-frame globals derived from them.
 	if(grid.thread_rank() == 0){
-		uniforms = _uniforms;
 		g_codec  = PointCodec::forBox(_uniforms.boxMin, _uniforms.boxMax);   // stored points
 		float3 td;
 		_torchValid = (uniforms.torchOn != 0 && pixelRayDir(uniforms.torchX + 0.5f, uniforms.torchY + 0.5f, td)) ? 1 : 0;
@@ -2279,14 +2293,18 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	int volH = int(uniforms.height) / 4; if(volH < 1) volH = 1;
 	float* volBuf = allocator->alloc<float*>(volW * volH * 4 * sizeof(float));
 
+	// the high-quality passes' depth (4 B a pixel) and colour sums (16 B)
+	uint32_t* hqsDepth = allocator->alloc<uint32_t*>(int64_t(uniforms.width) * int64_t(uniforms.height) * 4);
+	uint32_t* hqsColor = allocator->alloc<uint32_t*>(int64_t(uniforms.width) * int64_t(uniforms.height) * 16);
+
 	// The host sizes the buffer for the window (renderBufferBytesFor) and
 	// skips the launch when it cannot. Should the frame's layout ever outgrow
 	// it, draw nothing rather than write past its end: a fixed 200 MB used to
-	// be overrun by any window above 3.8 Mpx. drawNodesHQS allocates its depth
-	// and colour buffers (20 B a pixel) later in the frame, where returning is
-	// no longer safe, so they are counted here. Every thread computes the
-	// same offset, so the return is uniform across the grid.
-	int64_t laterBytes = 1024 + 20 * int64_t(uniforms.width) * int64_t(uniforms.height);
+	// be overrun by any window above 3.8 Mpx. Only small allocations come
+	// later in the frame, where returning is no longer safe (a counter in
+	// drawNodes and drawNodesHQS); 1 KB covers them. Every thread computes
+	// the same offset, so the return is uniform across the grid.
+	int64_t laterBytes = 1024;
 	if(allocator->offset + laterBytes > int64_t(uniforms.renderBufferCapacity)){
 		return;
 	}
@@ -2305,7 +2323,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	if(uniforms.lightOn != 0 && uniforms.lightDirty != 0 && uniforms.lightGridPtr != 0 && uniforms.voxelGridPtr != 0){
 		grid.sync();
 		int nCells = uniforms.gridX * uniforms.gridY * uniforms.gridZ;
-		processRange(0, nCells, [&](int i){
+		processRangeStrided(nCells, [&](int i){
 			int cx = i % uniforms.gridX;
 			int cy = (i / uniforms.gridX) % uniforms.gridY;
 			int cz = i / (uniforms.gridX * uniforms.gridY);
@@ -2332,9 +2350,16 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	}
 	grid.sync();
 
+	// Only an event (a call playing, or the test source) puts anything in the
+	// emission buffer: evalEmission adds nothing without one, nor in the
+	// unedited view. Without one the buffer is neither cleared nor read, and
+	// the bloom, whose only source it is, does not run: 24 B a pixel less
+	// memory traffic, 199 MB a frame at 4K.
+	const bool emissive = uniforms.numEvents > 0 && !showUnedited();
+
 	// clear framebuffer
 	// integer product: as a float it rounds above 2^24 pixels (--render 4097 4097)
-	processRange(0, int(uniforms.width) * int(uniforms.height), [&](int pixelIndex){
+	processRangeStrided(int(uniforms.width) * int(uniforms.height), [&](int pixelIndex){
 		// depth:            7f800000 (Infinity)
 		// background color: 00332211 (aabbggrr)
 		// framebuffer[pixelIndex] = 0x7f800000'00332211ull;
@@ -2346,9 +2371,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			uint32_t sky = (sb << 16) | (sg << 8) | sr;
 			framebuffer[pixelIndex] = (0x7f800000ull << 32) | uint64_t(sky);
 		}
-		_emission[3 * pixelIndex + 0] = 0.0f;
-		_emission[3 * pixelIndex + 1] = 0.0f;
-		_emission[3 * pixelIndex + 2] = 0.0f;
+		if(emissive){
+			_emission[3 * pixelIndex + 0] = 0.0f;
+			_emission[3 * pixelIndex + 1] = 0.0f;
+			_emission[3 * pixelIndex + 2] = 0.0f;
+		}
 	});
 
 	grid.sync();
@@ -2404,7 +2431,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	{ // draw nodes, boxes, lines, ...
 		if(grid.thread_rank() == 0) stats->stageNs[0] = nanotime() - tStart;   // apply_stage_timers.ps1
 		if(uniforms.useHighQualityShading){
-			drawNodesHQS(visibleNodes, numVisibleNodes, framebuffer);
+			drawNodesHQS(visibleNodes, numVisibleNodes, framebuffer, hqsDepth, hqsColor);
 		}else{
 			drawNodes(visibleNodes, numVisibleNodes, framebuffer);
 		}
@@ -2526,7 +2553,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	// axes - it should sit exactly on the foliage and nowhere else.
 	if(uniforms.useVoxelGrid && uniforms.showVoxelGrid && uniforms.voxelGridPtr != 0){
 		int nCells = uniforms.gridX * uniforms.gridY * uniforms.gridZ;
-		processRange(0, nCells, [&](int i){
+		processRangeStrided(nCells, [&](int i){
 			const uint32_t* g = (const uint32_t*)uniforms.voxelGridPtr;
 			uint32_t n = g[i];
 			if(n == 0) return;
@@ -2651,8 +2678,6 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			float depth;
 		};
 
-		float* framebuffer_f = (float*)framebuffer;
-		uint32_t* framebuffer_u32 = (uint32_t*)framebuffer;
 		Pixel* framebuffer_p = (Pixel*)framebuffer;
 
 		int width = uniforms.width;
@@ -2679,7 +2704,6 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 
 			float PI = 3.1415;
 			float numSamples = 50;
-			float stepsize = 2.0 * PI / numSamples;
 			float r = 1.5;
 			// The EDL Strength slider and the "enable Eye Dome Lighting" checkbox
 			// have never done anything: this local shadowed uniforms.edlStrength,
@@ -2702,11 +2726,13 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 
 				Pixel neighbour = framebuffer_p[index];
 				
-				sum = sum + max(log2(pixel.depth) - log2(neighbour.depth), 0.0);
+				// single precision: the double literals made this, and the
+				// shade below, double-precision arithmetic at every pixel
+				sum = sum + fmaxf(log2f(pixel.depth) - log2f(neighbour.depth), 0.0f);
 			}
 			
 			float response = sum / numSamples;
-			float shade = __expf(-response * 300.0 * edlStrength);
+			float shade = __expf(-response * 300.0f * edlStrength);
 			// shade = 1.0;
 
 			uint32_t R = shade * ((pixel.color >>  0) & 0xff);
@@ -2755,13 +2781,13 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		// constant over the frame; the phase function is constant along each ray
 		float3 sunCol = hazeSunColour();
 
-		processRange(0, volW * volH, [&](int i){
+		processRangeStrided(volW * volH, [&](int i){
 			int vx = i % volW;
 			int vy = i / volW;
 
-			// volBuf is scratch memory that also serves other kernels, and the
-			// composite reads every entry, so clear it before any early return
-			// (fisheye corners beyond the lens, or nothing to march through).
+			// The composite reads every entry while the march runs, so clear
+			// it before any early return (fisheye corners beyond the lens, or
+			// nothing to march through).
 			volBuf[4*i + 0] = 0.0f;
 			volBuf[4*i + 1] = 0.0f;
 			volBuf[4*i + 2] = 0.0f;
@@ -2933,14 +2959,6 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		});
 		grid.sync();
 
-	}else{
-		processRange(0, volW * volH, [&](int i){
-			volBuf[4*i + 0] = 0.0f;
-			volBuf[4*i + 1] = 0.0f;
-			volBuf[4*i + 2] = 0.0f;
-			volBuf[4*i + 3] = SKY_DISTANCE;
-		});
-		grid.sync();
 	}
 
 	// ---- tier 1 shading composite ------------------------------------------
@@ -2983,11 +3001,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			}
 		}
 
-		if(uniforms.enableBloom && !showUnedited()){
+		if(uniforms.enableBloom && emissive){   // emissive also excludes the unedited view
 
 			// level 0: 2x2 box from the emission buffer. Reads emission, not a
 			// luminance threshold, so only actual sources bloom.
-			processRange(0, mipW[0] * mipH[0], [&](int i){
+			processRangeStrided(mipW[0] * mipH[0], [&](int i){
 				int x = i % mipW[0];
 				int y = i / mipW[0];
 				float sr = 0.0f, sg = 0.0f, sb = 0.0f;
@@ -3009,7 +3027,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 
 			// downsample: each level a 2x2 box of the one above
 			for(int L = 1; L < numMips; L++){
-				processRange(0, mipW[L] * mipH[L], [&](int i){
+				processRangeStrided(mipW[L] * mipH[L], [&](int i){
 					int x = i % mipW[L];
 					int y = i / mipW[L];
 					float sr = 0.0f, sg = 0.0f, sb = 0.0f;
@@ -3033,7 +3051,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			// upsample: bilinear from L+1, added into L. Accumulating on the way
 			// down is what makes the falloff smooth rather than banded.
 			for(int L = numMips - 2; L >= 0; L--){
-				processRange(0, mipW[L] * mipH[L], [&](int i){
+				processRangeStrided(mipW[L] * mipH[L], [&](int i){
 					int x = i % mipW[L];
 					int y = i / mipW[L];
 
@@ -3076,7 +3094,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		// the whole pixel graded with the backdrop left out: haze and beams in
 		// front of the sky are graded the same as in front of the trunk beside
 		// it, and nothing changes colour at the silhouette.
-		bool volActive = (uniforms.enableVolumetric && uniforms.numEvents > 0) || sunbeamsOn();
+		bool volActive = volEvents || volSun;   // exactly when the march above filled volBuf
 		// grid-stride: coalesced, and with the tone curve's amount the
 		// contiguous form made this loop reload two spilled registers a pixel
 		processRangeStrided(W * H, [&](int pixelIndex){
@@ -3172,9 +3190,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			}
 
 			// unblurred emission core, before the blurred halo
-			r += _emission[3 * pixelIndex + 0];
-			g += _emission[3 * pixelIndex + 1];
-			b += _emission[3 * pixelIndex + 2];
+			if(emissive){
+				r += _emission[3 * pixelIndex + 0];
+				g += _emission[3 * pixelIndex + 1];
+				b += _emission[3 * pixelIndex + 2];
+			}
 
 			// Volumetric light from quarter resolution. The march stopped at the
 			// geometry under one pixel of each 4x4 block, so beside a silhouette
@@ -3225,7 +3245,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 				}
 			}
 
-			if(uniforms.enableBloom){
+			if(uniforms.enableBloom && emissive){
 				// bilinear upsample from half resolution
 				float fx = (float(x) - 0.5f) * 0.5f;
 				float fy = (float(y) - 0.5f) * 0.5f;
