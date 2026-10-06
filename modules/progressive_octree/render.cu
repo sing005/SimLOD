@@ -2636,12 +2636,13 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 				if(!ok) return;
 			}
 
-			float t = uniforms.time * uniforms.insectSpeed;
+			// insectPhase[k]: seconds x speed x rate k, reduced to [0, 2 pi)
+			// on the host, for the rates 0.83, 2.7, 0.71, 3.1, 1.13 and 3.7
 			float a = u3 * 6.2831853f;
 
-			float px = hx + 2.2f * sin(t * 0.83f + a)        + 0.8f * sin(t * 2.7f + a * 3.1f);
-			float py = hy + 2.2f * cos(t * 0.71f + a * 1.7f) + 0.8f * sin(t * 3.1f + a * 2.3f);
-			float pz = hz + 1.1f * sin(t * 1.13f + a * 2.9f) + 0.4f * cos(t * 3.7f + a);
+			float px = hx + 2.2f * sin(uniforms.insectPhase[0] + a)        + 0.8f * sin(uniforms.insectPhase[1] + a * 3.1f);
+			float py = hy + 2.2f * cos(uniforms.insectPhase[2] + a * 1.7f) + 0.8f * sin(uniforms.insectPhase[3] + a * 2.3f);
+			float pz = hz + 1.1f * sin(uniforms.insectPhase[4] + a * 2.9f) + 0.4f * cos(uniforms.insectPhase[5] + a);
 
 			drawInsect(px, py, pz, 0x00171c22u, uniforms.insectGlow, framebuffer);
 		});

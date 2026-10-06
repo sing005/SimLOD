@@ -48,7 +48,7 @@ constexpr uint64_t NODE_BYTES        = 168;                  // sizeof(Node); ch
 struct Uniforms{
 	float width;
 	float height;
-	float time;
+	float insectPhase[6];   // radians in [0, 2 pi): the insects' six motion phases (getUniforms)
 	float fovy_rad;
 	mat4 world;
 	mat4 view;
@@ -99,7 +99,6 @@ struct Uniforms{
 	int   numInsects;
 	int   insectSize;
 	float insectGlow;
-	float insectSpeed;
 
 	// voxel occupancy grid (apply_voxel_grid.ps1). One uint32 count per cell,
 	// built on the GPU as points enter the octree. Passed as an integer so the

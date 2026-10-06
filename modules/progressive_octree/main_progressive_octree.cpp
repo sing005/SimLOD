@@ -395,7 +395,7 @@ bool requestBenchmark              = false;
 bool requestColorFiltering         = false;
 float renderingDuration            = 0.0f;
 atomic_uint64_t numPointsUploaded  = 0;   // written by the uploader, read by the main thread's progress log
-float loadStart                    = 0.0f;
+double loadStart                   = 0.0;   // now() when the load began
 
 float kernelUpdateDuration         = 0.0f;
 float totalUpdateDuration          = 0.0f;
@@ -771,8 +771,10 @@ static void freqToColour(float hz, float& r, float& g, float& b){
 	g = 0.45f + 0.25f * t;
 	b = 0.15f + 0.85f * t;
 }
-float lastFrameTime = static_cast<float>(now());
-float timeSinceLastFrame = 0.0;
+// in double, as now() gives them: in float the walking step varied from frame
+// to frame once the session had run for a day or two
+double lastFrameTime = now();
+double timeSinceLastFrame = 0.0;
 
 float3 boxMin  = float3{InfinityF, InfinityF, InfinityF};
 float3 boxMax  = float3{-InfinityF, -InfinityF, -InfinityF};
@@ -2345,7 +2347,16 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.width                    = static_cast<float>(renderer->width);
 	uniforms.height                   = static_cast<float>(renderer->height);
 	uniforms.fovy_rad                 = 3.1415f * renderer->camera->fovy / 180.0;
-	uniforms.time                     = static_cast<float>(now());
+	{
+		// The insects move along a sum of sines at six fixed rates, in radians
+		// a second at speed 1. Their phases are reduced here, in double: the
+		// clock passed in float lost precision as the session ran on (a step
+		// of 7.8 ms after 18 h, 15.6 ms after 36 h), so the insects moved in
+		// jumps and, from about 3 days, not on every frame.
+		static const double insectRate[6] = {0.83, 2.7, 0.71, 3.1, 1.13, 3.7};
+		double t = now() * double(settings.insectSpeed);
+		for(int k = 0; k < 6; k++) uniforms.insectPhase[k] = float(std::fmod(t * insectRate[k], 2.0 * 3.14159265358979));
+	}
 	uniforms.boxMin                   = float3{0.0f, 0.0f, 0.0f};
 	uniforms.boxMax                   = boxSize;
 	uniforms.frameCounter             = frameCounter;
@@ -2422,7 +2433,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.numInsects   = settings.numInsects;
 		uniforms.insectSize   = settings.insectSize;
 		uniforms.insectGlow   = settings.insectGlow;
-		uniforms.insectSpeed  = settings.insectSpeed;
 
 	checkMomentaryBudget(stats.allocatedBytes_momentary, momentaryBufferCapacity);
 
@@ -2824,13 +2834,14 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 // 	requestColorFiltering = false;
 // }
 
-// The uniforms of a frame, with the clock and the frame number cleared where
-// the kernel does not read them: the clock moves only the insects, and the
-// frame number changes only the grain. The unedited view draws neither.
+// The uniforms of a frame, with the insects' phases and the frame number
+// cleared where the kernel does not read them: the phases move only the
+// insects, and the frame number changes only the grain. The unedited view
+// draws neither. Insects at speed 0 keep their phases at 0.
 static void frameKey(const Uniforms& uniforms, Uniforms* key){
 	memcpy(key, &uniforms, sizeof(Uniforms));
 	bool unedited = uniforms.showUnedited != 0;
-	if(uniforms.numInsects <= 0 || unedited) key->time = 0.0f;
+	if(uniforms.numInsects <= 0 || unedited) memset(key->insectPhase, 0, sizeof(key->insectPhase));
 	if(!(uniforms.grain > 0.0f) || unedited) key->frameCounter = 0;
 }
 
@@ -3219,7 +3230,7 @@ void reload(){
 
 	printfmt("start loading \n");
 
-	loadStart = static_cast<float>(now());
+	loadStart = now();
 	totalUpdateDuration     = 0.0f;
 	kernelUpdateDuration    = 0.0f;
 	minKernelUpdateDuration = Infinity;
@@ -3429,7 +3440,7 @@ void logLoadSummary(){
 	Stats s;
 	if(cuMemcpyDtoH(&s, cptr_stats, sizeof(Stats)) != CUDA_SUCCESS) return;
 
-	double seconds = now() - double(loadStart);
+	double seconds = now() - loadStart;
 	double inserted = double(s.numPointsProcessed);
 
 	logLine("[load] done in %.1f s: %.2f M of %.2f M points inserted (%.1f M/s), %.2f M decoded%s\n",
@@ -4239,7 +4250,7 @@ int main(int argc, char** argv){
 
 	auto render = [&](){
 
-		timeSinceLastFrame = static_cast<float>(now()) - lastFrameTime;
+		timeSinceLastFrame = now() - lastFrameTime;
 
 		// ---- walking (apply_navigate.ps1) --------------------------------
 		// W/S forward and back along the view, A/D sideways, Q/E down and up.
@@ -4248,7 +4259,7 @@ int main(int argc, char** argv){
 		{
 			ImGuiIO& io = ImGui::GetIO();
 			if(!io.WantCaptureKeyboard && !GLRenderer::inputLocked){
-				float dt = timeSinceLastFrame > 0.0f && timeSinceLastFrame < 0.5f ? timeSinceLastFrame : 0.016f;
+				float dt = timeSinceLastFrame > 0.0 && timeSinceLastFrame < 0.5 ? float(timeSinceLastFrame) : 0.016f;
 				double d = double(g_walkSpeed) * double(dt);
 				auto held = [](int key){ return Runtime::keyStates[key] > 0; };
 				double fwd = 0.0, side = 0.0, up = 0.0;
@@ -4346,7 +4357,7 @@ int main(int argc, char** argv){
 				g_pickWaiting = false;
 			}
 		}
-		lastFrameTime = static_cast<float>(now());
+		lastFrameTime = now();
 
 		if(renderer->width > 0 && renderer->height > 0){   // 0 x 0 while minimised
 			auto& framebuffer = renderer->view.framebuffer;
@@ -4506,7 +4517,7 @@ int main(int argc, char** argv){
 		// }
 
 		if(!lastBatchFinishedDevice){
-			totalUpdateDuration = 1000.0f * (static_cast<float>(now()) - loadStart);
+			totalUpdateDuration = float(1000.0 * (now() - loadStart));
 		}else if(requestBenchmark && lastBatchFinishedDevice){
 			requestBenchmark = false;
 			printfmt("finished loading, disabling benchmarking. \n");
@@ -4529,7 +4540,7 @@ int main(int argc, char** argv){
 
 			if(!lastBatchFinishedDevice && numPointsTotal > 0){
 				logIfChanged("load", 2.0, "[load] %.1f s: %.1f M decoded, %.1f M uploaded, %.1f M of %.1f M inserted; octree pool %.0f of %.0f MB\n",
-					now() - double(loadStart), numPointsLoaded / 1e6, numPointsUploaded / 1e6,
+					now() - loadStart, numPointsLoaded / 1e6, numPointsUploaded / 1e6,
 					stats.numPointsProcessed / 1e6, numPointsTotal / 1e6,
 					stats.allocatedBytes_persistent / 1e6, persistentBufferCapacity / 1e6);
 			}
