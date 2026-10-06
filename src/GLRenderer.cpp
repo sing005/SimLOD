@@ -1,4 +1,5 @@
 
+#include <cstdlib>
 #include <filesystem>
 
 #include "GLRenderer.h"
@@ -22,8 +23,18 @@ static void APIENTRY debugCallback(GLenum source, GLenum type, GLuint id, GLenum
 	cout << "OPENGL DEBUG CALLBACK: " << message << endl;
 }
 
+static void report(const string& message){
+	if(GLRenderer::log) GLRenderer::log(message);
+	else fprintf(stderr, "%s\n", message.c_str());
+}
+
+// GLFW errors were written to stderr, which the run log does not see. The
+// first 20 are logged, in case one repeats every frame.
 void error_callback(int error, const char* description){
-	fprintf(stderr, "Error: %s\n", description);
+	static int numReported = 0;
+	if(numReported >= 20) return;
+	numReported++;
+	report("GLFW error " + to_string(error) + ": " + (description ? description : "") + (numReported == 20 ? " (further GLFW errors are not logged)" : ""));
 }
 
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods){
@@ -33,8 +44,6 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 	// GLFW passes GLFW_KEY_UNKNOWN (-1) for keys it has no token for, such as
 	// media keys (glfw3.h, glfwSetKeyCallback); it was written to keyStates[-1]
 	if(key < 0 || key >= int(Runtime::keyStates.size())) return;
-
-	cout << "key: " << key << ", scancode: " << scancode << ", action: " << action << ", mods: " << mods << endl;
 
 	// Esc closes the viewer, except while a text field or slider has the
 	// keyboard (there Esc cancels the edit) or a popup is open, such as a
@@ -47,8 +56,6 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 	}
 
 	Runtime::keyStates[key] = action;
-
-	cout << key << endl;
 }
 
 static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos){
@@ -71,12 +78,6 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset){
 	_controls->onMouseScroll(xoffset, yoffset);
 }
 
-
-void drop_callback(GLFWwindow* window, int count, const char **paths){
-	for(int i = 0; i < count; i++){
-		cout << paths[i] << endl;
-	}
-}
 
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods){
 
@@ -113,7 +114,8 @@ void GLRenderer::init(){
 	glfwSetErrorCallback(error_callback);
 
 	if (!glfwInit()) {
-		// Initialization failed
+		report("GLFW could not start, so no window can open");
+		exit(EXIT_FAILURE);
 	}
 
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
@@ -122,6 +124,11 @@ void GLRenderer::init(){
 	glfwWindowHint(GLFW_DECORATED, true);
 	glfwWindowHint(GLFW_RESIZABLE, true);
 	glfwWindowHint(GLFW_VISIBLE, !startHidden);
+	// Nothing is drawn into the window with a depth or stencil test: it gets
+	// the frame (a blit, colour only) and the UI, which ImGui draws with both
+	// tests off. GLFW's defaults asked for 24 depth and 8 stencil bits.
+	glfwWindowHint(GLFW_DEPTH_BITS, 0);
+	glfwWindowHint(GLFW_STENCIL_BITS, 0);
 
 	int numMonitors;
 	GLFWmonitor** monitors = glfwGetMonitors(&numMonitors);
@@ -131,10 +138,10 @@ void GLRenderer::init(){
 		const GLFWvidmode * modeLeft = glfwGetVideoMode(monitors[0]);
 		const GLFWvidmode * modeRight = glfwGetVideoMode(monitors[1]);
 
-		window = glfwCreateWindow(1920, 1080, "stuff", nullptr, nullptr);
-		// window = glfwCreateWindow(modeRight->width, modeRight->height - 300, "Simple example", nullptr, nullptr);
+		window = glfwCreateWindow(1920, 1080, "SimLOD", nullptr, nullptr);
 
 		if (!window) {
+			report("no OpenGL 4.6 core-profile window could be created: the graphics driver may not support OpenGL 4.6");
 			glfwTerminate();
 			exit(EXIT_FAILURE);
 		}
@@ -148,11 +155,12 @@ void GLRenderer::init(){
 		// FIRST
 		// glfwSetWindowPos(window, 0, 0);
 	} else {
-		const GLFWvidmode * mode = glfwGetVideoMode(monitors[0]);
+		const GLFWvidmode * mode = numMonitors > 0 ? glfwGetVideoMode(monitors[0]) : nullptr;   // no monitor: monitors is null
 
-		window = glfwCreateWindow(mode->width - 100, mode->height - 100, "Simple example", nullptr, nullptr);
+		window = glfwCreateWindow(mode ? mode->width - 100 : 1920, mode ? mode->height - 100 : 1080, "SimLOD", nullptr, nullptr);
 
 		if (!window) {
+			report("no OpenGL 4.6 core-profile window could be created: the graphics driver may not support OpenGL 4.6");
 			glfwTerminate();
 			exit(EXIT_FAILURE);
 		}
@@ -165,7 +173,6 @@ void GLRenderer::init(){
 	glfwSetCursorPosCallback(window, cursor_position_callback);
 	glfwSetMouseButtonCallback(window, mouse_button_callback);
 	glfwSetScrollCallback(window, scroll_callback);
-	// glfwSetDropCallback(window, drop_callback);
 
 	static GLRenderer* ref = this;
 	glfwSetDropCallback(window, [](GLFWwindow*, int count, const char **paths){
@@ -186,8 +193,9 @@ void GLRenderer::init(){
 
 	GLenum err = glewInit();
 	if (GLEW_OK != err) {
-		/* Problem: glewInit failed, something is seriously wrong. */
-		fprintf(stderr, "glew error: %s\n", glewGetErrorString(err));
+		// start-up used to go on, to fail at the first OpenGL call
+		report(string("GLEW could not load the OpenGL functions: ") + (const char*)glewGetErrorString(err));
+		exit(EXIT_FAILURE);
 	}
 
 	cout << "<glewInit done> " << "(" << now() << ")" << endl;
@@ -237,8 +245,6 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 	double tPrevious = start;
 	double tPreviousFPSMeasure = start;
 
-	vector<float> frameTimes(1000, 0);
-
 	while (!glfwWindowShouldClose(window)){
 
 		// TIMING
@@ -256,9 +262,15 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 				tPreviousFPSMeasure = tCurrent;
 				fpsCounter = 0;
 			}
-			frameTimes[frameCount % frameTimes.size()] = static_cast<float>(timeSinceLastFrame);
 		}
-		
+
+		// Minimised: wait for events, up to 0.1 s, instead of drawing frames
+		// no one sees, unless the application has work that needs frames.
+		// The loop used to run flat out.
+		if(glfwGetWindowAttrib(window, GLFW_ICONIFIED) && !(workPending && workPending())){
+			glfwWaitEventsTimeout(0.1);
+			continue;
+		}
 
 		// WINDOW
 		int width, height;
@@ -440,7 +452,12 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 
 	glfwDestroyWindow(window);
 	glfwTerminate();
-	exit(EXIT_SUCCESS);
+
+	// quick_exit, not exit: exit destroys the globals, such as the mutexes
+	// and queues the loader and uploader threads are still using. The run
+	// log is flushed after every line.
+	fflush(stdout);
+	std::quick_exit(EXIT_SUCCESS);
 }
 
 shared_ptr<Framebuffer> Framebuffer::create(GLRenderer* renderer) {
@@ -456,14 +473,6 @@ shared_ptr<Framebuffer> Framebuffer::create(GLRenderer* renderer) {
 		fbo->colorAttachments.push_back(texture);
 
 		glNamedFramebufferTexture(fbo->handle, GL_COLOR_ATTACHMENT0, texture->handle, 0);
-	}
-
-	{ // DEPTH ATTACHMENT
-
-		auto texture = renderer->createTexture(fbo->width, fbo->height, GL_DEPTH_COMPONENT32F);
-		fbo->depth = texture;
-
-		glNamedFramebufferTexture(fbo->handle, GL_DEPTH_ATTACHMENT, texture->handle, 0);
 	}
 
 	fbo->setSize(128, 128);

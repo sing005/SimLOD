@@ -125,6 +125,16 @@ CUdeviceptr cptr_batchSizes;
 CUdeviceptr cptr_batchTags;
 CUdeviceptr cptr_frameStart;
 CUgraphicsResource cugl_colorbuffer;
+GLuint g_registeredFrameTexture = 0;   // the texture cugl_colorbuffer is registered for; 0 = none
+
+// Called before a resize replaces the frame texture, so CUDA lets go of it
+// before OpenGL deletes it. GL may give the new texture the same name.
+static void releaseFrameTexture(){
+	if(g_registeredFrameTexture == 0) return;
+	cuGraphicsUnregisterResource(cugl_colorbuffer);
+	g_registeredFrameTexture = 0;
+}
+
 CUevent ce_render_start, ce_render_end;
 CUevent ce_update_start, ce_update_end;
 cudaStream_t stream_upload, stream_download;
@@ -2582,9 +2592,27 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	return uniforms;
 }
 
-void resetCUDA(shared_ptr<GLRenderer> renderer){
+// A kernel launch that failed goes to the run log, once until that kernel
+// launches again: a failure on every frame would fill the log. Failures were
+// printed to the console only.
+static void logLaunch(const char* kernel, CUresult res){
+	static std::map<string, CUresult> last;
+	CUresult& previous = last[kernel];
+	if(res != CUDA_SUCCESS && res != previous){
+		const char* name = nullptr;
+		cuGetErrorName(res, &name);
+		logLine("[host] kernel %s did not launch: %s\n", kernel, name ? name : "unknown error");
+	}
+	previous = res;
+}
 
-	ensureVoxelGrid();   // apply_voxel_grid.ps1: size and zero before the first batch
+// False if the reset kernel did not run, and the device still holds the
+// previous load's octree and counters.
+bool resetCUDA(shared_ptr<GLRenderer> renderer){
+
+	// The current cloud's grid: reload() reads the new box after this, and the
+	// next beginFrameState sizes the grid for it, before the first batch.
+	ensureVoxelGrid();
 
 	// ensureVoxelGrid returns early when the dimensions are unchanged, which
 	// they are when the same cloud is reloaded. The construct kernel adds to
@@ -2618,12 +2646,11 @@ void resetCUDA(shared_ptr<GLRenderer> renderer){
 		numGroups, 1, 1,
 		workgroupSize, 1, 1,
 		0, 0, args);
-
-	if(res_launch != CUDA_SUCCESS){
-		printfmt("CUDA kernel 'reset' failed.\n");
-	}
+	logLaunch("reset", res_launch);
 
 	cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
+
+	return res_launch == CUDA_SUCCESS;
 }
 
 // incrementally updates the octree on the GPU
@@ -2666,11 +2693,7 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 		0, 0, args);
 	// printfmt("update done\n");
 
-	if(res_launch != CUDA_SUCCESS){
-		const char* str; 
-		cuGetErrorString(res_launch, &str);
-		printf("error: %s \n", str);
-	}
+	logLaunch("construct", res_launch);
 
 	cuEventRecord(ce_update_end, 0);
 
@@ -2727,6 +2750,15 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 // 	requestColorFiltering = false;
 // }
 
+// kernel_render did not run: put back the requests beginFrameState took for
+// this frame, for the next frame that is drawn
+static void keepFrameRequests(){
+	if(g_frameGridRefill) g_gridRefill = true;
+	if(g_frameLightDirty) g_lightDirty = true;
+	g_frameGridRefill = false;
+	g_frameLightDirty = false;
+}
+
 // draw the octree with a CUDA kernel
 void renderCUDA(shared_ptr<GLRenderer> renderer){
 
@@ -2751,30 +2783,27 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 		}
 	}
 	if(uniformsSymbol == 0){
-		// kernel_render cannot run: keep the requests beginFrameState took
-		if(g_frameGridRefill) g_gridRefill = true;
-		if(g_frameLightDirty) g_lightDirty = true;
-		g_frameGridRefill = false;
-		g_frameLightDirty = false;
+		keepFrameRequests();
 		return;
 	}
 
-	CUresult registered_res = cuGraphicsGLRegisterImage(
-		&cugl_colorbuffer,
-		renderer->view.framebuffer->colorAttachments[0]->handle,
-		GL_TEXTURE_2D,
-		CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
-	if(registered_res != CUDA_SUCCESS){
-		// mapping a resource that did not register crashes in the driver
-		static bool warned = false;
-		if(!warned){ warned = true; logLine("[host] cannot register the frame texture with CUDA (%d); frame skipped\n", int(registered_res)); }
-		// kernel_render does not run: put back the requests beginFrameState
-		// took for this frame, for the next one that is drawn
-		if(g_frameGridRefill) g_gridRefill = true;
-		if(g_frameLightDirty) g_lightDirty = true;
-		g_frameGridRefill = false;
-		g_frameLightDirty = false;
-		return;
+	// Registered once, and again only after a resize has replaced the
+	// texture (releaseFrameTexture). "Registering a resource is potentially
+	// high-overhead and therefore typically called only once per resource"
+	// (CUDA C++ Programming Guide 12.4, 3.2.15); it was registered and
+	// unregistered on every frame. Mapping stays per frame.
+	GLuint frameTexture = renderer->view.framebuffer->colorAttachments[0]->handle;
+	if(g_registeredFrameTexture != frameTexture){
+		releaseFrameTexture();
+		CUresult registered_res = cuGraphicsGLRegisterImage(&cugl_colorbuffer, frameTexture, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
+		if(registered_res != CUDA_SUCCESS){
+			// mapping a resource that did not register crashes in the driver
+			static bool warned = false;
+			if(!warned){ warned = true; logLine("[host] cannot register the frame texture with CUDA (%d); frame skipped\n", int(registered_res)); }
+			keepFrameRequests();
+			return;
+		}
+		g_registeredFrameTexture = frameTexture;
 	}
 
 	// map OpenGL resources to CUDA
@@ -2789,7 +2818,6 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 
 	cuEventRecord(ce_render_start, 0);
 
-	float time = static_cast<float>(now());
 	int workgroupSize = 256;   // kernel_render's __launch_bounds__ in render.cu assumes 256
 	
 	int maxActiveBlocksPerSM;
@@ -2821,11 +2849,8 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 
 	g_frameDrawn = res_launch == CUDA_SUCCESS;
 	if(g_frameDrawn && g_frameGridRefill) g_refillGen++;   // the bird's-eye view follows the grid
-	if(res_launch != CUDA_SUCCESS){
-		const char* str;
-		cuGetErrorString(res_launch, &str);
-		printf("error: %s \n", str);
-	}
+	logLaunch("render", res_launch);
+	if(!g_frameDrawn) keepFrameRequests();
 
 	cuEventRecord(ce_render_end, 0);
 
@@ -2850,8 +2875,6 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 
 	cuSurfObjectDestroy(output_surf);
 	cuGraphicsUnmapResources(static_cast<int>(dynamic_resources.size()), dynamic_resources.data(), ((CUstream)CU_STREAM_DEFAULT));
-
-	cuGraphicsUnregisterResource(cugl_colorbuffer);
 }
 
 // compile kernels and allocate buffers
@@ -3033,8 +3056,6 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	cuEventCreate(&ce_update_start, 0);
 	cuEventCreate(&ce_update_end, 0);
 	
-	cuGraphicsGLRegisterImage(&cugl_colorbuffer, renderer->view.framebuffer->colorAttachments[0]->handle, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
-
 	size_t freeAfterInit = 0;
 	cuMemGetInfo(&freeAfterInit, &totalMem);
 	logLine("[vram] %.0f MB free after allocating the octree pool\n", freeAfterInit / 1e6);
@@ -3326,17 +3347,24 @@ void reset(shared_ptr<GLRenderer> renderer){
 	cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
 
 	// now reset octree-construction related state on device
-	resetCUDA(renderer);
+	bool resetDone = resetCUDA(renderer);
 	cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
 
-	// read stats just to make sure device and host are on the same page
-	// (sync before the memcpy, or this copies the previous, stale contents)
-	cuMemcpyDtoHAsync(h_stats_pinned, cptr_stats, sizeof(Stats), ((CUstream)CU_STREAM_DEFAULT));
-	cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
-	memcpy(&stats, h_stats_pinned, sizeof(Stats));
+	if(resetDone){
+		// read stats just to make sure device and host are on the same page
+		// (sync before the memcpy, or this copies the previous, stale contents)
+		cuMemcpyDtoHAsync(h_stats_pinned, cptr_stats, sizeof(Stats), ((CUstream)CU_STREAM_DEFAULT));
+		cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
+		memcpy(&stats, h_stats_pinned, sizeof(Stats));
 
-	// finally, reset host state to start reloading current data set from disk
-	reload();
+		// finally, reset host state to start reloading current data set from disk
+		reload();
+	}else{
+		// The device kept the previous load's counters, from which the
+		// construct kernel would have read stale upload slots. The cloud
+		// already loaded stays.
+		notice("The octree could not be reset (see the log) - keeping the current cloud");
+	}
 
 	requestReset = false;
 
@@ -3781,7 +3809,12 @@ int main(int argc, char** argv){
 		if(string(argv[i]) == "--hidden") GLRenderer::startHidden = true;
 	}
 
+	// GLFW errors and window start-up failures go to the run log
+	GLRenderer::log = [](const string& message){ logLine("[host] %s\n", message.c_str()); };
 	auto renderer = make_shared<GLRenderer>();
+	// Minimised, the window waits for events instead of drawing frames no one
+	// sees, except while a load needs frames to insert its points.
+	renderer->workPending = [](){ return !lastBatchFinishedDevice || requestReset; };
 	{
 		// Which GPU draws the window. On a hybrid-graphics laptop it must be
 		// the NVIDIA one, or CUDA cannot register the frame texture and every
@@ -4181,7 +4214,11 @@ int main(int argc, char** argv){
 		lastFrameTime = static_cast<float>(now());
 
 		if(renderer->width > 0 && renderer->height > 0){   // 0 x 0 while minimised
-			renderer->view.framebuffer->setSize(renderer->width, renderer->height);
+			auto& framebuffer = renderer->view.framebuffer;
+			if(framebuffer->width != renderer->width || framebuffer->height != renderer->height){
+				releaseFrameTexture();   // setSize deletes the texture and makes a new one
+			}
+			framebuffer->setSize(renderer->width, renderer->height);
 		}
 
 		glBindFramebuffer(GL_FRAMEBUFFER, renderer->view.framebuffer->handle);
