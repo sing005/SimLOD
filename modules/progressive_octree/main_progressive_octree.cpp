@@ -131,7 +131,7 @@ GLuint g_registeredFrameTexture = 0;   // the texture cugl_colorbuffer is regist
 static struct {
 	bool        valid = false;
 	Uniforms    key;                  // frameKey of its uniforms
-	CUfunction  kernel = nullptr;
+	int         generation = -1;      // the render program's, so a hot reload draws again
 	GLuint      texture = 0;
 	CUdeviceptr renderBuffer = 0;
 } g_lastDrawn;
@@ -2750,10 +2750,11 @@ static void frameKey(const Uniforms& uniforms, Uniforms* key){
 // load; the grids, in a rebuild (beginFrameState asks for one when they are
 // reallocated or emptied); the kernel, on a hot reload; and the texture and
 // buffers, on a resize. Any doubt draws the frame.
-static bool sameAsLastDrawn(const Uniforms& uniforms, CUfunction kernel, GLuint texture){
+static bool sameAsLastDrawn(const Uniforms& uniforms, GLuint texture){
 	if(!settings.skipUnchanged || g_drawEveryFrame || !g_lastDrawn.valid) return false;
 	if(!lastBatchFinishedDevice || g_frameGridRefill || g_frameLightDirty) return false;
-	if(kernel != g_lastDrawn.kernel || texture != g_lastDrawn.texture || cptr_renderbuffer != g_lastDrawn.renderBuffer) return false;
+	if(cuda_program_render->generation != g_lastDrawn.generation) return false;
+	if(texture != g_lastDrawn.texture || cptr_renderbuffer != g_lastDrawn.renderBuffer) return false;
 	Uniforms key;
 	frameKey(uniforms, &key);
 	return memcmp(&key, &g_lastDrawn.key, sizeof(Uniforms)) == 0;
@@ -2780,15 +2781,17 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 
 	// kernel_render reads the uniforms from constant memory (render.cu).
 	// Find that symbol in the current module; a hot reload replaces the
-	// module, and with it the symbol's address.
-	static CUmodule uniformsModule = nullptr;
+	// module, and with it the symbol's address. By generation, not handle:
+	// the old module is unloaded, and the new one can get its handle.
+	static int uniformsGeneration = -1;
 	static CUdeviceptr uniformsSymbol = 0;
-	if(uniformsModule != cuda_program_render->mod){
+	if(uniformsGeneration != cuda_program_render->generation){
 		size_t bytes = 0;
-		uniformsModule = cuda_program_render->mod;
-		if(cuModuleGetGlobal(&uniformsSymbol, &bytes, uniformsModule, "uniforms") != CUDA_SUCCESS || bytes != sizeof(Uniforms)){
+		uniformsGeneration = cuda_program_render->generation;
+		CUmodule module = cuda_program_render->mod;   // none if the kernels never compiled, which they logged
+		if(module == nullptr || cuModuleGetGlobal(&uniformsSymbol, &bytes, module, "uniforms") != CUDA_SUCCESS || bytes != sizeof(Uniforms)){
 			uniformsSymbol = 0;
-			logLine("[host] the render kernel has no uniforms of %zu bytes (found %zu); frames are skipped\n", sizeof(Uniforms), bytes);
+			if(module != nullptr) logLine("[host] the render kernel has no uniforms of %zu bytes (found %zu); frames are skipped\n", sizeof(Uniforms), bytes);
 		}
 	}
 	if(uniformsSymbol == 0){
@@ -2820,7 +2823,7 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	// on every frame, keeping the GPU busy for most of each frame whenever
 	// full detail cost more than the budget.
 	CUfunction kernel = cuda_program_render->kernels["kernel_render"];
-	bool kept = sameAsLastDrawn(uniforms, kernel, frameTexture);
+	bool kept = sameAsLastDrawn(uniforms, frameTexture);
 	g_keptShare += 0.02f * ((kept ? 1.0f : 0.0f) - g_keptShare);   // about the last 50 frames
 	if(kept){
 		g_frameDrawn = true;   // the texture holds this frame
@@ -2839,7 +2842,7 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 
 	int workgroupSize = 256;   // kernel_render's __launch_bounds__ in render.cu assumes 256
 	
-	int maxActiveBlocksPerSM;
+	int maxActiveBlocksPerSM = 0;   // on failure the launch below fails, and is logged
 	cuOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocksPerSM, kernel, workgroupSize, 0);
 	
 	int numGroups = maxActiveBlocksPerSM * numSMs;
@@ -2869,7 +2872,7 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	g_lastDrawn.valid = g_frameDrawn;
 	if(g_frameDrawn){
 		frameKey(uniforms, &g_lastDrawn.key);
-		g_lastDrawn.kernel       = kernel;
+		g_lastDrawn.generation   = cuda_program_render->generation;
 		g_lastDrawn.texture      = frameTexture;
 		g_lastDrawn.renderBuffer = cptr_renderbuffer;
 	}
@@ -3852,6 +3855,17 @@ int main(int argc, char** argv){
 		}
 	}
 
+	// Kernel compile and link messages, a line at a time: a compiler's log
+	// can run past the 2,048 characters of one log line
+	cudaProgramLog = [](const string& message){
+		std::stringstream lines(message);
+		string line;
+		int numLines = 0;
+		while(std::getline(lines, line)){
+			if(++numLines > 60){ logLine("[kernels]   (the rest is on the console)\n"); break; }
+			logLine("%s\n", line.c_str());
+		}
+	};
 	initCuda();
 	initCudaProgram(renderer);
 

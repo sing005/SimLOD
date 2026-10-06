@@ -559,6 +559,7 @@ inline string readFile(string path) {
 
 	std::ifstream t(path);
 	std::string str;
+	if (!t) return str;   // reserve(tellg()) threw on a file that could not be opened
 
 	t.seekg(0, std::ios::end);
 	str.reserve(t.tellg());
@@ -699,20 +700,24 @@ inline void monitorFile(string file, std::function<void()> callback) {
 
 	std::thread([file, callback]() {
 
-		if (!fs::exists(file)) {
-			cout << "ERROR(monitorFile): file does not exist: " << file << endl;
+		std::error_code ec;
+		auto lastWriteTime = fs::last_write_time(fs::path(file), ec);
+		if (ec) {
+			cout << "ERROR(monitorFile): cannot watch " << file << ": " << ec.message() << endl;
 
 			return;
 		}
 
-		auto lastWriteTime = fs::last_write_time(fs::path(file));
-
 		using namespace std::chrono_literals;
 
+		// Every 250 ms, often enough for a save to show at once; it was every
+		// 20 ms. A poll that fails, as when git replaces the file, is skipped:
+		// the throwing calls used before ended the program.
 		while (true) {
-			std::this_thread::sleep_for(20ms);
+			std::this_thread::sleep_for(250ms);
 
-			auto currentWriteTime = fs::last_write_time(fs::path(file));
+			auto currentWriteTime = fs::last_write_time(fs::path(file), ec);
+			if (ec) continue;
 
 			if (currentWriteTime > lastWriteTime) {
 
