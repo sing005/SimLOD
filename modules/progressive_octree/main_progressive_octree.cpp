@@ -2898,9 +2898,9 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 
 	// kernel_construct's scratch, and nothing else's: the render kernel's
 	// emission, bloom and volumetric buffers live in cptr_renderbuffer. Sized
-	// from the kernel's own capacities, 405 MB plus a chunk queue entry per
-	// point chunk the pool could hold (total VRAM bounds the pool: 4 MB on an
-	// 8 GB card). It was a fixed 1.2 GB, and before that 300 MB, which the
+	// from the kernel's own capacities, 360.8 MB plus a chunk queue entry per
+	// point chunk the pool could hold (total VRAM bounds the pool: 5.7 MB for
+	// 8 GiB). It was a fixed 1.2 GB, and before that 300 MB, which the
 	// kernel overran by 109 MB with no check. The kernel now refuses to run if
 	// its layout outgrows this.
 	uint64_t cptr_buffer_bytes       = CONSTRUCT_SCRATCH_FIXED_BYTES + 8 * (totalMem / CHUNK_BYTES + 1);
@@ -3308,7 +3308,7 @@ void logLoadSummary(){
 		double(s.allocatedBytes_persistent) / std::max(double(s.numPoints), 1.0),
 		s.allocatedBytes_momentary / 1e6, momentaryBufferCapacity / 1e6,
 		freeNow / 1e6);
-	logLine("[load] integrity: %u points dropped (no chunk), %u upload-ring slots refilled while still in use, %u points outside the header box (stored on its faces)\n",
+	logLine("[load] integrity: %u points dropped (no chunk, or no room among the spilled points), %u upload-ring slots refilled while still in use, %u points outside the header box (stored on its faces)\n",
 		s.numDroppedPoints, s.numRingMismatches, s.numClampedPoints);
 }
 

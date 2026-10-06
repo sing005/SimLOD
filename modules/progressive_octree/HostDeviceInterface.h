@@ -24,7 +24,7 @@ constexpr uint64_t BATCH_STREAM_SIZE = 8;
 // of which 409 MB was used.
 constexpr uint64_t CONSTRUCT_VOXEL_BACKLOG  = 10'000'000;   // voxel samples: a 16 B point and an 8 B node pointer each
 constexpr uint64_t CONSTRUCT_SPILLING_NODES = 100'000;      // node pointers, 8 B
-constexpr uint64_t CONSTRUCT_SPILLED_POINTS = 10'000'000;   // 12 B stored points; written unchecked, re-inserted only up to 3 M
+constexpr uint64_t CONSTRUCT_SPILLED_POINTS = 10'000'000;   // 12 B stored points; one that does not fit is dropped and counted
 constexpr uint64_t CONSTRUCT_SCRATCH_FIXED_BYTES =
 	  CONSTRUCT_VOXEL_BACKLOG  * (16 + 8)
 	+ CONSTRUCT_SPILLING_NODES * 8

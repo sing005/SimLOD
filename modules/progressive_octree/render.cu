@@ -46,11 +46,8 @@ inline void countUp(uint32_t* counter){
 
 constexpr int VISIBLITY_DISJUNCT = 0;
 constexpr int VISIBLITY_ADDING = 1;
-constexpr int VISIBLITY_SKIP = 2;
 constexpr int visiblityMethod = VISIBLITY_DISJUNCT;
 
-constexpr int SPLAT_SIZE = 1;
-constexpr uint32_t BACKGROUND_COLOR = 0x00332211;
 // constexpr uint32_t BACKGROUND_COLOR = 0x00ffff00;
 // constexpr uint32_t BACKGROUND_COLOR = 0x00ffffff;
 // constexpr uint32_t BACKGROUND_COLOR = 0x000000ff;
@@ -1199,7 +1196,6 @@ void drawNodes(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 
 	float3 boxSize = uniforms.boxMax - uniforms.boxMin;
 	float cubeSize = max(max(boxSize.x, boxSize.y), boxSize.z);
-	float3 cubeMin = uniforms.boxMin;
 
 	uint32_t& numNodesDrawn = *allocator->alloc<uint32_t*>(4);
 	if(grid.thread_rank() == 0){
@@ -1225,12 +1221,6 @@ void drawNodes(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 		Node* node = &nodes[sh_nodeIndex];
 
 		float nodeSize = cubeSize / pow(2.0f, float(node->level));
-		float scale = cubeSize / pow(2.0f, float(node->level));
-		float3 nodeMin = {
-			cubeMin.x + float(node->X + 0.0f) * scale,
-			cubeMin.y + float(node->Y + 0.0f) * scale,
-			cubeMin.z + float(node->Z + 0.0f) * scale,
-		};
 
 		drawNode(node->points, node, node->numPoints, framebuffer, 0.0f);
 		// A leaf's voxels duplicate its own points. Only a root that never
@@ -1795,12 +1785,6 @@ void compute_visibility_disjunct(
 			cubeMin.y + float(node->Y + 1.0f) * nodeSize,
 			cubeMin.z + float(node->Z + 1.0f) * nodeSize,
 		};
-		float3 nodeCenter = {
-			cubeMin.x + float(node->X + 0.5f) * nodeSize,
-			cubeMin.y + float(node->Y + 0.5f) * nodeSize,
-			cubeMin.z + float(node->Z + 0.5f) * nodeSize,
-		};
-
 		// compute node boundaries in screen space
 		float4 p000 = {nodeMin.x, nodeMin.y, nodeMin.z, 1.0f};
 		float4 p001 = {nodeMin.x, nodeMin.y, nodeMax.z, 1.0f};
@@ -2065,11 +2049,6 @@ void compute_visibility_add(
 		Node* node = &nodes[nodeIndex];
 
 		float nodeSize = cubeSize / pow(2.0f, float(node->level));
-		// node-center
-		float ncx = (float(node->X) + 0.5f) * nodeSize + cubeMin.x;
-		float ncy = (float(node->Y) + 0.5f) * nodeSize + cubeMin.y;
-		float ncz = (float(node->Z) + 0.5f) * nodeSize + cubeMin.z;
-
 		float scale = cubeSize / pow(2.0f, float(node->level));
 		float3 nodeMin = {
 			cubeMin.x + float(node->X + 0.0f) * scale,
