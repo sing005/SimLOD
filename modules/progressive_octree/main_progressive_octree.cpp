@@ -247,7 +247,6 @@ struct {
 	float lightIntensity             = 2.5f;
 	float ambient                    = 0.109f;   // shadowed points keep a third of their colour
 	float lightAbsorb                = 0.16f;   // per metre: 5 m of canopy passes about 45% (exp(-0.8))
-	int   lightSteps                 = 40;
 	float sunbeams                   = 0.0f;    // key light in the haze; 0 = haze lit by ambient only
 	float sunAnisotropy              = 0.5f;    // forward scattering of the haze (Henyey-Greenstein g)
 
@@ -1533,7 +1532,12 @@ static void updateAdaptiveDetail(){
 	static uint32_t lastFrameID = ~0u;
 	if(stats.frameID == lastFrameID) return;
 	lastFrameID = stats.frameID;
-	double ms = double(stats.stageNs[6]) / 1e6;
+	// Without the grid rebuilds at the start of the frame (stageNs[7]): a long
+	// drag of a light control rebuilds the light grid on every frame, which
+	// coarsened the points until well after the drag. A torn readback can
+	// pair two frames' values, so a later [7] than [6] is ignored.
+	uint64_t gridNs = stats.stageNs[7] <= stats.stageNs[6] ? stats.stageNs[7] : 0;
+	double ms = double(stats.stageNs[6] - gridNs) / 1e6;
 	if(ms > settings.frameBudgetMs * 1.10)      g_adaptReduce += 0.03f;
 	else if(ms < settings.frameBudgetMs * 0.70) g_adaptReduce -= 0.015f;
 	g_adaptReduce = std::clamp(g_adaptReduce, 0.0f, 1.0f);
@@ -1666,7 +1670,6 @@ static void resetToUnedited(){
 	settings.lightIntensity = d.lightIntensity;
 	settings.ambient        = d.ambient;
 	settings.lightAbsorb    = d.lightAbsorb;
-	settings.lightSteps     = d.lightSteps;
 	for(int i = 0; i < 3; i++) settings.lightColour[i] = d.lightColour[i];
 	settings.torchOn        = d.torchOn;
 	settings.torchIntensity = d.torchIntensity;
@@ -2467,7 +2470,12 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.lightIntensity = settings.lightIntensity;
 		uniforms.ambient        = settings.ambient;
 		uniforms.lightAbsorb    = settings.lightAbsorb;
-		uniforms.lightSteps     = settings.lightSteps;
+		// Enough one-cell steps for any ray to leave the grid, so canopy
+		// anywhere above a cell can shade it. A fixed 40 steps reached 27.6 m
+		// above a point at grid resolution 256 and 13.8 m at 512, so raising
+		// the resolution took away the shade of the upper canopy. The march
+		// stops on leaving the grid, or when almost no light is left.
+		uniforms.lightSteps     = g_gridX + g_gridY + g_gridZ;
 		uniforms.lightDirty     = g_frameLightDirty ? 1 : 0;   // decided once per frame in beginFrameState
 		uniforms.sunbeams       = settings.sunbeams;
 		uniforms.sunAnisotropy  = std::clamp(settings.sunAnisotropy, -0.95f, 0.95f);   // g = 1 is a spike
@@ -4505,7 +4513,7 @@ int main(int argc, char** argv){
 				lm |= ImGui::SliderFloat("Azimuth",          &settings.lightAzimuth,   0.0f, 360.0f);
 				lm |= ImGui::SliderFloat("Elevation",        &settings.lightElevation, 0.0f,  89.0f);
 				tipFor("Where the light comes FROM. The reference is backlit and high.");
-				lm |= ImGui::SliderFloat("Strength",         &settings.lightIntensity, 0.0f,   6.0f);
+				ImGui::SliderFloat("Strength",         &settings.lightIntensity, 0.0f,   6.0f);   // scales the light at draw time: no grid rebuild
 				ImGui::ColorEdit3 ("Light colour",     settings.lightColour, ImGuiColorEditFlags_NoInputs);
 				ImGui::SliderFloat("Ambient",          &settings.ambient,        0.0f, 1.0f);
 				tipFor("Floor under the key light, so shadowed points keep some of their own colour. The haze in shade darkens to the same level.");

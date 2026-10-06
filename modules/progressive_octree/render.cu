@@ -391,8 +391,8 @@ inline bool isStrayPoint(float px, float py, float pz){
 //
 // This computes, ONCE per cell rather than per point per frame, how much light
 // reaches that cell from the light direction: march through the occupancy grid
-// and accumulate extinction. 5.3 M cells at 32 steps is a one-off pass; at draw
-// time it is a single lookup.
+// until the ray leaves it, accumulating extinction. That is a one-off pass, on
+// a light change or a grid rebuild; at draw time it is a single lookup.
 inline float lightAt(float px, float py, float pz){
 	if(uniforms.lightGridPtr == 0) return 1.0f;
 	float c = uniforms.cellSize;
@@ -1153,7 +1153,7 @@ void countNodeIntoGrid(Chunk* chunk, uint32_t numElements){
 	}
 }
 
-void refillVoxelGrid(Node* nodes){
+void refillVoxelGrid(Node* nodes, Stats* stats){
 	if(uniforms.gridRefill == 0) return;
 	if(uniforms.voxelGridPtr == 0) return;
 
@@ -1178,7 +1178,8 @@ void refillVoxelGrid(Node* nodes){
 		block.sync();
 		if(block.thread_rank() == 0){ sh_n = atomicAdd(&_refillNextNode, 1); }
 		block.sync();
-		if(sh_n >= uniforms.numNodesTotal) break;
+		// the device's own count: the host's copy of it lags by a frame or more
+		if(sh_n >= int(stats->numNodes)) break;
 
 		Node* node = &nodes[sh_n];
 		// points only. Voxels are coarse summaries of the same surfaces, and
@@ -1704,14 +1705,7 @@ void drawNodesBoundingBoxes(
 
 		color = 0x0000ff00;
 
-		drawBoundingBox(lines, pos, {scale, scale, scale}, color);
-		int steps = 1;
-		for(int si = 0; si < steps; si++){
-			float s = 1.0 + 0.02 * float(si) / 5.0f;
-			drawBoundingBox(lines, pos, float3{s * scale, scale, scale}, color);
-			drawBoundingBox(lines, pos, float3{scale, s * scale, scale}, color);
-			drawBoundingBox(lines, pos, float3{scale, s * scale, s * scale}, color);
-		}
+		drawBoundingBox(lines, pos, {scale, scale, scale}, color);   // once: a loop added three identical copies
 	});
 }
 
@@ -1916,7 +1910,7 @@ void compute_visibility_disjunct(
 		if(!hasSamples) visible = false;
 
 		node->visible = visible;
-		node->isLarge = dx > 2.0 * uniforms.minNodeSize || dy > 2.0 * uniforms.minNodeSize;
+		node->isLarge = dx > 2.0f * uniforms.minNodeSize || dy > 2.0f * uniforms.minNodeSize;
 		node->screenSize = fmaxf(dx, dy);
 
 		// if(strequal(node->name, "r")){
@@ -2010,6 +2004,10 @@ void compute_visibility_disjunct(
 				}
 			}
 		}else if(node->isLarge && node->isLeafFn() && node->visible){
+			makeVisible(node, 0, 0.0f);
+		}else if(nodeIndex == 0 && !node->isLarge && node->visible){
+			// The root has no parent to draw it, so a cloud whose whole cube
+			// is under 2 x minNodeSize on screen drew nothing.
 			makeVisible(node, 0, 0.0f);
 		}
 	});
@@ -2292,7 +2290,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	// Recount the occupancy grid first: the light grid below is derived from
 	// these counts, and the host requests both together after a reallocation.
 	grid.sync();
-	refillVoxelGrid(nodes);   // apply_grid_refill.ps1: only when the host says stale
+	refillVoxelGrid(nodes, stats);   // only when the host says the counts are stale
 
 	// ---- build the light transmittance grid (apply_keylight.ps1) ----------
 	// Only when the host says it is stale: after a load, or when a light
@@ -2327,6 +2325,8 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		grid.sync();
 	}
 	grid.sync();
+	// the grid rebuilds end here; adaptive detail leaves them out
+	if(grid.thread_rank() == 0) stats->stageNs[7] = nanotime() - tStart;
 
 	// Only an event (a call playing, or the test source) puts anything in the
 	// emission buffer: evalEmission adds nothing without one, nor in the
@@ -2664,22 +2664,25 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		int width = uniforms.width;
 		int height = uniforms.height;
 
+		// Every tile, the partial ones at the right and top edges included,
+		// each block stepping through them. Only whole tiles used to be
+		// counted, and only numTiles / numBlocks of them per block, so the
+		// last few tiles and an edge strip up to 15 px wide went unshaded.
+		// The pass reads depths and writes colours, so no barrier is needed
+		// between tiles.
 		uint32_t tileSize = 16;
-		uint32_t numTiles_x = width / tileSize;
-		uint32_t numTiles_y = height / tileSize;
+		uint32_t numTiles_x = (width  + tileSize - 1) / tileSize;
+		uint32_t numTiles_y = (height + tileSize - 1) / tileSize;
 		uint32_t numTiles = numTiles_x * numTiles_y;
-		uint32_t tilesPerBlock = numTiles / grid.num_blocks();
 
-		for(int i = 0; i < tilesPerBlock; i++){
+		for(uint32_t tileID = block.group_index().x; tileID < numTiles; tileID += grid.num_blocks()){
 
-			block.sync();
-
-			int tileID = i * grid.num_blocks() + block.group_index().x;
 			int tileX = tileID % numTiles_x;
 			int tileY = tileID / numTiles_x;
-			int tileStart = tileX * tileSize + tileY * width * tileSize;
-
-			int pixelID = tileStart + block.thread_rank() % tileSize + (block.thread_rank() / tileSize) * width;
+			int px = tileX * tileSize + block.thread_rank() % tileSize;
+			int py = tileY * tileSize + block.thread_rank() / tileSize;
+			if(px >= width || py >= height) continue;
+			int pixelID = px + py * width;
 
 			Pixel& pixel = framebuffer_p[pixelID];
 
@@ -2722,8 +2725,6 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			uint32_t color = R | (G << 8) | (B << 16) | (255u << 24);
 
 			pixel.color = color;
-
-			block.sync();
 		}
 		grid.sync();
 	}
@@ -3219,7 +3220,12 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 					r += vr * n;
 					g += vg * n;
 					b += vb * n;
-				}else{
+				}else if(isGeometry || uniforms.fogSky != 0 || volEvents){
+					// No sample is near this pixel's distance: take the closest.
+					// A sky pixel takes none while only the sunbeams light the
+					// haze and Haze over sky is off, as a sky ray gets none
+					// then; in a canopy gap narrower than the 4 px sample
+					// spacing it used to take a leaf's beam light.
 					r += volBuf[best + 0];
 					g += volBuf[best + 1];
 					b += volBuf[best + 2];
