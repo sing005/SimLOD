@@ -4,7 +4,7 @@ This file provides guidance for working with code in this repository.
 
 ## What this is
 
-A modified fork of [m-schuetz/SimLOD](https://github.com/m-schuetz/SimLOD) (MIT): a CUDA point-cloud viewer that builds an octree LOD on the GPU while loading LAS/LAZ/.simlod files and renders it in real time. Local work adds a fisheye lens, key light + volumetrics, bloom/"look" grading, an occupancy voxel grid (stray-point cull, insect placement, light transmittance), survey markers with CSV I/O and a Horn survey-frame fit, walk navigation, find/isolate, and call-schedule emission for the Rotokare acoustic project.
+A modified fork of [m-schuetz/SimLOD](https://github.com/m-schuetz/SimLOD) (MIT): a CUDA point-cloud viewer that builds an octree LOD on the GPU while loading LAS/LAZ/.simlod files and renders it in real time. Local work adds a fisheye lens, key light + volumetrics, bloom/"look" grading, an occupancy voxel grid (stray-point cull, insect placement, light transmittance), survey markers with CSV I/O and a Horn survey-frame fit, walk navigation, and call-schedule emission for the Rotokare acoustic project.
 
 Git remotes: `upstream` = m-schuetz/SimLOD. The user's own repo is private. Work on feature branches; `main` holds the user's baseline, not upstream.
 
@@ -18,11 +18,12 @@ cmake --build . --config Release
 ```
 
 - The policy flag is needed with CMake 4.x, because the fetched GLFW declares `cmake_minimum_required` < 3.5.
-- The CUDA `.cu` files cannot be syntax-checked with plain `nvcc`. NVRTC compiles them with device as the default execution space. To check them, run the built exe from the repo root for a few seconds and look for `=== COMPILING:` lines followed by errors in stdout.
-- Without a GPU (for example in a cloud session), the PyPI wheels `nvidia-cuda-nvrtc-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-curand-cu12` and `nvidia-cuda-cccl-cu12` (all 12.4) supply NVRTC and the headers. Merge the wheels' `include/` folders into one directory, then call `nvrtcCompileProgram` (for example through Python `ctypes`) with the options listed in `CudaModularProgram::compile()`. This compiles the `.cu` files without a GPU.
+- The CUDA `.cu` files cannot be syntax-checked with plain `nvcc`. NVRTC compiles them with device as the default execution space. To check them, run the built exe from the repo root for a few seconds and read the `[kernels]` lines in the run log: a file that does not compile logs NVRTC's messages there, and the kernels already in use are kept. A start compiles the kernels only when a file under `modules/` has changed since they were cached (see Hot reload and the kernel cache).
+- Without a GPU (for example in a cloud session), the PyPI wheels `nvidia-cuda-nvrtc-cu12`, `nvidia-cuda-runtime-cu12` and `nvidia-cuda-cccl-cu12` (all 12.4) supply NVRTC and the headers. Merge the wheels' `include/` folders into one directory, then call `nvrtcCompileProgram` (for example through Python `ctypes`) with the options `CudaModule::options()` lists in `include/CudaModularProgram.h`. This compiles the `.cu` files without a GPU.
 
 - Build **Release** for normal use. Debug is much slower, but it is useful for host-side debugging. Release also writes `SimLOD.pdb`; keep it next to the exe so crash traces have line numbers.
-- Requires CUDA ≥ 12.0 (links `CUDA::nvJitLink`) and CMake ≥ 3.26. At runtime `CUDA_PATH` must point to a CUDA 12 toolkit, because NVRTC compiles the kernels against its headers.
+- Requires CMake ≥ 3.26 and a CUDA 12 toolkit. `CMakeLists.txt` asks for 12.0, the first with nvJitLink; CI and the laptop use 12.4.
+- At run time `CUDA_PATH` must point to a toolkit no older than the one the exe was built with, and its `bin` folder must be on `PATH`. NVRTC compiles the kernels against its headers, and an exe built with 12.4 calls nvJitLink entry points (`__nvJitLink*_12_4`) that older libraries lack.
 - There are no tests and no linter. Verification means building and running.
 - Post-build copies `modules/` next to the exe. The `.cu` files are compiled **at runtime** with NVRTC, so CUDA edits do not need a C++ rebuild.
 - CI (`.github/workflows/build.yml`) builds Release on Windows for each pull request and uploads a runnable bundle. It does not compile the `.cu` files.
@@ -35,7 +36,15 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 
 - Files load as if dropped on the window.
 - `--view` places the camera. The target is in the renderer frame, i.e. relative to the cloud's minimum corner.
-- `--set` accepts `hqs`, `splat`, `detail`, `adaptive`, `budget` and `vsync`, and for the haze and key light `haze`, `hazefall`, `hazefloor`, `hazesky`, `light` and `sunbeams`.
+- `--set name=value` accepts `hqs`, `splat`, `detail`, `adaptive`, `budget`, `vsync`, `insects`, `grain`, `bloom`, `markers`, `pointsize`, `gain`, `haze`, `hazefall`, `hazefloor`, `hazesky`, `light`, `sunbeams`, `whitefix`, `skycast`, `torch`, `radius`, `exposure`, `tone`, `unedited` and `keep` (the share of each file loaded). Values are clamped to the sliders' ranges. An unknown key, like any argument not recognised, is logged and ignored.
+- The other options:
+  - `--render W H` renders at that size, scaled to the window.
+  - `--calls FILE` loads a call schedule and plays it.
+  - `--screenshot FILE.bmp`, or `--shots LIST` with one shot per line (`name yaw pitch radius tx ty tz`, written to `name.bmp` beside the list). The shots are taken once loading has finished, each after `--shot-delay S` seconds (default 3) at its camera.
+  - `--bench N` times N frames at each shot's camera.
+  - `--exit` closes the viewer after the shots, or once loading finishes when there are none. It exits with code 1 when files were given on the command line and none could be loaded.
+  - `--hidden` starts without showing the window, `--look` loads a look (below), and `--no-kernel-cache` compiles the kernels at every start.
+- Point files are checked before the current cloud is reset (`lasFileProblem()` in `LasLoader.cpp`, `simlodFileProblem()` in `SimlodLoader.cpp`). A file that is cut short, has no points, has bounds that are not valid, or is compressed but named `.las` is refused with a notice and the log line `[load] not loading`, and the current cloud stays. A batch that cannot be read during loading is logged and skipped.
 - SimLOD starts **unedited**: every setting that changes how the cloud is represented starts at the value that changes nothing. Each point shows the colour stored in the file, with no light, torch, haze, sunbeams, bloom, insects, point shading, eye dome lighting, canopy repair or cull, a neutral grade (exposure 1, saturation 1, temperature 0, mix 1) and no tone curve. Every effect is built up from there.
   - **Reset to unedited**, at the top of the settings panel, returns to those values (`resetToUnedited()`). It also restores point size, splat shape and high-quality shading, and shows the points again in their stored colours (Show points on; Markers only, Colour by node and Colour by LOD off). It keeps the camera, lens and near clip, the sky and horizon, markers and survey, calls, detail and speed, and the bounding box, voxel grid and Update visibility.
   - **Show unedited**, beside it, draws the cloud as the reset would leave it without changing the settings, for comparison (`showUnedited()` in `render.cu`; the host shows the points and leaves out the debug colours in `getUniforms()`). Point size, splat shape and high-quality shading stay as set.
@@ -50,7 +59,7 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 
 ## Architecture
 
-**Host and device split.** `modules/progressive_octree/main_progressive_octree.cpp` is the whole host application: `main()`, the ImGui UI, loader and uploader threads (`spawnLoader`, `spawnUploader`), GPU buffer allocation, and kernel launches. The GPU side consists of three runtime-compiled programs, each `CudaModularProgram` built from a `.cu` file plus `utils.cu`:
+**Host and device split.** `modules/progressive_octree/main_progressive_octree.cpp` is the whole host application: `main()`, the ImGui UI, loader and uploader threads (`spawnLoader`, `spawnUploader`), GPU buffer allocation, and kernel launches. The GPU side consists of three runtime-compiled programs, each a `CudaModularProgram` built from one `.cu` file and the headers it includes (`utils.h.cu`, `structures.cuh` and others):
 
 | Program | Kernel | Role |
 |---|---|---|
@@ -62,12 +71,17 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 - All kernels are launched with `cuLaunchCooperativeKernel` and synchronise across the whole grid with `grid.sync()`. Any early `return` before a `grid.sync()` must be uniform across all threads.
 - Work is split with `processRange` from `utils.h.cu`, which gives each thread a contiguous run of items. Per-pixel passes can use `processRangeStrided` instead: consecutive threads take consecutive items, so memory accesses coalesce. The composite uses it, and with it `kernel_render` spills no registers.
 
-**Hot reload.** `CudaModularProgram` (`include/CudaModularProgram.h`) watches each `.cu` file and recompiles it when it changes. This only works if the working directory is the repo root, because the files are loaded from `./modules/...`. It compiles for the present GPU's compute capability.
+**Hot reload and the kernel cache.**
+- `CudaModularProgram` (`include/CudaModularProgram.h`) watches each `.cu` file and recompiles it when it changes. This only works if the working directory is the repo root, because the files are loaded from `./modules/...`. It compiles for the present GPU's compute capability.
+- A file that does not compile, or kernels that do not link or load, are logged as `[kernels]` lines, and the kernels in use are kept.
+- Each load of new kernels increases the program's `generation`. Anything looked up in a module, such as the render kernel's `uniforms` symbol, is looked up again when the generation changes. Comparing module handles is not enough: the old module is unloaded, and the new one can be given its handle.
+- At start, each program's linked kernels are loaded from a cache if nothing they depend on has changed. The folder is `%LOCALAPPDATA%\SimLOD\kernels` (on Linux `$XDG_CACHE_HOME/SimLOD/kernels` or `~/.cache/SimLOD/kernels`). A file's name is a SHA-256 (`include/Sha256.h`) of the NVRTC and link options (which include the compute capability), the kernel names, the NVRTC and nvJitLink versions, the toolkit (`CUDA_PATH`, its `version.json` and `cuda.h`) and every `.cu`, `.cuh` and `.h` file under `./modules`. In a cloud session, reading the three programs' kernels from the cache took 0.04 s, against 7.8 s to compile and link them. `--no-kernel-cache` compiles them at every start.
 
 **Shared host/device structs.**
-- `HostDeviceInterface.h` defines `Uniforms` (per-frame settings passed **by value** as a kernel parameter) and `Stats` (counters and pick results written by the GPU).
+- `HostDeviceInterface.h` defines `Uniforms` (per-frame settings) and `Stats` (counters and pick results written by the GPU).
+- `kernel_render` reads `Uniforms` from constant memory (`__constant__ Uniforms uniforms` in `render.cu`), which `renderCUDA()` fills with `cuMemcpyHtoDAsync` before each launch. `kernel_construct` and the reset kernel take it by value, as a kernel parameter.
 - Both structs are compiled by MSVC and NVRTC, so field order and types must stay layout-compatible.
-- `Uniforms` is about 2 KB against the 4 KB kernel-parameter limit.
+- `Uniforms` is 1,824 bytes, against the 4 KB kernel-parameter limit. `Stats` is 208 bytes.
 - Fixed arrays in these structs, such as `MAX_EVENTS` and the 32-entry marker arrays, are bounds-checked on the host.
 
 **Per-frame flow.**
@@ -75,13 +89,16 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
    - The light grid is held only while the key light is on.
    - The colour grid (8 bytes a cell) is held only while Fix blown-out canopy is on, or while the bird's-eye view waits to be rebuilt with its colours. The next grid rebuild fills it.
 2. `renderCUDA()` and `updateOctree()` launch the kernels. Each calls `getUniforms()`, which copies `settings` and frame state into `Uniforms`.
+   - `renderCUDA()` does not draw again when nothing that reaches the kernel has changed since the frame in the texture was drawn (`sameAsLastDrawn()`). It compares the bytes of the `Uniforms`, the program generation, the texture and the render buffer. The insects' phases and the frame counter are left out of the comparison while the kernel does not read them (`frameKey()`).
+   - A frame is always drawn while points are loading, when the voxel or light grid is rebuilt, and with `--bench`. Skip unchanged frames, under Detail and speed, turns the comparison off.
 3. `Stats` is read back with an unsynchronised `cuMemcpyDtoHAsync`, so host reads lag by a frame or more and a single read can be half-copied. Results the host must not miss use a request id that the kernel answers once and leaves in place (see `pickSeq` / `pickSeqDone`).
 
-`getUniforms()` runs for every kernel launch, so it must stay free of side effects such as allocation and flag clearing; those belong in `beginFrameState()`.
+`getUniforms()` runs for every kernel launch, so it must stay free of side effects such as allocation and flag clearing; those belong in `beginFrameState()`. It starts by zeroing the whole struct, so padding bytes compare equal. A new `Uniforms` field whose value changes on every frame makes every frame differ from the last and stops the frame skip; leave it out in `frameKey()` while the kernel does not read it.
 
 **Haze, sunbeams and the composite.**
 - The haze (`fog*` uniforms) has a density that depends only on height, so `hazeOpticalDepth()` computes its optical depth along a ray in closed form. The composite applies its extinction and its ambient light exactly, at full resolution.
 - The key light's share of the haze is shaded by the canopy, so it varies along the ray. The volumetric pass marches it through the light grid, alongside the calls' medium, at quarter resolution.
+- The light grid's transmittance is marched towards the light in one-cell steps. The host passes enough steps for any ray to leave the grid, so canopy at any height can shade the points below it at every grid resolution; the march stops on leaving the grid, or once almost no light is left. A rebuild therefore costs more at high resolutions and low light elevations. The Strength slider does not rebuild the grid, since transmittance does not depend on it.
 - A ray that hits no point (sky, or the void below the horizon) gets the haze, its ambient light and its sunbeams only with Haze over sky (`fogSky`) on. The march's dither is fixed per pixel; a per-frame one made the lit haze flicker.
 - `volBuf` holds RGB plus the distance to the surface each ray sees (`SKY_DISTANCE` for sky). The composite upsamples it with weights from that distance (joint bilateral), so lit haze does not spread across silhouettes.
 - The composite keeps the backdrop (sky, or the void below the horizon) apart from the scene light and grades only the scene. Anything added in front of the sky is graded the same as when it is in front of geometry.
@@ -93,7 +110,7 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
 - On dense scans viewed up close, the cost is splatting the nearest full-resolution leaves, which LOD alone cannot reduce.
 - High-quality shading (on by default) draws every point twice, in a depth pass and a colour pass.
 
-**Global state.** Host state lives in file-scope globals prefixed `g_` (grids, markers, call schedule, survey fit). The rendering settings struct is `settings` (anonymous struct at about line 124).
+**Global state.** Host state lives in file-scope globals prefixed `g_` (grids, markers, call schedule, survey fit). The rendering settings struct is `settings` (anonymous struct at about line 165).
 
 **Runtime outputs.** These are written to the working directory and are git-ignored:
 - `log/simlod_<timestamp>.log`, written by `logLine()`.
@@ -102,7 +119,8 @@ build\Release\SimLOD.exe cloud.las --view <yaw> <pitch> <radius> <tx> <ty> <tz> 
   - Periodic status lines go through `logIfChanged()`.
   - Each run is capped at 20 MB, and only the newest 10 logs are kept.
   - `CrashHandler.cpp` appends a symbolised stack trace on any unhandled exception. Start any crash investigation there.
-- `markers.csv`.
+- `markers.csv`, written and read by Save markers.csv and Load markers.csv under Markers and survey. Its full path is logged.
+- `survey_transform.txt`, written by the survey fit.
 
 ## Working rules for this repo
 
@@ -141,9 +159,11 @@ The docstring gives the method. In order, the steps are:
   - `--show paths` shows which step coloured each point.
   - Detected page centres go to `OUT_pages.csv`, in the viewer's `markers.csv` format.
 - The full scans (3–4 GB, 346–455 M points) live only on the local machine.
-  - The tool streams them through 16 m ground tiles with a 0.6 m halo. A tile over `--slab-points` (12 M own points) is read from disk one slab at a time.
+  - The tool streams them through 16 m ground tiles with a 0.6 m halo. A tile over `--slab-points` (12 M own points) is processed in slabs along x, each read from disk with the points within 0.6 m of it.
+  - Each whole tile, and each slab, is a separate job. `--workers N` runs N at once, the largest first, so the slabs of one dense tile are spread over the workers. The output is byte-identical for any number of workers.
   - Memory is about 0.32 GB per million points a worker holds at once: a slab's own points plus those within 0.6 m of it. Near the scanner the slabs are about 1 m wide and their context holds more points than they do, so the full scan needs up to about 27 M points, about 10 GB, per worker. The log reports this after the split.
   - A quick test on a full scan: `--crop 8 -4 12 0`, about 3.4 M points. A patch around the scanner such as `--crop -10 -10 10 10` holds half the scan.
-  - `--workers N` processes tiles in parallel and gives identical output.
-  - The rewritten tool has been run on the full WhiteCanopy scan (345.8 M points). The samples take about a minute each with one worker in a 4-core cloud session; the original version took about 15 minutes for a full scan on the 20-thread laptop.
+  - Disk: the scratch folder (next to the output unless `--scratch` names one) holds every tile's points and halo, then the recoloured copies of whole tiles and 3 bytes a point for slabs: about 15 GB for WhiteCanopy, estimated from `every100.laz`. After the split the log gives the space the rest of the run needs, and the run stops if it is not free. A folder the run made itself is removed when the run ends, whether or not it succeeds.
+  - `--reuse-scratch` needs `--scratch`, and refuses tiles made from another input or with another `--tile`, `--margin` or `--crop`.
+  - An earlier version of the tool was run on the full WhiteCanopy scan (345.8 M points). The current one, with slabs, has not been. The samples take about a minute each with one worker in a 4-core cloud session; the original version took about 15 minutes for a full scan on the 20-thread laptop.
 - Judge the results in SimLOD at 4K unedited, as it starts or after Reset to unedited. Any light, haze or grade changes every colour, and Fix blown-out canopy is a separate, on-the-fly repair inside the viewer.
