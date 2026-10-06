@@ -924,6 +924,15 @@ def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None, tex=None):
 SCRATCH_FORMAT = 'recolour scratch v2: t_*.rec own records, h_*.rec halo records\n'
 
 
+def scratch_source(a):
+    """What the tiles in a scratch folder are made from, kept in its format.txt after the format line:
+    --reuse-scratch with another input, or other split options, wrote one scan's points under another's
+    header, or kept pages with the wrong tile boxes."""
+    st = os.stat(a.input)
+    return (f'input {os.path.abspath(a.input)}, {st.st_size} bytes, modified {st.st_mtime_ns} ns\n'
+            f'tile {a.tile!r}, margin {a.margin!r}, crop {a.crop!r}\n')
+
+
 def split_into_tiles(a, scratch):
     """Pass 1: stream the file into per-tile record files, plus each tile's halo of neighbours' records."""
     tiles = {}      # (ix, iy) -> open file of raw records
@@ -991,7 +1000,7 @@ def split_into_tiles(a, scratch):
                 tiles = {}; halos = {}              # reopened in append mode on demand
     for f in list(tiles.values()) + list(halos.values()): f.close()
     with open(os.path.join(scratch, 'format.txt'), 'w') as f:
-        f.write(SCRATCH_FORMAT)
+        f.write(SCRATCH_FORMAT + scratch_source(a))
     return hdr
 
 
@@ -1337,10 +1346,77 @@ def build_parser():
     return ap
 
 
-def main():
-    a = build_parser().parse_args()
+def check_disk(a, scratch, keys, hdr):
+    """Stop now if the rest of the run cannot fit on disk: the recoloured copies of whole tiles and the
+    colours of slabs in the scratch folder, then the output. The output's size is estimated from the
+    input file's when both are compressed or both are not, and as uncompressed records otherwise."""
+    rs = hdr.point_format.size
+    sizes = [tile_size(scratch, k, hdr) for k in keys]
+    n = sum(sizes)
+    in_scratch = sum(m * rs if m <= a.slab_points else 3 * m for m in sizes)
+    if a.input.lower().endswith('.laz') == a.output.lower().endswith('.laz'):
+        out = os.path.getsize(a.input) * n / max(hdr.point_count, 1)
+    else:
+        out = hdr.offset_to_point_data + n * rs
+    out_dir = os.path.dirname(os.path.abspath(a.output))
+    needs = {scratch: in_scratch}
+    if os.stat(out_dir).st_dev == os.stat(scratch).st_dev:
+        needs[scratch] += out
+    else:
+        needs[out_dir] = out
+    for folder, need in needs.items():
+        free = shutil.disk_usage(folder).free
+        log(f'disk: the rest of the run needs about {need / 1e9:.1f} GB in {folder}; {free / 1e9:.1f} GB is free')
+        if need > free:
+            raise SystemExit(f'not enough disk space in {folder}: about {need / 1e9:.1f} GB more is needed, '
+                             f'{free / 1e9:.1f} GB is free')
 
+
+def same_file(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:             # b does not exist yet
+        return False
+
+
+def check_arguments(ap, a):
+    """Stop on values the run cannot use before the split, instead of during it or after it."""
+    for name in ('tile', 'slab_points', 'chunk', 'batch', 'k', 'patch', 'palette_k', 'roi_cell', 'workers'):
+        if not getattr(a, name) > 0:
+            ap.error(f'--{name.replace("_", "-")} must be more than 0')
+    for name in ('margin', 'fill_radius', 'fill_passes', 'palette_radius', 'jitter', 'texture', 'fit_tiles', 'fit_pairs'):
+        if not getattr(a, name) >= 0:
+            ap.error(f'--{name.replace("_", "-")} must be 0 or more')
+    if a.reuse_scratch and a.scratch is None:
+        ap.error('--reuse-scratch needs --scratch, the folder that holds the tiles')
+    if not os.path.isfile(a.input):
+        ap.error(f'{a.input} does not exist')
+    if same_file(a.input, a.output):
+        ap.error('the output would overwrite the input')
+    # The output is written last, so a folder that does not exist, or a file another program holds
+    # open, is found now
+    existed = os.path.exists(a.output)
+    try:
+        open(a.output, 'ab').close()
+    except OSError as e:
+        ap.error(f'cannot write {a.output}: {e}')
+    if not existed:
+        os.remove(a.output)
+
+
+def main():
+    ap = build_parser()
+    a = ap.parse_args()
+    check_arguments(ap, a)
     scratch = a.scratch or tempfile.mkdtemp(prefix='recolour_', dir=os.path.dirname(os.path.abspath(a.output)))
+    try:
+        recolour_scan(a, scratch)
+    finally:
+        if a.scratch is None:   # a folder the run made itself holds nothing a later run can use
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+def recolour_scan(a, scratch):
     os.makedirs(scratch, exist_ok=True)
     log(f'scratch {scratch}')
     t0 = time.time()
@@ -1356,8 +1432,9 @@ def main():
             os.remove(os.path.join(scratch, f))
     if a.reuse_scratch:
         fp = os.path.join(scratch, 'format.txt')
-        if not os.path.exists(fp) or open(fp).read() != SCRATCH_FORMAT:
-            raise SystemExit('--reuse-scratch: the scratch directory was written by an older version; run without it')
+        if not os.path.exists(fp) or open(fp).read() != SCRATCH_FORMAT + scratch_source(a):
+            raise SystemExit('--reuse-scratch: the scratch folder was made by an older version, from another input, '
+                             'or with another --tile, --margin or --crop (see its format.txt); run without it')
         log('reusing the tiles already in scratch')
     else:
         # The split appends to tile files, so files an earlier run left in
@@ -1371,6 +1448,7 @@ def main():
     keys = sorted(f[2:-4] for f in os.listdir(scratch) if f.startswith('t_') and f.endswith('.rec'))
     if not keys:
         raise SystemExit('no points to process (is --crop outside the scan?)')
+    check_disk(a, scratch, keys, hdr)
     # Each tile is one piece, and each slab of a dense tile is a piece of its own, so the slabs of
     # the densest tile are spread over the workers. The largest pieces start first, so no large
     # piece is left to run alone at the end.
@@ -1447,8 +1525,6 @@ def main():
                 f'{p["points"]} points, {100 * p["cover"]:.0f}% filled, {100 * p["dark"]:.0f}% dark, '
                 f'{100 * p["bright"]:.0f}% paper, intensity contrast {p["contrast"]:.2f}')
         log(f'{len(pages)} checkerboard pages left unchanged; centres in {pp}')
-    if a.scratch is None:
-        shutil.rmtree(scratch, ignore_errors=True)
     p = max(stats['points'], 1); b = max(stats['blown'], 1)
     log(f'done in {(time.time() - t0) / 60:.1f} min: {stats["points"]:,} points; '
         f'{100 * stats["blown"] / p:.2f}% blown, {100 * stats["greyed"] / p:.2f}% greyed. '
