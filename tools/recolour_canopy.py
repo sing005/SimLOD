@@ -70,7 +70,7 @@ Usage:
   python recolour_canopy.py IN.laz OUT.laz                      # whole scan
   python recolour_canopy.py IN.laz OUT.laz --crop 8 -4 12 0     # test patch (4 x 4 m)
   python recolour_canopy.py IN.laz OUT.laz --show classes       # structure classes as false colour
-  python recolour_canopy.py IN.laz OUT.laz --workers 4          # tiles in parallel (memory x4)
+  python recolour_canopy.py IN.laz OUT.laz --workers 4          # tiles and slabs in parallel (memory x4)
   python recolour_canopy.py IN.laz OUT.laz --texture 1          # restore the natural variation of colour
 """
 import argparse
@@ -1103,78 +1103,85 @@ def slab_plan(xr, hdr, a):
     return edges, sid
 
 
-def dense_slabs(own, halo, xr, edges, sid, hdr, key, a):
-    """The slabs of a dense tile, read from its maps. Yields, for each slab, its number, the
-    indices of its own points, its records (those points, then their context: the tile's other
-    points and the halo points within --margin of the slab) and its box. xr is the raw x of the own
-    points, held in memory so that finding the context does not read the whole tile from disk again
-    for every slab."""
+def slab_records(own, halo, xr, edges, sid, s, hdr, key, a):
+    """Slab s of a dense tile, read from its maps: the indices of its own points, its records
+    (those points, then their context: the tile's other points and the halo points within --margin
+    of the slab) and its box. xr is the raw x of the own points, held in memory so that finding the
+    context does not read the whole tile from disk again for every slab."""
     ix, iy = (int(v) for v in key.split('_'))
-    x_halo = xs(halo['X'], hdr)
     m = a.margin
+    x0, x1 = edges[s], edges[s + 1]
+    own_i = np.flatnonzero(sid == s)
+    ctx = []
+    for c0 in range(0, len(xr), CHUNK):
+        xc = xs(xr[c0:c0 + CHUNK], hdr)
+        ctx.append(c0 + np.flatnonzero((xc >= x0 - m) & (xc < x1 + m) & (sid[c0:c0 + CHUNK] != s)))
+    x_halo = xs(halo['X'], hdr)
+    near = np.flatnonzero((x_halo >= x0 - m) & (x_halo < x1 + m))
+    return (own_i, as_points(np.concatenate([own[own_i], own[np.concatenate(ctx)], halo[near]]), hdr),
+            (max(ix * a.tile, x0), iy * a.tile, min((ix + 1) * a.tile, x1), (iy + 1) * a.tile))
+
+
+def dense_slabs(own, halo, xr, edges, sid, hdr, key, a):
+    """Each slab of a dense tile in turn: its number, then what slab_records returns."""
     for s in range(len(edges) - 1):
-        x0, x1 = edges[s], edges[s + 1]
-        own_i = np.flatnonzero(sid == s)
-        ctx = []
-        for c0 in range(0, len(xr), CHUNK):
-            xc = xs(xr[c0:c0 + CHUNK], hdr)
-            ctx.append(c0 + np.flatnonzero((xc >= x0 - m) & (xc < x1 + m) & (sid[c0:c0 + CHUNK] != s)))
-        near = np.flatnonzero((x_halo >= x0 - m) & (x_halo < x1 + m))
-        yield (s, own_i, as_points(np.concatenate([own[own_i], own[np.concatenate(ctx)], halo[near]]), hdr),
-               (max(ix * a.tile, x0), iy * a.tile, min((ix + 1) * a.tile, x1), (iy + 1) * a.tile))
+        yield (s,) + slab_records(own, halo, xr, edges, sid, s, hdr, key, a)
 
 
-def recolour_dense(scratch, key, hdr, scale16, model, gpal, tex, a):
-    """Recolour a tile with more own points than --slab-points, one slab at a time, and write
-    o_<key>.rec. The records are read through memory maps and the new colours written into a
-    mapped copy of the tile, so a worker holds one slab in memory, however dense the tile.
-    Returns stats and pages."""
+def recolour_slab(scratch, key, s, hdr, scale16, model, gpal, tex, a):
+    """Recolour slab s of a tile with more own points than --slab-points. The records are read
+    through memory maps, so a worker holds one slab and its context, however dense the tile. The
+    new 8-bit colours of the slab's own points, in the order of their indices, go to
+    c_<key>_<s>.npy (3 bytes a point; nothing when no colour changed), and the final write applies
+    them to the tile's records. Returns stats, pages and whether any colour changed."""
     own, halo = tile_maps(scratch, key, hdr)
     xr = np.array(own['X'])   # 4 bytes a point
     edges, sid = slab_plan(xr, hdr, a)
-    op = os.path.join(scratch, f'o_{key}.rec')
-    shutil.copyfile(os.path.join(scratch, f't_{key}.rec'), op)
-    out = np.memmap(op, dtype=own.dtype, mode='r+')
+    own_i, sub, box = slab_records(own, halo, xr, edges, sid, s, hdr, key, a)
+    del own, halo, xr, sid
+    r, st, pages = recolour_tile(sub, len(own_i), scale16, model, gpal, a, own_box=box, tex=tex)
+    if r is not None:
+        np.save(os.path.join(scratch, f'c_{key}_{s}.npy'), r.astype(np.uint8))
+    return st, pages, r is not None
+
+
+def dense_tile_records(scratch, key, hdr, changed, scale16, a):
+    """A dense tile's records with the new colours of its slabs applied; changed[s] says whether
+    slab s has any. With 16-bit colour, once any slab is recoloured, the colours of the untouched
+    slabs are written at 8-bit precision too, as in a tile recoloured whole."""
+    own, _ = tile_maps(scratch, key, hdr)
+    _, sid = slab_plan(np.array(own['X']), hdr, a)
+    del own
+    data = np.fromfile(os.path.join(scratch, f't_{key}.rec'), dtype=hdr.point_format.dtype())
     mul = 257 if scale16 else 1
-    st = dict.fromkeys(STAT_KEYS, 0); pages = []; untouched = []
-    for s, own_i, sub, box in dense_slabs(own, halo, xr, edges, sid, hdr, key, a):
-        r, s_st, p = recolour_tile(sub, len(own_i), scale16, model, gpal, a, own_box=box, tex=tex)
-        del sub
-        for k in STAT_KEYS: st[k] += s_st[k]
-        pages.extend(p)
-        if r is None:
-            untouched.append(s)
-            continue
-        for c, name in enumerate(('red', 'green', 'blue')):
-            out[name][own_i] = (r[:, c] * mul).astype(out.dtype[name])
-    if scale16 and len(untouched) < len(edges) - 1:
-        # as for a tile recoloured in one piece: once any of its points is recoloured, every
-        # colour in the tile is written at 8-bit precision
-        for s in untouched:
-            own_i = np.flatnonzero(sid == s)
+    for s, ch in enumerate(changed):
+        own_i = np.flatnonzero(sid == s)
+        if ch:
+            cp = os.path.join(scratch, f'c_{key}_{s}.npy')
+            cols = np.load(cp)
+            for c, name in enumerate(('red', 'green', 'blue')):
+                data[name][own_i] = (cols[:, c].astype(np.int32) * mul).astype(data.dtype[name])
+            os.remove(cp)
+        elif scale16 and any(changed):
             for name in ('red', 'green', 'blue'):
-                out[name][own_i] = ((out[name][own_i].astype(np.int32) >> 8) * mul).astype(out.dtype[name])
-    out.flush()
-    del out   # unmapped before the main process reads and deletes the file (Windows will not delete a mapped file)
-    return st, pages
+                data[name][own_i] = ((data[name][own_i].astype(np.int32) >> 8) * mul).astype(data.dtype[name])
+    return data
 
 
-def worker_memory(scratch, key, hdr, a, step=9973):
-    """The most points a worker holds at once for this tile, and the memory that needs in GB. A
-    tile is held whole with its halo; a dense tile one slab at a time, with that slab's context,
-    estimated from every step-th record (records 340 kB apart, so only part of the file is read).
-    Near the scanner a slab is narrow and its context can hold more points than the slab."""
+def tile_pieces(scratch, key, hdr, a, step=9973):
+    """The pieces a tile is recoloured in, each as (points a worker holds for it, slab number): the
+    tile whole with its halo (slab number None), or each slab of a dense tile with that slab's
+    context, estimated from every step-th record (records 340 kB apart, so only part of the file is
+    read). Near the scanner a slab is narrow and its context can hold more points than the slab."""
     own, halo = tile_maps(scratch, key, hdr)
     if len(own) <= a.slab_points:
-        held = len(own) + len(halo)
-        return held, GB_BASE + GB_PER_M * held / 1e6
+        return [(len(own) + len(halo), None)]
     xo = xs(own['X'][::step], hdr); xh = xs(halo['X'][::step], hdr)
     n = int(np.ceil(len(own) / a.slab_points))
     e = np.quantile(xo, np.linspace(0, 1, n + 1)); e[0] = -np.inf; e[-1] = np.inf
     m = a.margin
-    held = step * max(int(((xo >= x0 - m) & (xo < x1 + m)).sum() + ((xh >= x0 - m) & (xh < x1 + m)).sum())
-                      for x0, x1 in zip(e[:-1], e[1:]))
-    return held, GB_BASE + GB_PER_M * held / 1e6 + 5 * len(own) / 1e9   # + the tile's raw x and slab numbers
+    return [(step * int(((xo >= x0 - m) & (xo < x1 + m)).sum() + ((xh >= x0 - m) & (xh < x1 + m)).sum()), s)
+            for s, (x0, x1) in enumerate(zip(e[:-1], e[1:]))]
 
 
 def fit_texture_from_tiles(scratch, keys, hdr, scale16, model, gpal, a):
@@ -1237,14 +1244,17 @@ def fit_texture_from_tiles(scratch, keys, hdr, scale16, model, gpal, a):
     return tex
 
 
-def process_tile(job):
-    """Recolour one tile and write its records to o_<key>.rec. Runs in a worker process when --workers > 1."""
-    scratch, key, a, scale16, model, gpal, tex = job
+def process_piece(job):
+    """Recolour a tile whole (slab None), writing its own records to o_<key>.rec, or one slab of a
+    dense tile (see recolour_slab). Pieces read only the t_ and h_ files, so they can run in any
+    order, the slabs of one tile in several workers at once. Runs in a worker process when
+    --workers > 1."""
+    scratch, key, slab, a, scale16, model, gpal, tex = job
     with laspy.open(a.input) as rd:
         hdr = rd.header
-    if tile_size(scratch, key, hdr) > a.slab_points:
-        st, pages = recolour_dense(scratch, key, hdr, scale16, model, gpal, tex, a)
-        return key, st, pages
+    if slab is not None:
+        st, pages, changed = recolour_slab(scratch, key, slab, hdr, scale16, model, gpal, tex, a)
+        return key, slab, st, pages, changed
     pts, n_own = load_tile(scratch, key, hdr)
     res, st, pages = recolour_whole(pts, n_own, key, scale16, model, gpal, tex, a)
     own = pts[:n_own]
@@ -1253,7 +1263,7 @@ def process_tile(job):
         dt = np.asarray(own.red).dtype
         own.red = (res[:, 0] * mul).astype(dt); own.green = (res[:, 1] * mul).astype(dt); own.blue = (res[:, 2] * mul).astype(dt)
     own.array.tofile(os.path.join(scratch, f'o_{key}.rec'))
-    return key, st, pages
+    return key, slab, st, pages, res is not None
 
 
 def write_pages_csv(path, pages):
@@ -1315,7 +1325,8 @@ def build_parser():
                    help='write false colour instead: classes = trunk/branch orange, leaf green; '
                         'paths = repaired yellow, borrowed cyan, palette red. Pages magenta, untouched points dim grey')
     g.add_argument('--workers', type=int, default=1,
-                   help='tiles processed in parallel (default 1); each needs the memory the log reports after the split')
+                   help='tiles, and slabs of dense tiles, processed in parallel (default 1); each needs the memory '
+                        'the log reports after the split')
     g.add_argument('--slab-points', type=int, default=12_000_000,
                    help='a tile with more own points than this is read from disk in slabs of at most this many own '
                         'points, each held with the points within --margin of it (default 12 M)')
@@ -1340,6 +1351,9 @@ def main():
     scale16 = max(int(np.max(sample.red)), int(np.max(sample.green)), int(np.max(sample.blue))) > 255
     log(f'colour is {"16" if scale16 else "8"}-bit')
 
+    for f in os.listdir(scratch):   # pieces' output an earlier run left
+        if (f[:2] == 'o_' and f.endswith('.rec')) or (f[:2] == 'c_' and f.endswith('.npy')):
+            os.remove(os.path.join(scratch, f))
     if a.reuse_scratch:
         fp = os.path.join(scratch, 'format.txt')
         if not os.path.exists(fp) or open(fp).read() != SCRATCH_FORMAT:
@@ -1357,35 +1371,50 @@ def main():
     keys = sorted(f[2:-4] for f in os.listdir(scratch) if f.startswith('t_') and f.endswith('.rec'))
     if not keys:
         raise SystemExit('no points to process (is --crop outside the scan?)')
-    by_size = sorted(keys, key=lambda k: tile_size(scratch, k, hdr), reverse=True)
-    held, gb = max((worker_memory(scratch, k, hdr, a) for k in by_size[:3]), key=lambda t: t[1])
-    log(f'{len(keys)} tile{"s" if len(keys) > 1 else ""}; the largest holds {tile_size(scratch, by_size[0], hdr) / 1e6:.1f} M points. A worker holds '
+    # Each tile is one piece, and each slab of a dense tile is a piece of its own, so the slabs of
+    # the densest tile are spread over the workers. The largest pieces start first, so no large
+    # piece is left to run alone at the end.
+    pieces = sorted(((held, key, slab) for key in keys for held, slab in tile_pieces(scratch, key, hdr, a)),
+                    key=lambda p: -p[0])
+    held = pieces[0][0]; gb = GB_BASE + GB_PER_M * held / 1e6
+    largest = max(tile_size(scratch, k, hdr) for k in keys)
+    log(f'{len(keys)} tile{"s" if len(keys) > 1 else ""}'
+        + (f', processed in {len(pieces)} pieces' if len(pieces) > len(keys) else '')
+        + f'; the largest holds {largest / 1e6:.1f} M points. A worker holds '
         f'up to about {held / 1e6:.1f} M points at once, about {gb:.1f} GB'
         + (f'; {a.workers} workers up to about {a.workers * gb:.0f} GB' if a.workers > 1 else ''))
     model, gpal = fit_from_tiles(scratch, keys, hdr, scale16, a)
     tex = fit_texture_from_tiles(scratch, keys, hdr, scale16, model, gpal, a) if a.texture > 0 and not a.show else None
 
     stats = dict.fromkeys(STAT_KEYS, 0)
-    pages = []
-    jobs = [(scratch, key, a, scale16, model, gpal, tex) for key in keys]
+    jobs = [(scratch, key, slab, a, scale16, model, gpal, tex) for _, key, slab in pieces]
+    results = {}    # (key, slab, or -1 for a whole tile) -> (pages, whether any colour changed)
 
-    def done(i, key, st, pg):
+    def done(i, key, slab, st, pg, changed):
+        results[(key, -1 if slab is None else slab)] = (pg, changed)
         for k in STAT_KEYS: stats[k] += st[k]
-        pages.extend(pg)
-        if i % 10 == 0 or i == len(keys) - 1:
-            log(f'tile {i + 1}/{len(keys)}: {stats["points"] / 1e6:.1f} M points, {stats["blown"] / 1e6:.2f} M blown, '
+        if i % 10 == 0 or i == len(jobs) - 1:
+            log(f'piece {i + 1}/{len(jobs)}: {stats["points"] / 1e6:.1f} M points, {stats["blown"] / 1e6:.2f} M blown, '
                 f'{stats["greyed"] / 1e6:.2f} M greyed; {stats["repaired"] / 1e6:.2f} M repaired, '
                 f'{stats["borrowed"] / 1e6:.2f} M borrowed, {stats["palette"] / 1e6:.2f} M palette')
 
     if a.workers > 1:
         ctx = multiprocessing.get_context('spawn')
         with concurrent.futures.ProcessPoolExecutor(max_workers=a.workers, mp_context=ctx) as ex:
-            for i, (key, st, pg) in enumerate(ex.map(process_tile, jobs)):
-                done(i, key, st, pg)
+            futures = [ex.submit(process_piece, job) for job in jobs]   # started in this order
+            try:
+                for i, f in enumerate(concurrent.futures.as_completed(futures)):
+                    done(i, *f.result())
+            except BaseException:
+                for f in futures:
+                    f.cancel()
+                raise
     else:
         for i, job in enumerate(jobs):
-            key, st, pg = process_tile(job)
-            done(i, key, st, pg)
+            done(i, *process_piece(job))
+
+    # pages in tile order, then slab order, whichever piece finished first
+    pages = [p for k in sorted(results) for p in results[k][0]]
 
     # The input's header as it is (global encoding, GUID, system identifier,
     # software, date, VLRs); a new one lost those and wrote the Extra Bytes
@@ -1394,9 +1423,13 @@ def main():
     dtype = hdr.point_format.dtype()
     with laspy.open(a.output, mode='w', header=out_hdr) as wr:
         for key in keys:
-            data = np.fromfile(os.path.join(scratch, f'o_{key}.rec'), dtype=dtype)
+            if (key, -1) in results:
+                data = np.fromfile(os.path.join(scratch, f'o_{key}.rec'), dtype=dtype)
+                os.remove(os.path.join(scratch, f'o_{key}.rec'))
+            else:
+                changed = [results[(key, s)][1] for s in range(sum(k == key for k, _ in results))]
+                data = dense_tile_records(scratch, key, hdr, changed, scale16, a)
             wr.write_points(laspy.ScaleAwarePointRecord(data, hdr.point_format, hdr.scales, hdr.offsets))
-            os.remove(os.path.join(scratch, f'o_{key}.rec'))
         if hdr.evlrs:       # LAS 1.4 extended VLRs; the writer does not copy them
             wr.write_evlrs(hdr.evlrs)
         # the input's bounds, not the recoloured points' own: SimLOD places its
