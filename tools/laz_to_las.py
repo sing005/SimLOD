@@ -93,7 +93,15 @@ def main():
     parser.add_argument("files", nargs="+", help=".laz files to convert")
     parser.add_argument("--out", help="output directory (default: next to each input)")
     args = parser.parse_args()
-    results = [convert(f, args.out) for f in args.files]   # every file, even after one is skipped
+    if args.out:
+        os.makedirs(args.out, exist_ok=True)
+    results = []
+    for f in args.files:        # every file, even after one is skipped or fails
+        try:
+            results.append(convert(f, args.out))
+        except Exception as e:  # a missing, damaged or cut-short file
+            print(f"{os.path.basename(f)}: failed: {e}")
+            results.append(False)
     sys.exit(0 if all(results) else 1)
 
 
