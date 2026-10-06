@@ -453,7 +453,8 @@ def wood_probability(xyz, sp, a):
         return np.zeros(len(xyz))
     _, nz, _, nbr, dst = eig_knn(cen, 10)
     q = segment_probability(cen, nz, nbr, dst, a)
-    _, nb16 = cKDTree(cen).query(cen, k=min(16, len(cen)), workers=-1)
+    del nbr, dst, nz, _
+    nb16 = cKDTree(cen).query(cen, k=min(16, len(cen)), workers=-1)[1]
     if a.thin_lines:
         q = np.maximum(q, thin_lines(cen, np.bincount(inv, minlength=len(cen)).astype(np.float64), nb16, sp, a))
     for _ in range(2):          # average over neighbours, so labels come in pieces
@@ -797,6 +798,7 @@ def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None, tex=None):
     X = np.asarray(pts.x); Y = np.asarray(pts.y); Z = np.asarray(pts.z)
     origin = np.array([X.min(), Y.min(), Z.min()])
     xyz = (np.stack([X, Y, Z], 1) - origin).astype(np.float32)   # float32 relative to the tile corner
+    del X, Y, Z
     rgb = np.stack([np.asarray(pts.red), np.asarray(pts.green), np.asarray(pts.blue)], 1).astype(np.int32)
     if scale16:
         rgb >>= 8
@@ -824,7 +826,7 @@ def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None, tex=None):
         return None, st, pages
 
     lab = srgb_to_lab(rgb)
-    new = lab.copy()
+    new = lab          # lab[pi] is read before new[pi] is written; nothing reads lab afterwards
     path = np.zeros(n, np.uint8)          # 0 untouched, 1 repaired, 2 borrowed, 3 palette
 
     # 3. greyed points: regression from their own colour, averaged with nearby well-exposed colour
@@ -841,6 +843,10 @@ def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None, tex=None):
         ww = correction_share(w[pi])[:, None]
         new[pi] = (1 - ww) * lab[pi] + ww * comb
         path[pi] = 1
+        del pi, reg, comb, ww
+        if trusted.sum() >= 3:
+            del ti, bo, okb, dn, wr, wb
+    del lab
 
     # 4-6. blown points
     cls = np.full(n, -1, np.int8)         # -1 not classified, 0 leaf (less linear cluster), 1 line (trunk or branch)
@@ -882,7 +888,7 @@ def recolour_tile(pts, n_own, scale16, model, gpal, a, own_box=None, tex=None):
     if tex is not None and a.texture > 0 and not a.show:
         ti = np.flatnonzero(path > 0)
         if len(ti):
-            noise = (texture_noise(np.stack([X[ti], Y[ti], Z[ti]], 1), tex)
+            noise = (texture_noise(np.stack([np.asarray(pts.x)[ti], np.asarray(pts.y)[ti], np.asarray(pts.z)[ti]], 1), tex)
                      * (np.sqrt(a.texture) * correction_share(w[ti]))[:, None]).astype(np.float32)
             base = new[ti].copy()
             _, _, w_base, _ = colour_state(np.clip(np.rint(lab_to_srgb(base)), 0, 255).astype(np.int32), a)
