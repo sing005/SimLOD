@@ -2416,15 +2416,43 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 
 		grid.sync();
 
-		// draw point cloud cube
-		// if(uniforms.showBoundingBox)
-		// if(grid.thread_rank() == 0)
-		// {
-		// 	float3 size = {cubeSize, cubeSize, cubeSize};
-		// 	drawBoundingBox(lines, cubePosition, size, 0x000000ff);
-		// }
-
-		grid.sync();
+		// ---- pick -----------------------------------------------------------
+		// After the scan is drawn but before anything else (bounding boxes and
+		// the frustum, the voxel-grid view, event markers), so a pick always
+		// lands on the scan: read the depth under the requested pixel, turn it
+		// back into a world position, hand it to the host via Stats. Each
+		// request id is answered exactly once and the answer is left in place,
+		// so the host cannot miss it however far its asynchronous Stats copy
+		// lags behind. It came after the bounding boxes and the frustum, so
+		// with those shown a pick could land on one of their lines.
+		if(grid.thread_rank() == 0 && uniforms.pickSeq != stats->pickSeqDone){
+			int valid = 0;
+			// Reject the background explicitly. The clear writes 0x7f800000, which
+			// is +infinity; comparing a float against 1.0e30 relies on that bit
+			// pattern decoding cleanly, and a NaN would pass every comparison.
+			// Test the bits.
+			if(uniforms.pickX >= 0 && uniforms.pickY >= 0
+			   && uniforms.pickX < int(uniforms.width) && uniforms.pickY < int(uniforms.height)){
+				uint64_t fbv = framebuffer[uniforms.pickX + int(uniforms.width) * uniforms.pickY];
+				uint32_t dbits = uint32_t(fbv >> 32);
+				float depth = *((float*)&dbits);
+				float3 rd;
+				bool hitGeometry = (dbits != 0x7f800000u)          // not the cleared background
+								&& ((dbits & 0x7f800000u) != 0x7f800000u)   // not inf or NaN
+								&& depth > 0.0f && depth < 1.0e6f;
+				if(hitGeometry && pixelRayDir(float(uniforms.pickX) + 0.5f, float(uniforms.pickY) + 0.5f, rd)){
+					float dist = depthToDistance(depth, rd);
+					stats->pickWX = uniforms.camPos.x + rd.x * dist;
+					stats->pickWY = uniforms.camPos.y + rd.y * dist;
+					stats->pickWZ = uniforms.camPos.z + rd.z * dist;
+					valid = 1;
+				}
+			}
+			stats->pickValid = valid;
+			__threadfence();
+			stats->pickSeqDone = uniforms.pickSeq;   // written last
+		}
+		grid.sync();   // nothing may draw over the pixel while thread 0 reads it
 
 		if(uniforms.showBoundingBox)
 		if(grid.thread_rank() == 0)
@@ -2487,43 +2515,6 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 
 	// if(false)
 	if(grid.thread_rank() == 0) stats->stageNs[1] = nanotime() - tStart;   // apply_stage_timers.ps1
-
-	// ---- pick (apply_navigate.ps1) ----------------------------------------
-	// After the scan is drawn but before debug geometry (voxel-grid view,
-	// event markers), so a pick always lands on the scan: read the depth
-	// under the requested pixel, turn it back into a world position, hand it
-	// to the host via Stats. Each request id is answered exactly once and the
-	// answer is left in place, so the host cannot miss it however far its
-	// asynchronous Stats copy lags behind.
-	grid.sync();
-	if(grid.thread_rank() == 0 && uniforms.pickSeq != stats->pickSeqDone){
-		int valid = 0;
-		// Reject the background explicitly. The clear writes 0x7f800000, which
-		// is +infinity; comparing a float against 1.0e30 relies on that bit
-		// pattern decoding cleanly, and a NaN would pass every comparison.
-		// Test the bits.
-		if(uniforms.pickX >= 0 && uniforms.pickY >= 0
-		   && uniforms.pickX < int(uniforms.width) && uniforms.pickY < int(uniforms.height)){
-			uint64_t fbv = framebuffer[uniforms.pickX + int(uniforms.width) * uniforms.pickY];
-			uint32_t dbits = uint32_t(fbv >> 32);
-			float depth = *((float*)&dbits);
-			float3 rd;
-			bool hitGeometry = (dbits != 0x7f800000u)          // not the cleared background
-							&& ((dbits & 0x7f800000u) != 0x7f800000u)   // not inf or NaN
-							&& depth > 0.0f && depth < 1.0e6f;
-			if(hitGeometry && pixelRayDir(float(uniforms.pickX) + 0.5f, float(uniforms.pickY) + 0.5f, rd)){
-				float dist = depthToDistance(depth, rd);
-				stats->pickWX = uniforms.camPos.x + rd.x * dist;
-				stats->pickWY = uniforms.camPos.y + rd.y * dist;
-				stats->pickWZ = uniforms.camPos.z + rd.z * dist;
-				valid = 1;
-			}
-		}
-		stats->pickValid = valid;
-		__threadfence();
-		stats->pickSeqDone = uniforms.pickSeq;   // written last
-	}
-	grid.sync();   // nothing may draw over the pixel while thread 0 reads it
 
 	// ---- voxel grid debug view (apply_voxel_grid.ps1) ------------------
 	// Draws the centre of every occupied cell, coloured by count: blue for
