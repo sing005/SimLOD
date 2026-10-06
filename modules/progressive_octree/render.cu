@@ -786,28 +786,25 @@ inline float pxPerMetreAt(float depth){
 	return ((0.5f * uniforms.height) / halfFov) / d;
 }
 
-inline void drawMarkerBall(float px, float py, float pz, uint64_t* framebuffer){
+// One pixel (ox, oy) of a marker ball's square of side 2 MARKER_MAX_R + 1.
+// Drawn one item a pixel (kernel_render), so a ball near the camera no longer
+// keeps one thread looping over 16,641 pixels while the rest wait.
+constexpr int MARKER_MAX_R = 64;
+inline void drawMarkerBallPixel(float px, float py, float pz, int ox, int oy, uint64_t* framebuffer){
 	int x, y; float depth;
 	if(!projectPoint(px, py, pz, x, y, depth)) return;
 	if(depth < uniforms.nearClip) return;
-	float pxPerMetre = pxPerMetreAt(depth);
-	int R = int(0.5f * uniforms.markerScale * pxPerMetre + 0.5f);
+	int R = int(0.5f * uniforms.markerScale * pxPerMetreAt(depth) + 0.5f);
 	if(R < 3)  R = 3;
-	if(R > 64) R = 64;
+	if(R > MARKER_MAX_R) R = MARKER_MAX_R;
+	if(ox*ox + oy*oy > R*R) return;
+	int qx = x + ox, qy = y + oy;
+	if(qx < 0 || qx >= int(uniforms.width) || qy < 0 || qy >= int(uniforms.height)) return;
 	float dz = depth * 0.999f;
 	uint64_t udz = *((uint32_t*)&dz);
 	uint64_t encoded = (udz << 32) | 0x00ff00ffull;   // aabbggrr: magenta
-	for(int oy = -R; oy <= R; oy++){
-		int qy = y + oy;
-		if(qy < 0 || qy >= int(uniforms.height)) continue;
-		for(int ox = -R; ox <= R; ox++){
-			if(ox*ox + oy*oy > R*R) continue;
-			int qx = x + ox;
-			if(qx < 0 || qx >= int(uniforms.width)) continue;
-			uint32_t pixelID = qx + int(uniforms.width) * qy;
-			if(encoded < framebuffer[pixelID]) atomicMin(&framebuffer[pixelID], encoded);
-		}
-	}
+	uint32_t pixelID = qx + int(uniforms.width) * qy;
+	if(encoded < framebuffer[pixelID]) atomicMin(&framebuffer[pixelID], encoded);
 }
 
 // ---- world-space point size and sphere shading (apply_look.ps1) ---------
@@ -862,6 +859,41 @@ inline float splatShade(int ox, int oy, int R, float half){
 	return (1.0f - uniforms.pointShading) + uniforms.pointShading * lit;
 }
 
+// The pixels of an R x R splat centred on (x, y), row by row, as f(ox, oy,
+// pixelID) with ox and oy from 0 to R - 1 (the offsets splatShade takes).
+// a = 2 ox - (R - 1) and b = 2 oy - (R - 1) are offsets in half pixels, so the
+// round test (ox - half)^2 + (oy - half)^2 <= (R/2)^2 is a^2 + b^2 <= R^2, and
+// each row keeps |a| <= floor(sqrt(R^2 - b^2)) of the parity of R - 1. This
+// visits exactly the pixels the column-by-column loop with the test inside
+// visited, for every R from 1 to 64 (tested), with the test once a row.
+// Pixels off the frame are skipped rather than moved onto its edge.
+template<typename F>
+inline void forEachSplatPixel(int x, int y, int R, F&& f){
+	int W = int(uniforms.width), H = int(uniforms.height);
+	bool clip = uniforms.roundSplats && R > 2;
+	for(int oy = 0; oy < R; oy++){
+		int b  = 2 * oy - (R - 1);
+		int py = y + (b >> 1);
+		if(py < 0 || py >= H) continue;
+		int amax = R - 1;
+		if(clip){
+			int m = R * R - b * b;
+			int r = int(sqrtf(float(m)));
+			if((r + 1) * (r + 1) <= m) r++;
+			if(r * r > m) r--;
+			if(((r ^ (R - 1)) & 1) != 0) r--;
+			if(r < 0) continue;
+			amax = r;
+		}
+		int row = W * py;
+		for(int a = -amax; a <= amax; a += 2){
+			int px = x + (a >> 1);
+			if(px < 0 || px >= W) continue;
+			f((a + R - 1) >> 1, oy, uint32_t(px + row));
+		}
+	}
+}
+
 inline uint32_t shadeColour(uint32_t c, float s){
 	if(s >= 0.999f) return c;
 	uint32_t r = uint32_t(fminf(float((c      ) & 0xff) * s, 255.0f));
@@ -881,8 +913,13 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 	if(!projectPoint(point.x, point.y, point.z, x, y, depth)) return;   // apply_fisheye.ps1
 	if(depth < uniforms.nearClip) return;
 
-	if(x > 1 && x < uniforms.width  - 2.0f)   // 2.0f: a double literal made this a double-precision test per point
-	if(y > 1 && y < uniforms.height - 2.0f)
+	// Drawn when its splat can reach the frame; forEachSplatPixel skips the
+	// pixels off it. The test used to want the centre 2 px inside, which left
+	// a border up to 2 px wide that small splats never reached, and moved the
+	// off-frame pixels of larger splats onto the edge.
+	int R = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
+	if(x > -R && x < int(uniforms.width)  + R)
+	if(y > -R && y < int(uniforms.height) + R)
 	{
 		// stray-point culling (apply_stray_cull.ps1). Up to seven grid reads,
 		// so it runs only for points that land on screen; projection is
@@ -921,44 +958,28 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 		bool emitting = (emR + emG + emB) > 0.0001f;
 		if(emitting) countUp(&_numEmitting);   // debug
 
-		// Centred, optionally circular splat. The original loop offset only
-		// in +x/+y, so the splat sat below-right of the point. Clamp to
-		// width-1/height-1 also closes a latent one-past-the-end write.
-		int   R    = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
+		// Centred, optionally round splat, visited row by row
+		// (forEachSplatPixel).
 		float half = float(R - 1) * 0.5f;
-		float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
-
-		for(int ox = 0; ox < R; ox++)
-		for(int oy = 0; oy < R; oy++)
-		{
-			if(uniforms.roundSplats && R > 2){
-				float ddx = float(ox) - half;
-				float ddy = float(oy) - half;
-				if(ddx * ddx + ddy * ddy > rad2) continue;
-			}
-
-			uint32_t px = clamp(int(x + ox - half), 0, int(uniforms.width)  - 1);
-			uint32_t py = clamp(int(y + oy - half), 0, int(uniforms.height) - 1);
-
-			uint32_t pixelID = px + int(uniforms.width) * py;
-
+		float* em = emitting ? _emission : nullptr;   // read once a point
+		uint64_t udepth = *((uint32_t*)&depth);
+		forEachSplatPixel(x, y, R, [&](int ox, int oy, uint32_t pixelID){
 			// Additive, and deliberately outside the depth test: overlapping
 			// excited points sum, which atomicMin cannot do. A point behind a
 			// trunk still glows through it - move this inside the depth test
 			// below to occlude instead.
-			if(emitting && _emission != nullptr){
-				atomicAdd(&_emission[3 * pixelID + 0], emR);
-				atomicAdd(&_emission[3 * pixelID + 1], emG);
-				atomicAdd(&_emission[3 * pixelID + 2], emB);
+			if(em != nullptr){
+				atomicAdd(&em[3 * pixelID + 0], emR);
+				atomicAdd(&em[3 * pixelID + 1], emG);
+				atomicAdd(&em[3 * pixelID + 2], emB);
 			}
-			uint64_t udepth = *((uint32_t*)&depth);
 			uint32_t shaded = shadeColour(color, splatShade(ox, oy, R, half));   // apply_look.ps1
 			uint64_t encoded = (udepth << 32) | shaded;
 
 			if(encoded < framebuffer[pixelID]){
 				atomicMin(&framebuffer[pixelID], encoded);
 			}
-		}
+		});
 
 	}
 }
@@ -975,13 +996,18 @@ inline bool lodKeep(const Node* node, int index){
 	return node->lodRole == 1 ? (u >= node->lodBlend) : (u < node->lodBlend);
 }
 
-// Point density as a loop stride: keep every step-th point.
-inline int densityStep(){
-	if(uniforms.pointDensity >= 0.999f) return 1;
+// Point density as a fractional loop stride: the k-th kept point is
+// floor(k / d), with 1/d in 16.16 fixed point, so a node keeps the fraction d
+// of its points whatever d is. An integer stride, 1/round(1/d), kept all of
+// them for any d above two thirds and half of them from 0.4 to two thirds.
+// Deterministic, so the same points are kept from frame to frame, and the
+// depth and colour passes keep the same ones.
+inline uint32_t densityStepFx(){
+	if(uniforms.pointDensity >= 0.999f) return 65536u;
 	float d = uniforms.pointDensity < 0.0005f ? 0.0005f : uniforms.pointDensity;
-	int step = int(1.0f / d + 0.5f);
-	return step < 1 ? 1 : step;
+	return uint32_t(65536.0f / d + 0.5f);
 }
+inline int keptIndex(int k, uint32_t stepFx){ return int((uint64_t(k) * stepFx) >> 16); }
 
 // ---- shared point test for the high-quality (HQS) passes ------------------
 // The depth pass and the colour pass must agree exactly on which points exist,
@@ -994,8 +1020,9 @@ inline bool hqsAcceptPoint(const Point& point, Node* node, float minWorldSize,
                            int& x, int& y, float& depth, int& R, uint32_t& color){
 	if(!projectPoint(point.x, point.y, point.z, x, y, depth)) return false;   // apply_fisheye.ps1
 	if(!(depth > 0.0f) || depth < uniforms.nearClip) return false;
-	if(!(x > 1 && x < uniforms.width  - 2.0f)) return false;   // as drawPoint: single precision
-	if(!(y > 1 && y < uniforms.height - 2.0f)) return false;
+	R = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
+	if(!(x > -R && x < int(uniforms.width)  + R)) return false;   // as drawPoint: the splat can reach the frame
+	if(!(y > -R && y < int(uniforms.height) + R)) return false;
 
 	// stray-point culling, after the cheaper on-screen test (apply_stray_cull.ps1)
 	bool stray = isStrayPoint(point.x, point.y, point.z);
@@ -1012,7 +1039,6 @@ inline bool hqsAcceptPoint(const Point& point, Node* node, float minWorldSize,
 		color = (node->getID() % 127) * 123456789;
 	}
 
-	R = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
 	return true;
 }
 
@@ -1034,13 +1060,11 @@ void drawNode(Chunk* chunk, Node* node, uint32_t numElements, uint64_t* framebuf
 	// walk, no 16-byte load, no hash. The traversal shrinks by the same factor
 	// as the density. Deterministic, so the same points are kept frame to
 	// frame, as with the hash.
-	int step = densityStep();
+	uint32_t stepFx = densityStepFx();
 
-	for(
-		int pointIndex = block.thread_rank() * step; 
-		pointIndex < numElements; 
-		pointIndex += block.num_threads() * step
-	){
+	for(int k = block.thread_rank(); ; k += block.num_threads()){
+		int pointIndex = keptIndex(k, stepFx);
+		if(pointIndex >= int(numElements)) break;
 		int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
 		// while, not if: with a stride the target can jump several chunks at
@@ -1234,7 +1258,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 
 	// density as a loop stride, as in drawNode: skipped points are never read,
 	// and both passes step identically so they keep the same points
-	int hqsStep = densityStep();
+	uint32_t hqsStepFx = densityStepFx();
 
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
@@ -1292,7 +1316,9 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 			Chunk* chunk = node->points;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numPoints; pointIndex += block.num_threads() * hqsStep){
+			for(int k = block.thread_rank(); ; k += block.num_threads()){
+				int pointIndex = keptIndex(k, hqsStepFx);
+				if(pointIndex >= int(node->numPoints)) break;
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
@@ -1308,30 +1334,15 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 				int x, y, R; float depth; uint32_t color;
 				if(!hqsAcceptPoint(point, node, 0.0f, x, y, depth, R, color)) continue;
 				{
-					// HQS depth pass, brought into line with drawPoint by
-					// apply_test_source.ps1: centred, optionally round, and
-					// clamped to width-1/height-1. Must match the colour pass
-					// below exactly or the depth test and the colour disagree.
-					float half = float(R - 1) * 0.5f;
-					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
-					for(int ox = 0; ox < R; ox++)
-					for(int oy = 0; oy < R; oy++)
-					{
-						if(uniforms.roundSplats && R > 2){
-							float ddx = float(ox) - half;
-							float ddy = float(oy) - half;
-							if(ddx * ddx + ddy * ddy > rad2) continue;
-						}
-						uint32_t px = clamp(int(x + ox - half), 0, int(uniforms.width)  - 1);
-						uint32_t py = clamp(int(y + oy - half), 0, int(uniforms.height) - 1);
-
-						uint32_t pixelID = px + int(uniforms.width) * py;
-						uint32_t udepth = *((uint32_t*)&depth);
-
+					// HQS depth pass: the same pixels as the colour pass
+					// below (forEachSplatPixel), or the depth test and the
+					// colour disagree.
+					uint32_t udepth = *((uint32_t*)&depth);
+					forEachSplatPixel(x, y, R, [&](int ox, int oy, uint32_t pixelID){
 						if(udepth < fb_depth[pixelID]){
 							atomicMin(&fb_depth[pixelID], udepth);
 						}
-					}
+					});
 				}
 			}
 		}
@@ -1356,7 +1367,9 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 			Chunk* chunk = node->voxelChunks;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numVoxels; pointIndex += block.num_threads() * hqsStep){
+			for(int k = block.thread_rank(); ; k += block.num_threads()){
+				int pointIndex = keptIndex(k, hqsStepFx);
+				if(pointIndex >= int(node->numVoxels)) break;
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
@@ -1389,30 +1402,15 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 				if(!hqsAcceptPoint(point, node, voxelSplatMetres(nodeSize), x, y, depth, R, color)) continue;
 				{
 
-					// HQS depth pass, brought into line with drawPoint by
-					// apply_test_source.ps1: centred, optionally round, and
-					// clamped to width-1/height-1. Must match the colour pass
-					// below exactly or the depth test and the colour disagree.
-					float half = float(R - 1) * 0.5f;
-					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
-					for(int ox = 0; ox < R; ox++)
-					for(int oy = 0; oy < R; oy++)
-					{
-						if(uniforms.roundSplats && R > 2){
-							float ddx = float(ox) - half;
-							float ddy = float(oy) - half;
-							if(ddx * ddx + ddy * ddy > rad2) continue;
-						}
-						uint32_t px = clamp(int(x + ox - half), 0, int(uniforms.width)  - 1);
-						uint32_t py = clamp(int(y + oy - half), 0, int(uniforms.height) - 1);
-
-						uint32_t pixelID = px + int(uniforms.width) * py;
-						uint32_t udepth = *((uint32_t*)&depth);
-
+					// HQS depth pass: the same pixels as the colour pass
+					// below (forEachSplatPixel), or the depth test and the
+					// colour disagree.
+					uint32_t udepth = *((uint32_t*)&depth);
+					forEachSplatPixel(x, y, R, [&](int ox, int oy, uint32_t pixelID){
 						if(udepth < fb_depth[pixelID]){
 							atomicMin(&fb_depth[pixelID], udepth);
 						}
-					}
+					});
 
 				}
 			}
@@ -1454,7 +1452,9 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 			Chunk* chunk = node->points;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numPoints; pointIndex += block.num_threads() * hqsStep){
+			for(int k = block.thread_rank(); ; k += block.num_threads()){
+				int pointIndex = keptIndex(k, hqsStepFx);
+				if(pointIndex >= int(node->numPoints)) break;
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
@@ -1494,24 +1494,12 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 					countUp(&_numDrawn);   // colour pass only, once per point
 
 					float half = float(R - 1) * 0.5f;
-					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
-					for(int ox = 0; ox < R; ox++)
-					for(int oy = 0; oy < R; oy++)
-					{
-						if(uniforms.roundSplats && R > 2){
-							float ddx = float(ox) - half;
-							float ddy = float(oy) - half;
-							if(ddx * ddx + ddy * ddy > rad2) continue;
-						}
-						uint32_t px = clamp(int(x + ox - half), 0, int(uniforms.width)  - 1);
-						uint32_t py = clamp(int(y + oy - half), 0, int(uniforms.height) - 1);
-
-						uint32_t pixelID = px + int(uniforms.width) * py;
-
-						if(emitting && _emission != nullptr){
-							atomicAdd(&_emission[3 * pixelID + 0], emR);
-							atomicAdd(&_emission[3 * pixelID + 1], emG);
-							atomicAdd(&_emission[3 * pixelID + 2], emB);
+					float* em = emitting ? _emission : nullptr;   // read once a point
+					forEachSplatPixel(x, y, R, [&](int ox, int oy, uint32_t pixelID){
+						if(em != nullptr){
+							atomicAdd(&em[3 * pixelID + 0], emR);
+							atomicAdd(&em[3 * pixelID + 1], emG);
+							atomicAdd(&em[3 * pixelID + 2], emB);
 						}
 
 						float fbDepth = *((float*)&fb_depth[pixelID]);
@@ -1528,7 +1516,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 							atomicAdd(&c64[0], (unsigned long long)uint32_t(float(rgba[0]) * sh) | ((unsigned long long)uint32_t(float(rgba[1]) * sh) << 32));
 							atomicAdd(&c64[1], (unsigned long long)uint32_t(float(rgba[2]) * sh) | (1ull << 32));
 						}
-					}
+					});
 				}
 			}
 		}
@@ -1553,7 +1541,9 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 			Chunk* chunk = node->voxelChunks;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numVoxels; pointIndex += block.num_threads() * hqsStep){
+			for(int k = block.thread_rank(); ; k += block.num_threads()){
+				int pointIndex = keptIndex(k, hqsStepFx);
+				if(pointIndex >= int(node->numVoxels)) break;
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
@@ -1610,24 +1600,12 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 					countUp(&_numDrawn);   // colour pass only, once per point
 
 					float half = float(R - 1) * 0.5f;
-					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
-					for(int ox = 0; ox < R; ox++)
-					for(int oy = 0; oy < R; oy++)
-					{
-						if(uniforms.roundSplats && R > 2){
-							float ddx = float(ox) - half;
-							float ddy = float(oy) - half;
-							if(ddx * ddx + ddy * ddy > rad2) continue;
-						}
-						uint32_t px = clamp(int(x + ox - half), 0, int(uniforms.width)  - 1);
-						uint32_t py = clamp(int(y + oy - half), 0, int(uniforms.height) - 1);
-
-						uint32_t pixelID = px + int(uniforms.width) * py;
-
-						if(emitting && _emission != nullptr){
-							atomicAdd(&_emission[3 * pixelID + 0], emR);
-							atomicAdd(&_emission[3 * pixelID + 1], emG);
-							atomicAdd(&_emission[3 * pixelID + 2], emB);
+					float* em = emitting ? _emission : nullptr;   // read once a point
+					forEachSplatPixel(x, y, R, [&](int ox, int oy, uint32_t pixelID){
+						if(em != nullptr){
+							atomicAdd(&em[3 * pixelID + 0], emR);
+							atomicAdd(&em[3 * pixelID + 1], emG);
+							atomicAdd(&em[3 * pixelID + 2], emB);
 						}
 
 						float fbDepth = *((float*)&fb_depth[pixelID]);
@@ -1644,7 +1622,7 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 							atomicAdd(&c64[0], (unsigned long long)uint32_t(float(rgba[0]) * sh) | ((unsigned long long)uint32_t(float(rgba[1]) * sh) << 32));
 							atomicAdd(&c64[1], (unsigned long long)uint32_t(float(rgba[2]) * sh) | (1ull << 32));
 						}
-					}
+					});
 
 				}
 			}
@@ -2606,8 +2584,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	// 0.15 m each - fine in principle, but drawn as a line it made any bad
 	// pick look like a beam running off to the horizon. A cube cannot do that.
 	if(uniforms.numMarkers > 0 && uniforms.showMarkers != 0){   // apply_markers2.ps1
-		processRange(0, uniforms.numMarkers, [&](int m){
-			drawMarkerBall(uniforms.markerX[m], uniforms.markerY[m], uniforms.markerZ[m], framebuffer);
+		constexpr int SIDE = 2 * MARKER_MAX_R + 1;
+		processRangeStrided(uniforms.numMarkers * SIDE * SIDE, [&](int k){
+			int m = k / (SIDE * SIDE), r = k - m * (SIDE * SIDE);
+			drawMarkerBallPixel(uniforms.markerX[m], uniforms.markerY[m], uniforms.markerZ[m],
+								r % SIDE - MARKER_MAX_R, r / SIDE - MARKER_MAX_R, framebuffer);
 		});
 		grid.sync();
 	}
