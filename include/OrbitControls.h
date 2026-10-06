@@ -103,7 +103,9 @@ struct OrbitControls{
 
 	void onMouseMove(double xpos, double ypos){
 
-		bool selectActive = Runtime::keyStates[342] > 0;
+		// either Alt picks (main_progressive_octree.cpp), so neither may also
+		// start an orbit; only the left one stopped it (GLFW key codes)
+		bool selectActive = Runtime::keyStates[342] > 0 || Runtime::keyStates[346] > 0;
 		if(selectActive){
 			return;
 		}
@@ -141,20 +143,19 @@ struct OrbitControls{
 		// "backwards" in walk mode and "zoom in" when orbiting
 		if(yoffset == 0.0) return;
 
-		// +1 in, -1 out. Orbiting from a distance, the wheel zooms by scaling
-		// the radius. Standing inside the forest - radius under half a metre,
-		// which is what Go to centre sets - scaling 0.001 m by 1.1 moves the
-		// camera a tenth of a millimetre, so the wheel WALKS instead: a step
-		// along the view direction. (apply_navigate.ps1)
+		// +1 in, -1 out. Orbiting, the wheel zooms by scaling the radius. In
+		// walk mode the radius is pinned at 0.001 m, which scaling by 1.1
+		// would move a tenth of a millimetre, so the wheel WALKS instead: a
+		// step along the view direction.
 		if(walkMode){
 			// translate_local moves the TARGET; the camera sits one radius
 			// behind it. Pinning the radius each step is what keeps the two
 			// together - without it, looking around lets the camera drift
 			// back, radius grows past the old 0.5 m test, and the wheel
 			// silently reverts to zooming, which at a steep pitch reads as
-			// rising rather than advancing. (fix_walk_targets.ps1)
+			// rising rather than advancing.
 			double step = walkStep * (yoffset > 0.0 ? 1.0 : -1.0);
-			translate_local(0.0, 0.0, step);   // fix_walk_axis: z is forward, y is screen-up
+			translate_local(0.0, 0.0, step);   // z is forward, y is screen-up
 			radius = 0.001;
 		}else if(yoffset < 0.0){
 			radius = radius * 1.1;

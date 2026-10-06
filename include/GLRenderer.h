@@ -197,6 +197,7 @@ struct GLRenderer{
 	// Set before the renderer is constructed / once shots are known.
 	static inline bool startHidden = false;
 	static inline bool inputLocked = false;
+	static inline int  exitCode    = EXIT_SUCCESS;   // the process's exit code when the window closes
 
 	// Where GLFW errors and start-up failures are reported: the application's
 	// run log, if it is set before the renderer is constructed; stderr if not.

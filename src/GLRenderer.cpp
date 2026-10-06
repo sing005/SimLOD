@@ -457,7 +457,7 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 	// and queues the loader and uploader threads are still using. The run
 	// log is flushed after every line.
 	fflush(stdout);
-	std::quick_exit(EXIT_SUCCESS);
+	std::quick_exit(exitCode);
 }
 
 shared_ptr<Framebuffer> Framebuffer::create(GLRenderer* renderer) {
