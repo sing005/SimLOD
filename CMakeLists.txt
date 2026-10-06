@@ -111,9 +111,9 @@ target_link_libraries(${PROJECT_NAME} laszip)
 target_include_directories(${PROJECT_NAME} PRIVATE
 	libs/laszip)
 
-## TODO: disable copying of cuda source files
-## - developer builds should use the project root dir as the working directory and directly load from ./modules
-## - public release builds should be shipped with the precompiled cuda programs (cached in temp/cuda_programs)
+## The kernels are compiled at run time from the .cu files under modules/, so the folder goes next to
+## the exe. Developer builds should run from the project root, which loads ./modules directly and lets
+## hot reload see edits. Compiled kernels are cached per user (include/CudaModularProgram.h).
 # Post-Build
 if (SimLOD_CreateCUDASymlinks)
 	execute_process(

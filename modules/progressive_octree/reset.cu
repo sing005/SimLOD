@@ -4,7 +4,6 @@
 // License: MIT https://github.com/mrdoob/three.js/blob/dev/LICENSE
 
 #include <cooperative_groups.h>
-#include <curand_kernel.h>
 
 #include "utils.h.cu"
 #include "builtin_types.h"
@@ -40,7 +39,7 @@ void kernel(
 	if(grid.thread_rank() == 0){
 		
 		allocator_octree->buffer = buffer_octree;
-		allocator_octree->offset = 16; // 16-aligned, first 8 byte is allocator itself
+		allocator_octree->offset = 16; // the allocator itself takes the first 16 bytes (AllocatorGlobal: a pointer and an offset)
 
 		*stats = Stats();
 

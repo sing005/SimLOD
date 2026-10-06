@@ -24,7 +24,7 @@ constexpr uint64_t BATCH_STREAM_SIZE = 8;
 // of which 409 MB was used.
 constexpr uint64_t CONSTRUCT_VOXEL_BACKLOG  = 10'000'000;   // voxel samples: a 16 B point and an 8 B node pointer each
 constexpr uint64_t CONSTRUCT_SPILLING_NODES = 100'000;      // node pointers, 8 B
-constexpr uint64_t CONSTRUCT_SPILLED_POINTS = 10'000'000;   // 12 B stored points; written unchecked, re-inserted only up to 3 M
+constexpr uint64_t CONSTRUCT_SPILLED_POINTS = 10'000'000;   // 12 B stored points; one that does not fit is dropped and counted
 constexpr uint64_t CONSTRUCT_SCRATCH_FIXED_BYTES =
 	  CONSTRUCT_VOXEL_BACKLOG  * (16 + 8)
 	+ CONSTRUCT_SPILLING_NODES * 8
@@ -48,11 +48,8 @@ constexpr uint64_t NODE_BYTES        = 168;                  // sizeof(Node); ch
 struct Uniforms{
 	float width;
 	float height;
-	float time;
-	float fovy_rad;
-	mat4 world;
+	float insectPhase[6];   // radians in [0, 2 pi): the insects' six motion phases (getUniforms)
 	mat4 view;
-	mat4 proj;
 	mat4 transform;
 	mat4 transform_updateBound;
 	mat4 transformInv_updateBound;
@@ -99,7 +96,6 @@ struct Uniforms{
 	int   numInsects;
 	int   insectSize;
 	float insectGlow;
-	float insectSpeed;
 
 	// voxel occupancy grid (apply_voxel_grid.ps1). One uint32 count per cell,
 	// built on the GPU as points enter the octree. Passed as an integer so the
@@ -243,7 +239,6 @@ struct Stats{
 	uint32_t numVisibleLeaves           = 0;
 	uint32_t numVisiblePoints           = 0;
 	uint32_t numVisibleVoxels           = 0;
-	uint32_t numEmitting                = 0;   // apply_insects.ps1
 	uint32_t numDrawn                   = 0;   // apply_sweep_fixes.ps1
 	uint64_t stageNs[8]                 = {0,0,0,0,0,0,0,0};   // apply_stage_timers.ps1: ns since kernel start at each stage boundary
 	int      pickValid                  = 0;   // apply_navigate.ps1: a pick landed on geometry
@@ -258,7 +253,6 @@ struct Stats{
 	uint64_t numPointsProcessed         = 0;
 	uint64_t numAllocatedChunks         = 0;
 	uint64_t chunkPoolSize              = 0;
-	uint32_t dbg                        = 0;
 	uint32_t numDroppedPoints           = 0;   // points whose leaf had no chunk for them; not stored
 	uint32_t numRingMismatches          = 0;   // upload-ring slots refilled before the kernel had finished their batch
 	uint32_t numClampedPoints           = 0;   // points outside the box, stored on its faces (header bounds too small)

@@ -52,20 +52,15 @@ using namespace std;
 extern "C" { __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001; }
 #endif
 
-constexpr uint64_t PINNED_MEM_POOL_SIZE = 200;         // pool of pointers to batches of pinned memory
 // BATCH_STREAM_SIZE, the device upload ring, is in HostDeviceInterface.h
 constexpr uint64_t MAX_DECODED_AHEAD    = 50;          // batches the loaders may decode ahead of the kernel, in pinned host memory
 constexpr uint64_t MAX_BATCH_SIZE       = 1'000'000;   // each loaded batch comprises <size> points
 constexpr uint64_t VRAM_RESERVE_BYTES   = 512'000'000; // left free beside the octree pool: grids, GL framebuffers, headroom
-constexpr int MAX_LOADQUEUE_SIZE        = 300;         // stop loading from disk if processing lags behind
 
 CudaPrint cudaprint;
 
 
-vector<string> paths = {
-	"NONE",
-	// "d:/dev/pointclouds/riegl/retz.las",
-};
+vector<string> paths;   // the point files of the current load
 
 struct PinnedMemorySlot {
 	void* memLocation;
@@ -129,13 +124,31 @@ CUdeviceptr cptr_batchSizes;
 CUdeviceptr cptr_batchTags;
 CUdeviceptr cptr_frameStart;
 CUgraphicsResource cugl_colorbuffer;
-CUevent ce_render_start, ce_render_end;
-CUevent ce_update_start, ce_update_end;
+GLuint g_registeredFrameTexture = 0;   // the texture cugl_colorbuffer is registered for; 0 = none
+
+// What the frame in the frame texture was drawn from, so that renderCUDA can
+// tell when the next frame would come out the same (sameAsLastDrawn).
+static struct {
+	bool        valid = false;
+	Uniforms    key;                  // frameKey of its uniforms
+	int         generation = -1;      // the render program's, so a hot reload draws again
+	GLuint      texture = 0;
+	CUdeviceptr renderBuffer = 0;
+} g_lastDrawn;
+
+// Called before a resize replaces the frame texture, so CUDA lets go of it
+// before OpenGL deletes it. GL may give the new texture the same name.
+static void releaseFrameTexture(){
+	g_lastDrawn.valid = false;
+	if(g_registeredFrameTexture == 0) return;
+	cuGraphicsUnregisterResource(cugl_colorbuffer);
+	g_registeredFrameTexture = 0;
+}
+
 cudaStream_t stream_upload, stream_download;
 
 CudaModularProgram* cuda_program_update = nullptr;
 CudaModularProgram* cuda_program_render = nullptr;
-// CudaModularProgram* cuda_program_filter = nullptr;
 CudaModularProgram* cuda_program_reset  = nullptr;
 
 glm::mat4 transform;
@@ -143,8 +156,6 @@ glm::mat4 transform_updatebound;
 
 Stats stats;
 void* h_stats_pinned = nullptr;
-
-double t_drop_start = 0.0;
 
 // Settings. Everything that changes how the cloud is represented starts at the
 // value that changes nothing, the unedited baseline: each point in the colour
@@ -161,11 +172,11 @@ struct {
 	bool colorByNode                 = false;
 	bool colorByLOD                  = false;
 	bool autoFocusOnLoad             = true;
-	bool benchmarkRendering          = false;
 	float minNodeSize                = 64.0f;
 	bool  adaptiveDetail             = true;    // coarsen LOD when frames exceed the budget
 	float frameBudgetMs              = 33.0f;   // render-kernel time to aim for (30 fps)
 	bool  vsync                      = true;    // cap at display refresh: saves power and heat
+	bool  skipUnchanged              = true;    // keep the last frame while nothing that changes it has changed
 	int pointSize                    = 1;
 	float fovy                       = 90.0f;
 	bool enableEDL                   = false;   // reference has no outlines (apply_look.ps1)
@@ -247,7 +258,6 @@ struct {
 	float lightIntensity             = 2.5f;
 	float ambient                    = 0.109f;   // shadowed points keep a third of their colour
 	float lightAbsorb                = 0.16f;   // per metre: 5 m of canopy passes about 45% (exp(-0.8))
-	int   lightSteps                 = 40;
 	float sunbeams                   = 0.0f;    // key light in the haze; 0 = haze lit by ambient only
 	float sunAnisotropy              = 0.5f;    // forward scattering of the haze (Henyey-Greenstein g)
 
@@ -279,6 +289,8 @@ struct {
 	float emissionColour[3]          = {1.0f, 0.45f, 0.85f};   // the reference pink
 	bool  emissionByFrequency        = false;
 } settings;
+
+static void logLine(const char* fmt, ...);   // the run log, defined below
 
 struct PinnedMemPool{
 	mutex mtx_pool;
@@ -338,8 +350,8 @@ struct PinnedMemPool{
 		lock_guard<mutex> lock(mtx_pool);
 
 		if(pool.size() == 0){
-			printfmt("pool is empty, allocating additional pinned memory slots \n");
 			reserveSlot();
+			logLine("[load] pinned memory pool empty: grown to %d slots\n", int(registered.size()));
 		}
 
 		PinnedMemorySlot slot = pool.front();
@@ -372,27 +384,10 @@ struct PinnedMemPool{
 
 
 bool requestReset                  = false;
-bool requestBenchmark              = false;
-atomic_bool requestStepthrough     = false;
-atomic_bool requestStep            = false;
-bool requestColorFiltering         = false;
-float renderingDuration            = 0.0f;
 atomic_uint64_t numPointsUploaded  = 0;   // written by the uploader, read by the main thread's progress log
-float loadStart                    = 0.0f;
+double loadStart                   = 0.0;   // now() when the load began
 
-float kernelUpdateDuration         = 0.0f;
-float totalUpdateDuration          = 0.0f;
-double minKernelUpdateDuration     = Infinity;
-double maxKernelUpdateDuration     = 0.0;
-double avgKernelUpdateDuration     = 0.0;
-double cntKernelUpdateDuration     = 0.0;
-
-float kernelRenderDuration         = 0.0f;
-float totalRenderDuration          = 0.0f;
-double minKernelRenderDuration     = Infinity;
-double maxKernelRenderDuration     = 0.0;
-double avgKernelRenderDuration     = 0.0;
-double cntKernelRenderDuration     = 0.0;
+float totalUpdateDuration          = 0.0f;   // ms since the load began, for the Stats window
 
 atomic_uint64_t numPointsTotal     = 0;
 atomic_uint64_t numPointsLoaded    = 0;
@@ -400,7 +395,6 @@ atomic_uint64_t numBytesTotal      = 0;
 atomic_uint64_t numBytesLoaded     = 0;
 atomic_uint64_t numThreadsLoading  = 0;
 atomic_int numBatchesTotal         = 0;
-int numBatchesProcessed            = 0;
 bool lastBatchFinishedDevice       = false;
 bool loadStoppedAtCapacity         = false;
 
@@ -433,7 +427,6 @@ atomic_uint64_t pointsProcessedHost  = 0;
 uint64_t momentaryBufferCapacity   = 0;
 uint64_t persistentBufferCapacity  = 0;
 uint64_t renderBufferCapacity      = 0;
-vector<double> processFrameTimes; 
 
 PinnedMemPool pinnedMemPool;
 
@@ -612,13 +605,11 @@ static void cuCheck(CUresult res, const char* what){
 	exit(3);
 }
 
-float toggle = 1.0;
-
 // ---- call schedule (inserted by apply_emission.ps1) -----------------------
 // Reads the CSV the test kit generates. Columns:
 //   call_id,source,freq_hz,channel,x,y,z,t_start_s,duration_s,t_end_s,phase
 struct ScheduledCall {
-	float  x, y, z;
+	double x, y, z;     // as in calls.csv: file coordinates, or survey ones (g_callsInSurvey)
 	float  freqHz;
 	double tStart, duration;
 };
@@ -661,13 +652,13 @@ static int    g_surveyPairs   = 0;
 static bool   g_callsInSurvey = false;   // calls.csv positions are survey coordinates
 
 // survey -> file, the inverse of the fitted motion: file = R^T (survey - t)
-static void surveyToFile(float& x, float& y, float& z){
+static void surveyToFile(double& x, double& y, double& z){
 	if(!g_surveyValid) return;
-	double d0 = double(x) - g_surveyT[0], d1 = double(y) - g_surveyT[1], d2 = double(z) - g_surveyT[2];
+	double d0 = x - g_surveyT[0], d1 = y - g_surveyT[1], d2 = z - g_surveyT[2];
 	const double* R = g_surveyR;
-	x = float(R[0]*d0 + R[3]*d1 + R[6]*d2);
-	y = float(R[1]*d0 + R[4]*d1 + R[7]*d2);
-	z = float(R[2]*d0 + R[5]*d1 + R[8]*d2);
+	x = R[0]*d0 + R[3]*d1 + R[6]*d2;
+	y = R[1]*d0 + R[4]*d1 + R[7]*d2;
+	z = R[2]*d0 + R[5]*d1 + R[8]*d2;
 }
 static void fileToSurvey(double x, double y, double z, double& sx, double& sy, double& sz){
 	const double* R = g_surveyR;
@@ -701,7 +692,12 @@ static void notice(const char* fmt, ...);   // one line on screen for three seco
 static void loadCallSchedule(const std::string& path){
 	g_calls.clear();
 	std::ifstream in(path);
-	if(!in){ std::cout << "[calls] cannot open " << path << std::endl; return; }
+	if(!in){
+		logLine("[calls] cannot open %s\n", path.c_str());
+		notice("Could not open %s", path.c_str());
+		g_callsLoaded = false;
+		return;
+	}
 	std::string line;
 	std::getline(in, line);                     // header
 	int lineNo = 1, skipped = 0;
@@ -719,27 +715,28 @@ static void loadCallSchedule(const std::string& path){
 		}
 		ScheduledCall c;
 		c.freqHz   = float(freq);
-		c.x        = float(x);
-		c.y        = float(y);
-		c.z        = float(z);
+		c.x        = x;   // converted from the survey frame, if need be, as each frame is built
+		c.y        = y;
+		c.z        = z;
 		c.tStart   = t0;
 		c.duration = dur;
-		if(g_callsInSurvey && g_surveyValid) surveyToFile(c.x, c.y, c.z);   // apply_markers2.ps1
 		g_calls.push_back(c);
 	}
 	g_callsLoaded = !g_calls.empty();
+	logLine("[calls] loaded %d calls from %s (%d malformed rows skipped)\n", int(g_calls.size()), path.c_str(), skipped);
 	if(g_callsLoaded && g_callsInSurvey && !g_surveyValid){
-		logLine("[calls] calls.csv is marked as survey coordinates, but no survey frame is fitted: positions used as file coordinates\n");
-		notice("calls.csv is marked as survey coordinates, but there is no survey fit: positions used as file (LAS) coordinates");
+		logLine("[calls] calls.csv is marked as survey coordinates, but no survey frame is fitted: positions used as file coordinates until one is\n");
+		notice("calls.csv is marked as survey coordinates, but there is no survey fit: positions used as file (LAS) coordinates until there is");
+	}else if(skipped > 0){
+		notice("Loaded %d calls; skipped %d malformed rows (see log)", int(g_calls.size()), skipped);
+	}else{
+		notice("Loaded %d calls from %s", int(g_calls.size()), path.c_str());
 	}
-	std::cout << "[calls] loaded " << g_calls.size() << " calls from " << path;
-	if(skipped > 0) std::cout << " (" << skipped << " malformed rows skipped, see log)";
-	std::cout << std::endl;
 }
 
-// Warm for low frequency, cool for high. Stretched across 240-310 Hz so the
-// two test sources read as clearly different; widen this once real calls
-// carry real frequencies.
+// Warm for low frequency, cool for high, stretched across 220-340 Hz so the
+// test sources read as clearly different; widen this once real calls carry
+// real frequencies.
 static void freqToColour(float hz, float& r, float& g, float& b){
 	// 220 Hz warm through 340 Hz cool, matching the four-source schedule
 	float t = (hz - 220.0f) / 120.0f;
@@ -748,17 +745,19 @@ static void freqToColour(float hz, float& r, float& g, float& b){
 	g = 0.45f + 0.25f * t;
 	b = 0.15f + 0.85f * t;
 }
-float lastFrameTime = static_cast<float>(now());
-float timeSinceLastFrame = 0.0;
+// in double, as now() gives them: in float the walking step varied from frame
+// to frame once the session had run for a day or two
+double lastFrameTime = now();
+double timeSinceLastFrame = 0.0;
 
 float3 boxMin  = float3{InfinityF, InfinityF, InfinityF};
 float3 boxMax  = float3{-InfinityF, -InfinityF, -InfinityF};
 float3 boxSize = float3{0.0, 0.0, 0.0};
 
-// ---- voxel occupancy grid (apply_voxel_grid.ps1) --------------------------
-// Sized from the cloud's bounding box on load: the longest side gets 256
-// cells, the others proportionally, capped at 256 each. Zeroed on every load.
-// Counts are accumulated on the GPU as points enter the octree.
+// ---- voxel occupancy grid -----------------------------------------------------
+// Sized from the cloud's bounding box on load: the longest side gets the
+// chosen resolution, 64 to 512 cells, the others the same cell size. Zeroed on
+// every load. Counts are accumulated on the GPU as points enter the octree.
 static CUdeviceptr g_voxelGrid  = 0;
 static int         g_gridResolution = 256;   // cells along the longest side
 static int         g_gridBuiltAtRes = 0;     // what the CURRENT counts were built with
@@ -1012,7 +1011,14 @@ static bool fitSurveyFrame(){
 	return true;
 }
 
-// markers.csv (apply_markers2.ps1): file coordinates, label, survey coordinates
+static std::string pathText(const std::filesystem::path& p);   // UTF-8, defined with the looks
+
+// markers.csv, in the working directory: file coordinates, label, survey coordinates
+static std::string markersPath(){
+	std::error_code ec;
+	std::filesystem::path p = std::filesystem::absolute("markers.csv", ec);
+	return ec ? std::string("markers.csv") : pathText(p);
+}
 // Points are stored as float(file - boxMin) with boxMin itself a float, so
 // double(boxMin) + double(rel) recovers file coordinates exactly. Write them
 // with fixed decimals: the default stream precision (6 significant digits)
@@ -1025,8 +1031,8 @@ static void saveMarkersCsv(){
 	}
 	std::ofstream f("markers.csv");
 	if(!f.is_open()){
-		logLine("[pick] cannot open markers.csv for writing\n");
-		notice("Could not write markers.csv (is it open in another program?)");
+		logLine("[pick] cannot open %s for writing\n", markersPath().c_str());
+		notice("Could not write %s (is it open in another program?)", markersPath().c_str());
 		return;
 	}
 	f << "mic,label,x,y,z,sx,sy,sz,has_survey\n";
@@ -1049,8 +1055,8 @@ static void saveMarkersCsv(){
 		notice("Writing markers.csv failed");
 		return;
 	}
-	logLine("[pick] wrote %d markers to markers.csv (file coordinates)\n", int(g_markers.size()));
-	notice("Saved %d markers to markers.csv", int(g_markers.size()));
+	logLine("[pick] wrote %d markers to %s (file coordinates)\n", int(g_markers.size()), markersPath().c_str());
+	notice("Saved %d markers to %s", int(g_markers.size()), markersPath().c_str());
 }
 static void loadMarkersCsv(){
 	// markers are kept relative to boxMin, which is +infinity until a cloud loads
@@ -1059,14 +1065,19 @@ static void loadMarkersCsv(){
 		return;
 	}
 	std::ifstream in("markers.csv");
-	if(!in){ notice("markers.csv not found next to SimLOD.exe"); return; }
+	if(!in){
+		logLine("[pick] %s not found\n", markersPath().c_str());
+		notice("No markers.csv in the working directory: %s", markersPath().c_str());
+		return;
+	}
 	std::vector<Marker> loaded;
 	std::string line;
 	std::getline(in, line);   // header
-	int lineNo = 1, skipped = 0;
+	int lineNo = 1, skipped = 0, beyondLimit = 0;
 	while(std::getline(in, line)){
 		lineNo++;
 		if(line.empty() || line == "\r") continue;
+		if(loaded.size() >= 32){ beyondLimit++; continue; }   // the marker arrays hold 32
 		std::vector<std::string> f = splitCsvLine(line);
 		double mic, x, y, z;
 		if(f.size() < 5 || !parseNumber(f[0], mic)
@@ -1088,14 +1099,27 @@ static void loadMarkersCsv(){
 			m.hasSurvey = has != 0.0;
 		}
 		loaded.push_back(m);
-		if(loaded.size() >= 32) break;
+	}
+	// A file with no readable row, such as one re-saved with semicolons,
+	// used to replace the markers with none.
+	if(loaded.empty() && !g_markers.empty()){
+		logLine("[pick] no marker read from %s (%d malformed rows); the %d markers in the scene are kept\n",
+			markersPath().c_str(), skipped, int(g_markers.size()));
+		notice("No marker could be read from markers.csv (see log); the current markers are kept");
+		return;
 	}
 	g_markers = loaded;
 	g_nextMic = 1;
 	for(const Marker& m : g_markers) g_nextMic = std::max(g_nextMic, m.mic + 1);
-	logLine("[pick] loaded %d markers from markers.csv (%d malformed rows skipped)\n", int(g_markers.size()), skipped);
-	if(skipped > 0) notice("Loaded %d markers; skipped %d malformed rows (see log)", int(g_markers.size()), skipped);
-	else            notice("Loaded %d markers from markers.csv", int(g_markers.size()));
+	// the fit was made from the markers just replaced
+	bool hadFit = g_surveyValid;
+	g_surveyValid = false;
+	logLine("[pick] loaded %d markers from %s (%d malformed rows skipped, %d rows beyond the limit of 32 left out)%s\n",
+		int(g_markers.size()), markersPath().c_str(), skipped, beyondLimit, hadFit ? "; the survey fit is cleared" : "");
+	if(beyondLimit > 0)   notice("Loaded the first 32 markers; %d more rows were left out (32 is the limit)", beyondLimit);
+	else if(skipped > 0)  notice("Loaded %d markers; skipped %d malformed rows (see log)", int(g_markers.size()), skipped);
+	else if(hadFit)       notice("Loaded %d markers from markers.csv; fit the survey frame again", int(g_markers.size()));
+	else                  notice("Loaded %d markers from markers.csv", int(g_markers.size()));
 }
 static int    g_pickReqX = -1, g_pickReqY = -1;   // pixel of the outstanding request
 static float  g_torchPx = -1.0f, g_torchPy = -1.0f;  // frame pixel the torch aims through; < 0 = centre
@@ -1269,7 +1293,8 @@ static void ensureVoxelGrid(){
 
 	// Resolution is the number of cells along the cloud's LONGEST side; the
 	// other two follow from the same cell size, so cells stay cubic.
-	// Memory is 4 bytes a cell and grows with the cube of this, so 512 is the
+	// The occupancy grid takes 4 bytes a cell, the light grid 4 more and the
+	// colour grid 8 more, all growing with the cube of this, so 512 is the
 	// practical ceiling on an 8 GB card - see the readout beside the slider.
 	int R = g_gridResolution < 64 ? 64 : (g_gridResolution > 512 ? 512 : g_gridResolution);
 
@@ -1533,7 +1558,12 @@ static void updateAdaptiveDetail(){
 	static uint32_t lastFrameID = ~0u;
 	if(stats.frameID == lastFrameID) return;
 	lastFrameID = stats.frameID;
-	double ms = double(stats.stageNs[6]) / 1e6;
+	// Without the grid rebuilds at the start of the frame (stageNs[7]): a long
+	// drag of a light control rebuilds the light grid on every frame, which
+	// coarsened the points until well after the drag. A torn readback can
+	// pair two frames' values, so a later [7] than [6] is ignored.
+	uint64_t gridNs = stats.stageNs[7] <= stats.stageNs[6] ? stats.stageNs[7] : 0;
+	double ms = double(stats.stageNs[6] - gridNs) / 1e6;
 	if(ms > settings.frameBudgetMs * 1.10)      g_adaptReduce += 0.03f;
 	else if(ms < settings.frameBudgetMs * 0.70) g_adaptReduce -= 0.015f;
 	g_adaptReduce = std::clamp(g_adaptReduce, 0.0f, 1.0f);
@@ -1545,7 +1575,9 @@ static int   effectiveMaxSplatPx(){
 }
 
 static bool g_frameRenderable = false;   // the render buffer holds this frame's size
-static bool g_frameDrawn      = false;   // set by renderCUDA: kernel_render was launched this frame
+static bool g_frameDrawn      = false;   // set by renderCUDA: the frame texture holds this frame
+static bool g_drawEveryFrame  = false;   // --bench: every frame is drawn, to be timed
+static float g_keptShare      = 0.0f;    // share of recent frames kept unchanged, for the settings window
 
 static void beginFrameState(int width, int height){
 	// A minimised window reports 0 x 0: nothing to draw (loading goes on).
@@ -1555,14 +1587,17 @@ static void beginFrameState(int width, int height){
 	ensureVoxelGrid();
 	// The colour grid serves Fix blown-out canopy, and the bird's-eye view
 	// (Camera) while that view waits to be rebuilt: held only while either
-	// needs it. Turning the fix on tries again after a failure.
+	// needs it. Turning the fix on tries again after a failure. For the view,
+	// only once the load has finished: the rebuild that fills the grid waits
+	// for that, and g_gridRefill is set throughout a load, so the grid was
+	// held unused for the whole load (334 MB for the full scan at 512).
 	bool birdsEyeShown = g_birdsEyeDrawn;   // drawn in last frame's settings window
 	g_birdsEyeDrawn = false;
 	static bool whiteFixWas = false;
 	if(settings.whiteFix && !whiteFixWas) g_colourGridFailed = false;
 	whiteFixWas = settings.whiteFix;
 	ensureColourGrid(settings.whiteFix
-		|| (birdsEyeShown && (g_gridRefill || g_minimapGen != g_refillGen || !g_minimapColoured)));
+		|| (birdsEyeShown && lastBatchFinishedDevice && (g_gridRefill || g_minimapGen != g_refillGen || !g_minimapColoured)));
 	ensureLightGrid(settings.lightOn);
 
 	// kernel_render is the only one to act on the requests below; on a frame
@@ -1666,7 +1701,6 @@ static void resetToUnedited(){
 	settings.lightIntensity = d.lightIntensity;
 	settings.ambient        = d.ambient;
 	settings.lightAbsorb    = d.lightAbsorb;
-	settings.lightSteps     = d.lightSteps;
 	for(int i = 0; i < 3; i++) settings.lightColour[i] = d.lightColour[i];
 	settings.torchOn        = d.torchOn;
 	settings.torchIntensity = d.torchIntensity;
@@ -1849,6 +1883,12 @@ static void lookAssign(float& a, float b){ a = b; }
 static void lookAssign(int& a, int b){ a = b; }
 static void lookAssign(bool& a, bool b){ a = b; }
 static void lookAssign(float (&a)[3], const float (&b)[3]){ a[0] = b[0]; a[1] = b[1]; a[2] = b[2]; }
+
+// Within the slider's range, as a value read from a look file is kept
+static void lookClamp(float& v, float lo, float hi){ v = std::clamp(v, lo, hi); }
+static void lookClamp(int& v, int lo, int hi){ v = std::clamp(v, lo, hi); }
+static void lookClamp(bool&, int, int){}
+static void lookClamp(float (&v)[3], float lo, float hi){ for(float& c : v) c = std::clamp(c, lo, hi); }
 
 // The shortest text that reads back as the same float, with a point for the
 // decimal whatever the system's region settings.
@@ -2068,8 +2108,11 @@ static bool loadLook(const std::filesystem::path& path){
 	settings.showUnedited = false;   // show the look just loaded
 	g_lightDirty = true;
 	// the colour grid is built with these, so it must be built again
+	// Fix blown-out canopy too: built with the fix off, the grid counts blown
+	// points as colour sources, as the checkbox's rebuild already allows for.
 	if(settings.whiteLevel != before.whiteLevel || settings.whiteSpread != before.whiteSpread
-	|| settings.tintMargin != before.tintMargin || settings.whiteReach != before.whiteReach){
+	|| settings.tintMargin != before.tintMargin || settings.whiteReach != before.whiteReach
+	|| settings.whiteFix != before.whiteFix){
 		g_gridRefill = true;
 	}
 
@@ -2079,6 +2122,15 @@ static bool loadLook(const std::filesystem::path& path){
 	if(problems.empty()) notice("Look %s loaded", g_lookName.c_str());
 	else notice("Look %s loaded, with %d problem(s): see the run log", g_lookName.c_str(), int(problems.size()));
 	return true;
+}
+
+// Keeps one look setting, by its name in look files, within its slider's range
+static void clampLookSetting(const char* lookName){
+	decltype(settings) start{};
+	forEachLookSetting(settings, start, [](const char*){},
+		[&](const char* name, auto& value, const auto&, auto lo, auto hi){
+			if(std::strcmp(name, lookName) == 0) lookClamp(value, lo, hi);
+		});
 }
 
 // --look: a file, or the name of a look in the looks folder
@@ -2200,19 +2252,18 @@ static void drawLoadLookPopup(){
 
 Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	Uniforms uniforms;
+	// Every byte, padding and unused event slots too: renderCUDA compares
+	// frames' uniforms byte for byte.
+	memset(&uniforms, 0, sizeof(uniforms));
 
 	glm::mat4 world;
 	glm::mat4 view = renderer->camera->view;
 	glm::mat4 proj = renderer->camera->proj;
 	glm::mat4 worldViewProj = proj * view * world;
-	world = glm::transpose(world);
 	view = glm::transpose(view);
-	proj = glm::transpose(proj);
 	worldViewProj = glm::transpose(worldViewProj);
 
-	memcpy(&uniforms.world, &world, sizeof(world));
 	memcpy(&uniforms.view, &view, sizeof(view));
-	memcpy(&uniforms.proj, &proj, sizeof(proj));
 	memcpy(&uniforms.transform, &worldViewProj, sizeof(worldViewProj));
 
 	// volumetric medium (apply_volumetric.ps1): clip -> world for view rays,
@@ -2265,8 +2316,16 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	
 	uniforms.width                    = static_cast<float>(renderer->width);
 	uniforms.height                   = static_cast<float>(renderer->height);
-	uniforms.fovy_rad                 = 3.1415f * renderer->camera->fovy / 180.0;
-	uniforms.time                     = static_cast<float>(now());
+	{
+		// The insects move along a sum of sines at six fixed rates, in radians
+		// a second at speed 1. Their phases are reduced here, in double: the
+		// clock passed in float lost precision as the session ran on (a step
+		// of 7.8 ms after 18 h, 15.6 ms after 36 h), so the insects moved in
+		// jumps and, from about 3 days, not on every frame.
+		static const double insectRate[6] = {0.83, 2.7, 0.71, 3.1, 1.13, 3.7};
+		double t = now() * double(settings.insectSpeed);
+		for(int k = 0; k < 6; k++) uniforms.insectPhase[k] = float(std::fmod(t * insectRate[k], 2.0 * 3.14159265358979));
+	}
 	uniforms.boxMin                   = float3{0.0f, 0.0f, 0.0f};
 	uniforms.boxMax                   = boxSize;
 	uniforms.frameCounter             = frameCounter;
@@ -2343,7 +2402,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.numInsects   = settings.numInsects;
 		uniforms.insectSize   = settings.insectSize;
 		uniforms.insectGlow   = settings.insectGlow;
-		uniforms.insectSpeed  = settings.insectSpeed;
 
 	checkMomentaryBudget(stats.allocatedBytes_momentary, momentaryBufferCapacity);
 
@@ -2420,7 +2478,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.cellSize        = g_cellSize;
 	uniforms.showVoxelGrid   = settings.showVoxelGrid;
 	uniforms.insectPlacement = settings.insectPlacement;
-	uniforms.numNodesTotal   = int(stats.numNodes);
 	uniforms.gridRefill = g_frameGridRefill ? 1 : 0;   // decided once per frame in beginFrameState
 	uniforms.showEventMarkers = settings.showEventMarkers;
 	uniforms.useVoxelGrid     = settings.useVoxelGrid;
@@ -2467,7 +2524,12 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 		uniforms.lightIntensity = settings.lightIntensity;
 		uniforms.ambient        = settings.ambient;
 		uniforms.lightAbsorb    = settings.lightAbsorb;
-		uniforms.lightSteps     = settings.lightSteps;
+		// Enough one-cell steps for any ray to leave the grid, so canopy
+		// anywhere above a cell can shade it. A fixed 40 steps reached 27.6 m
+		// above a point at grid resolution 256 and 13.8 m at 512, so raising
+		// the resolution took away the shade of the upper canopy. The march
+		// stops on leaving the grid, or when almost no light is left.
+		uniforms.lightSteps     = g_gridX + g_gridY + g_gridZ;
 		uniforms.lightDirty     = g_frameLightDirty ? 1 : 0;   // decided once per frame in beginFrameState
 		uniforms.sunbeams       = settings.sunbeams;
 		uniforms.sunAnisotropy  = std::clamp(settings.sunAnisotropy, -0.95f, 0.95f);   // g = 1 is a spike
@@ -2519,15 +2581,19 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 				if(settings.emissionByFrequency) freqToColour(c.freqHz, cr, cg, cb);
 				else { cr = settings.emissionColour[0]; cg = settings.emissionColour[1]; cb = settings.emissionColour[2]; }
 				int i = uniforms.numEvents++;
-				// SimLOD translates every point by the original LAS minimum on
-				// load (main_progressive_octree.cpp ~line 901), so the renderer's
-				// world starts at the origin and uniforms.boxMin reads as zero.
-				// Any external coordinate - a call position here, a TDOA fix or a
-				// microphone location later - must carry the same offset or it
-				// lands outside the cloud entirely.
-				uniforms.eventX[i]  = c.x - boxMin.x;
-				uniforms.eventY[i]  = c.y - boxMin.y;
-				uniforms.eventZ[i]  = c.z - boxMin.z;
+				// The loaders subtract boxMin from every point, so the
+				// renderer's world starts at the origin and uniforms.boxMin
+				// reads as zero. Any external coordinate - a call position
+				// here, a TDOA fix or a microphone location later - must carry
+				// the same offset or it lands outside the cloud entirely.
+				// Survey coordinates are converted with the fit as it is now,
+				// so a new fit, or none, applies at once. They were converted
+				// once, when calls.csv was read.
+				double fx = c.x, fy = c.y, fz = c.z;
+				if(g_callsInSurvey) surveyToFile(fx, fy, fz);   // unchanged while no fit exists
+				uniforms.eventX[i]  = float(fx - double(boxMin.x));
+				uniforms.eventY[i]  = float(fy - double(boxMin.y));
+				uniforms.eventZ[i]  = float(fz - double(boxMin.z));
 				uniforms.eventR[i]  = g_eventRadius;
 				uniforms.eventI[i]  = env;   // already shaped above; no extra squaring
 				uniforms.eventCR[i] = cr;
@@ -2578,9 +2644,27 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	return uniforms;
 }
 
-void resetCUDA(shared_ptr<GLRenderer> renderer){
+// A kernel launch that failed goes to the run log, once until that kernel
+// launches again: a failure on every frame would fill the log. Failures were
+// printed to the console only.
+static void logLaunch(const char* kernel, CUresult res){
+	static std::map<string, CUresult> last;
+	CUresult& previous = last[kernel];
+	if(res != CUDA_SUCCESS && res != previous){
+		const char* name = nullptr;
+		cuGetErrorName(res, &name);
+		logLine("[host] kernel %s did not launch: %s\n", kernel, name ? name : "unknown error");
+	}
+	previous = res;
+}
 
-	ensureVoxelGrid();   // apply_voxel_grid.ps1: size and zero before the first batch
+// False if the reset kernel did not run, and the device still holds the
+// previous load's octree and counters.
+bool resetCUDA(shared_ptr<GLRenderer> renderer){
+
+	// The current cloud's grid: reload() reads the new box after this, and the
+	// next beginFrameState sizes the grid for it, before the first batch.
+	ensureVoxelGrid();
 
 	// ensureVoxelGrid returns early when the dimensions are unchanged, which
 	// they are when the same cloud is reloaded. The construct kernel adds to
@@ -2614,12 +2698,11 @@ void resetCUDA(shared_ptr<GLRenderer> renderer){
 		numGroups, 1, 1,
 		workgroupSize, 1, 1,
 		0, 0, args);
-
-	if(res_launch != CUDA_SUCCESS){
-		printfmt("CUDA kernel 'reset' failed.\n");
-	}
+	logLaunch("reset", res_launch);
 
 	cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
+
+	return res_launch == CUDA_SUCCESS;
 }
 
 // incrementally updates the octree on the GPU
@@ -2644,85 +2727,47 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 		&cptr_batchTags,
 	};
 
-	// printfmt("launching update!\n");
-	// printfmt("    frame:                   {} \n", renderer->frameCount);
-	// printfmt("    points:                  {} \n", batchStreamPointSize[processRingIndex]);
-	// printfmt("    uploadIndex:             {} \n", batchStreamUploadIndex);
-	// printfmt("    uploadRingIndex:         {} \n", batchStreamUploadIndex % BATCH_STREAM_SIZE);
-	// printfmt("    processIndex:            {} \n", batchStreamProcessIndex);
-	// printfmt("    processRingIndex:        {} \n", processRingIndex);
-	// printfmt("    cptr_points_ringbuffer:  {} \n", cptr_points_ringbuffer);
-	// printfmt("    ptrPoints:               {} \n", ptrPoints);
-
-	cuEventRecord(ce_update_start, 0);
-	// printfmt("launch update \n");
 	auto res_launch = cuLaunchCooperativeKernel(cuda_program_update->kernels["kernel_construct"],
 		numGroups, 1, 1,
 		workgroupSize, 1, 1,
 		0, 0, args);
-	// printfmt("update done\n");
-
-	if(res_launch != CUDA_SUCCESS){
-		const char* str; 
-		cuGetErrorString(res_launch, &str);
-		printf("error: %s \n", str);
-	}
-
-	cuEventRecord(ce_update_end, 0);
-
-	// benchmark kernel- slows down overall loading!
-	if(requestBenchmark){ 
-		cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
-
-		float duration;
-		cuEventElapsedTime(&duration, ce_update_start, ce_update_end);
-
-		kernelUpdateDuration    += duration;
-		minKernelUpdateDuration = std::min(minKernelUpdateDuration, double(duration));
-		maxKernelUpdateDuration = std::max(maxKernelUpdateDuration, double(duration));
-		avgKernelUpdateDuration = (cntKernelUpdateDuration * avgKernelUpdateDuration + duration) / (cntKernelUpdateDuration + 1.0);
-		cntKernelUpdateDuration += 1.0;
-	}
-
-	requestStep = false;
-	numBatchesProcessed++;
-
-	// cuCtxSynchronize();
+	logLaunch("construct", res_launch);
 }
 
-// post-process color-filtering.
-// computes average color values for voxels.
-// void doColorFiltering(shared_ptr<GLRenderer> renderer){
+// The uniforms of a frame, with the insects' phases and the frame number
+// cleared where the kernel does not read them: the phases move only the
+// insects, and the frame number changes only the grain. The unedited view
+// draws neither. Insects at speed 0 keep their phases at 0.
+static void frameKey(const Uniforms& uniforms, Uniforms* key){
+	memcpy(key, &uniforms, sizeof(Uniforms));
+	bool unedited = uniforms.showUnedited != 0;
+	if(uniforms.numInsects <= 0 || unedited) memset(key->insectPhase, 0, sizeof(key->insectPhase));
+	if(!(uniforms.grain > 0.0f) || unedited) key->frameCounter = 0;
+}
 
-// 	if(!lastBatchFinishedDevice) return;
+// True when kernel_render would draw the frame already in the frame texture.
+// Besides the uniforms, only these change what it draws: the octree, during a
+// load; the grids, in a rebuild (beginFrameState asks for one when they are
+// reallocated or emptied); the kernel, on a hot reload; and the texture and
+// buffers, on a resize. Any doubt draws the frame.
+static bool sameAsLastDrawn(const Uniforms& uniforms, GLuint texture){
+	if(!settings.skipUnchanged || g_drawEveryFrame || !g_lastDrawn.valid) return false;
+	if(!lastBatchFinishedDevice || g_frameGridRefill || g_frameLightDirty) return false;
+	if(cuda_program_render->generation != g_lastDrawn.generation) return false;
+	if(texture != g_lastDrawn.texture || cptr_renderbuffer != g_lastDrawn.renderBuffer) return false;
+	Uniforms key;
+	frameKey(uniforms, &key);
+	return memcmp(&key, &g_lastDrawn.key, sizeof(Uniforms)) == 0;
+}
 
-// 	Uniforms uniforms = getUniforms(renderer);
-
-// 	int workgroupSize = 256;
-// 	int numGroups = numSMs;
-
-// 	void* args[] = {
-// 		&uniforms,
-// 		&cptr_buffer, 
-// 		&cptr_nodes, 
-// 		&cptr_stats
-// 	};
-
-// 	printfmt("launching color filter!\n");
-
-// 	auto res_launch = cuLaunchCooperativeKernel(cuda_program_filter->kernels["kernel"],
-// 		numGroups, 1, 1,
-// 		workgroupSize, 1, 1,
-// 		0, 0, args);
-
-// 	if(res_launch != CUDA_SUCCESS){
-// 		const char* str; 
-// 		cuGetErrorString(res_launch, &str);
-// 		printf("error: %s \n", str);
-// 	}
-
-// 	requestColorFiltering = false;
-// }
+// kernel_render did not run: put back the requests beginFrameState took for
+// this frame, for the next frame that is drawn
+static void keepFrameRequests(){
+	if(g_frameGridRefill) g_gridRefill = true;
+	if(g_frameLightDirty) g_lightDirty = true;
+	g_frameGridRefill = false;
+	g_frameLightDirty = false;
+}
 
 // draw the octree with a CUDA kernel
 void renderCUDA(shared_ptr<GLRenderer> renderer){
@@ -2734,24 +2779,54 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 
 	Uniforms uniforms = getUniforms(renderer);
 
-	static bool registered = false;
-	static GLuint registeredHandle = -1;
+	// kernel_render reads the uniforms from constant memory (render.cu).
+	// Find that symbol in the current module; a hot reload replaces the
+	// module, and with it the symbol's address. By generation, not handle:
+	// the old module is unloaded, and the new one can get its handle.
+	static int uniformsGeneration = -1;
+	static CUdeviceptr uniformsSymbol = 0;
+	if(uniformsGeneration != cuda_program_render->generation){
+		size_t bytes = 0;
+		uniformsGeneration = cuda_program_render->generation;
+		CUmodule module = cuda_program_render->mod;   // none if the kernels never compiled, which they logged
+		if(module == nullptr || cuModuleGetGlobal(&uniformsSymbol, &bytes, module, "uniforms") != CUDA_SUCCESS || bytes != sizeof(Uniforms)){
+			uniformsSymbol = 0;
+			if(module != nullptr) logLine("[host] the render kernel has no uniforms of %zu bytes (found %zu); frames are skipped\n", sizeof(Uniforms), bytes);
+		}
+	}
+	if(uniformsSymbol == 0){
+		keepFrameRequests();
+		return;
+	}
 
-	CUresult registered_res = cuGraphicsGLRegisterImage(
-		&cugl_colorbuffer,
-		renderer->view.framebuffer->colorAttachments[0]->handle,
-		GL_TEXTURE_2D,
-		CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
-	if(registered_res != CUDA_SUCCESS){
-		// mapping a resource that did not register crashes in the driver
-		static bool warned = false;
-		if(!warned){ warned = true; logLine("[host] cannot register the frame texture with CUDA (%d); frame skipped\n", int(registered_res)); }
-		// kernel_render does not run: put back the requests beginFrameState
-		// took for this frame, for the next one that is drawn
-		if(g_frameGridRefill) g_gridRefill = true;
-		if(g_frameLightDirty) g_lightDirty = true;
-		g_frameGridRefill = false;
-		g_frameLightDirty = false;
+	// Registered once, and again only after a resize has replaced the
+	// texture (releaseFrameTexture). "Registering a resource is potentially
+	// high-overhead and therefore typically called only once per resource"
+	// (CUDA C++ Programming Guide 12.4, 3.2.15); it was registered and
+	// unregistered on every frame. Mapping stays per frame.
+	GLuint frameTexture = renderer->view.framebuffer->colorAttachments[0]->handle;
+	if(g_registeredFrameTexture != frameTexture){
+		releaseFrameTexture();
+		CUresult registered_res = cuGraphicsGLRegisterImage(&cugl_colorbuffer, frameTexture, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
+		if(registered_res != CUDA_SUCCESS){
+			// mapping a resource that did not register crashes in the driver
+			static bool warned = false;
+			if(!warned){ warned = true; logLine("[host] cannot register the frame texture with CUDA (%d); frame skipped\n", int(registered_res)); }
+			keepFrameRequests();
+			return;
+		}
+		g_registeredFrameTexture = frameTexture;
+	}
+
+	// Nothing that reaches the kernel has changed since the frame in the
+	// texture was drawn, so that frame stays. A still view was drawn again
+	// on every frame, keeping the GPU busy for most of each frame whenever
+	// full detail cost more than the budget.
+	CUfunction kernel = cuda_program_render->kernels["kernel_render"];
+	bool kept = sameAsLastDrawn(uniforms, frameTexture);
+	g_keptShare += 0.02f * ((kept ? 1.0f : 0.0f) - g_keptShare);   // about the last 50 frames
+	if(kept){
+		g_frameDrawn = true;   // the texture holds this frame
 		return;
 	}
 
@@ -2765,14 +2840,10 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	CUsurfObject output_surf;
 	cuSurfObjectCreate(&output_surf, &res_desc);
 
-	cuEventRecord(ce_render_start, 0);
-
-	float time = static_cast<float>(now());
 	int workgroupSize = 256;   // kernel_render's __launch_bounds__ in render.cu assumes 256
 	
-	int maxActiveBlocksPerSM;
-	cuOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocksPerSM, 
-		cuda_program_render->kernels["kernel_render"], workgroupSize, 0);
+	int maxActiveBlocksPerSM = 0;   // on failure the launch below fails, and is logged
+	cuOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocksPerSM, kernel, workgroupSize, 0);
 	
 	int numGroups = maxActiveBlocksPerSM * numSMs;
 	
@@ -2787,44 +2858,30 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	};
 
 	
-	auto res_launch = cuLaunchCooperativeKernel(cuda_program_render->kernels["kernel_render"],
+	// On the stream the kernel runs on, so the copy follows the previous
+	// frame's kernel and precedes this one. From pageable memory the call
+	// returns once the bytes are staged, so the local may then go out of scope.
+	cuMemcpyHtoDAsync(uniformsSymbol, &uniforms, sizeof(Uniforms), 0);
+
+	auto res_launch = cuLaunchCooperativeKernel(kernel,
 		numGroups, 1, 1,
 		workgroupSize, 1, 1,
 		0, 0, args);
 
 	g_frameDrawn = res_launch == CUDA_SUCCESS;
+	g_lastDrawn.valid = g_frameDrawn;
+	if(g_frameDrawn){
+		frameKey(uniforms, &g_lastDrawn.key);
+		g_lastDrawn.generation   = cuda_program_render->generation;
+		g_lastDrawn.texture      = frameTexture;
+		g_lastDrawn.renderBuffer = cptr_renderbuffer;
+	}
 	if(g_frameDrawn && g_frameGridRefill) g_refillGen++;   // the bird's-eye view follows the grid
-	if(res_launch != CUDA_SUCCESS){
-		const char* str;
-		cuGetErrorString(res_launch, &str);
-		printf("error: %s \n", str);
-	}
-
-	cuEventRecord(ce_render_end, 0);
-
-	// benchmark kernel- slows down overall loading!
-	if(requestBenchmark){ 
-		cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
-
-		float duration;
-		cuEventElapsedTime(&duration, ce_render_start, ce_render_end);
-
-		kernelRenderDuration    += duration;
-		minKernelRenderDuration = std::min(minKernelRenderDuration, double(duration));
-		maxKernelRenderDuration = std::max(maxKernelRenderDuration, double(duration));
-		avgKernelRenderDuration = (cntKernelRenderDuration * avgKernelRenderDuration + duration) / (cntKernelRenderDuration + 1.0);
-		cntKernelRenderDuration += 1.0;
-	}
-
-	if(settings.benchmarkRendering){
-		cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
-		cuEventElapsedTime(&renderingDuration, ce_render_start, ce_render_end);
-	}
+	logLaunch("render", res_launch);
+	if(!g_frameDrawn) keepFrameRequests();
 
 	cuSurfObjectDestroy(output_surf);
 	cuGraphicsUnmapResources(static_cast<int>(dynamic_resources.size()), dynamic_resources.data(), ((CUstream)CU_STREAM_DEFAULT));
-
-	cuGraphicsUnregisterResource(cugl_colorbuffer);
 }
 
 // compile kernels and allocate buffers
@@ -2841,9 +2898,9 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 
 	// kernel_construct's scratch, and nothing else's: the render kernel's
 	// emission, bloom and volumetric buffers live in cptr_renderbuffer. Sized
-	// from the kernel's own capacities, 405 MB plus a chunk queue entry per
-	// point chunk the pool could hold (total VRAM bounds the pool: 4 MB on an
-	// 8 GB card). It was a fixed 1.2 GB, and before that 300 MB, which the
+	// from the kernel's own capacities, 360.8 MB plus a chunk queue entry per
+	// point chunk the pool could hold (total VRAM bounds the pool: 5.7 MB for
+	// 8 GiB). It was a fixed 1.2 GB, and before that 300 MB, which the
 	// kernel overran by 109 MB with no check. The kernel now refuses to run if
 	// its layout outgrows this.
 	uint64_t cptr_buffer_bytes       = CONSTRUCT_SCRATCH_FIXED_BYTES + 8 * (totalMem / CHUNK_BYTES + 1);
@@ -2897,8 +2954,6 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	cuda_program_update = new CudaModularProgram({
 		.modules = {
 			"./modules/progressive_octree/progressive_octree_voxels.cu",
-			  //"./modules/progressive_octree/progressive_octree_mno.cu",
-			"./modules/progressive_octree/utils.cu",
 		},
 		.kernels = {"kernel_construct"}
 	});
@@ -2906,7 +2961,6 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	cuda_program_reset = new CudaModularProgram({
 		.modules = {
 			"./modules/progressive_octree/reset.cu",
-			"./modules/progressive_octree/utils.cu",
 		},
 		.kernels = {"kernel"}
 	});
@@ -2914,18 +2968,9 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	cuda_program_render = new CudaModularProgram({
 		.modules = {
 			"./modules/progressive_octree/render.cu",
-			"./modules/progressive_octree/utils.cu",
 		},
 		.kernels = {"kernel_render"}
 	});
-
-	// cuda_program_filter = new CudaModularProgram({
-	// 	.modules = {
-	// 		"./modules/progressive_octree/colorfilter.cu",
-	// 		"./modules/progressive_octree/utils.cu",
-	// 	},
-	// 	.kernels = {"kernel"}
-	// });
 
 	// The octree pool gets the VRAM that is left, so it is sized only now that
 	// the kernels are compiled. Their local memory (register spills, stack) is
@@ -2971,9 +3016,12 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 	cuCheck(cuMemAlloc(&cptr_buffer_persistent, cptr_buffer_persistent_bytes), "cuMemAlloc persistent buffer");
 	if(cptr_buffer_persistent_bytes < 300'000'000){
 		// kernel_construct stops 200 MB short of the end
-		logLine("[WARN] only %.0f MB of VRAM for the octree: room for at most %.1f M points. Close other programs using the GPU.\n",
+		// 17.4 B a point measured for the DarkCanopy scan (commit 3962fbc);
+		// 30 B, the estimate before points were stored in 12 bytes, gave
+		// about half the real capacity
+		logLine("[WARN] only %.0f MB of VRAM for the octree: room for about %.1f M points. Close other programs using the GPU.\n",
 			cptr_buffer_persistent_bytes / 1e6,
-			cptr_buffer_persistent_bytes > 200'000'000 ? (cptr_buffer_persistent_bytes - 200'000'000) / 30.0 / 1e6 : 0.0);
+			cptr_buffer_persistent_bytes > 200'000'000 ? (cptr_buffer_persistent_bytes - 200'000'000) / 17.4 / 1e6 : 0.0);
 	}
 
 	uint64_t total = cptr_buffer_bytes
@@ -3001,36 +3049,52 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 		cptr_buffer_persistent_bytes / 1e6, availableMem / 1e6,
 		double(availableMem - cptr_buffer_persistent_bytes) / 1e6, localMemBytes / 1e6);
 
-	cuEventCreate(&ce_render_start, 0);
-	cuEventCreate(&ce_render_end, 0);
-	cuEventCreate(&ce_update_start, 0);
-	cuEventCreate(&ce_update_end, 0);
-	
-	cuGraphicsGLRegisterImage(&cugl_colorbuffer, renderer->view.framebuffer->colorAttachments[0]->handle, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD);
-
 	size_t freeAfterInit = 0;
 	cuMemGetInfo(&freeAfterInit, &totalMem);
 	logLine("[vram] %.0f MB free after allocating the octree pool\n", freeAfterInit / 1e6);
+}
+
+static bool isPointFile(const string& path){
+	return iEndsWith(path, ".las") || iEndsWith(path, ".laz") || iEndsWith(path, ".simlod");
+}
+
+// Why a point file cannot be loaded, or "" when it can.
+static string pointFileProblem(const string& path){
+	std::error_code ec;
+	if(!fs::is_regular_file(path, ec)) return "not found";
+	if(iEndsWith(path, ".las") || iEndsWith(path, ".laz")) return lasFileProblem(path);
+	if(iEndsWith(path, ".simlod")) return simlodFileProblem(path);
+	return "not a .las, .laz or .simlod file";
+}
+
+// The files that can be loaded. Each one that cannot is logged, and *refusal
+// says which, for the screen. A cut LAZ file used to crash the viewer inside
+// laszip, a cut LAS file loaded copies of other points, and a missing file was
+// left out without a message.
+static vector<string> loadablePointFiles(const vector<string>& files, string* refusal){
+	vector<string> loadable;
+	int numRefused = 0;
+	refusal->clear();
+	for(const string& file : files){
+		string problem = pointFileProblem(file);
+		if(problem.empty()){
+			loadable.push_back(file);
+			continue;
+		}
+		logLine("[load] not loading %s: %s\n", file.c_str(), problem.c_str());
+		if(numRefused++ == 0) *refusal = fs::path(file).filename().string() + ": " + problem;
+	}
+	if(numRefused > 1)       *refusal = std::to_string(numRefused) + " files not loaded (see the log), " + *refusal;
+	else if(numRefused == 1) *refusal = "Not loaded - " + *refusal;
+	return loadable;
 }
 
 void reload(){
 
 	printfmt("start loading \n");
 
-	loadStart = static_cast<float>(now());
+	loadStart = now();
 	totalUpdateDuration     = 0.0f;
-	kernelUpdateDuration    = 0.0f;
-	minKernelUpdateDuration = Infinity;
-	maxKernelUpdateDuration = 0.0;
-	avgKernelUpdateDuration = 0.0;
-	cntKernelUpdateDuration = 0.0;
-
-	totalRenderDuration     = 0.0f;
-	kernelRenderDuration    = 0.0f;
-	minKernelRenderDuration = Infinity;
-	maxKernelRenderDuration = 0.0;
-	avgKernelRenderDuration = 0.0;
-	cntKernelRenderDuration = 0.0;
 
 	lock_guard<mutex> lock_batchesToProcess(mtx_batchesToProcess);
 	lock_guard<mutex> lock_batchesInPinnedMemory(mtx_batchesInPinnedMemory);
@@ -3059,17 +3123,19 @@ void reload(){
 
 	// query bounding box and number of points in input files
 	// vector<PointBatch> batches;
-	for(string path : paths){
+	string refusal;
+	for(string path : loadablePointFiles(paths, &refusal)){
 
-		if(!fs::exists(path)) continue;
+		std::error_code ec;
+		uint64_t fileSize = fs::file_size(path, ec);
+		if(ec) continue;   // gone since the check
+		numBytesTotal += fileSize;
 
-		numBytesTotal += fs::file_size(path);
-
-		if(iEndsWith(path, "laz")){
+		if(iEndsWith(path, ".laz")){
 			lazInBatches = true;
 		}
 
-		if(iEndsWith(path, "las") || iEndsWith(path, "laz")){
+		if(iEndsWith(path, ".las") || iEndsWith(path, ".laz")){
 
 			LasHeader header = loadHeader(path);
 			numPointsTotal += keptBefore(header.numPoints);
@@ -3102,10 +3168,10 @@ void reload(){
 				numBatchesTotal++;
 			}
 
-		}else if(iEndsWith(path, "simlod")){
+		}else if(iEndsWith(path, ".simlod") && fileSize >= 24){
 
 			auto buffer = readBinaryFile(path, 0, 24);
-			uint64_t numPoints = (fs::file_size(path) - 24) / 16;
+			uint64_t numPoints = (fileSize - 24) / 16;
 
 			boxMin.x = std::min(boxMin.x, buffer->get<float>( 0));
 			boxMin.y = std::min(boxMin.y, buffer->get<float>( 4));
@@ -3133,6 +3199,8 @@ void reload(){
 
 		
 	}
+
+	if(!refusal.empty()) notice("%s", refusal.c_str());
 
 	// Markers stay put in FILE coordinates. Each cloud is shifted by its own
 	// minimum corner, so a marker kept in the renderer frame used to land in a
@@ -3167,11 +3235,9 @@ void reload(){
 	batchesProcessedHost    = 0;
 	pointsProcessedHost     = 0;
 	numPointsUploaded       = 0;
-	numBatchesProcessed     = 0;
 	lastBatchFinishedDevice = false;
 	loadStoppedAtCapacity   = false;
 	batchStreamUploadIndex  = 0;
-	processFrameTimes.clear();
 
 	if(numPointsTotal > 0){
 		logLine("[load] start: %.2f M points in %d batches, %.2f GB on disk%s\n",
@@ -3194,9 +3260,8 @@ void stopLoadingAtCapacity(){
 		batchesToProcess.clear();
 	}
 
-	// The uploader holds mtx_uploader for all but ~100 ns of each ~100 us pass
-	// and std::mutex is not fair, so ask it to back off outside the lock first,
-	// as reset() does. Without this the main thread could wait indefinitely.
+	// The uploader takes mtx_uploader on every pass while it works, and
+	// std::mutex is not fair, so ask it to back off first, as reset() does.
 	resetInProgress = true;
 	{
 		// same lock order as the uploader: mtx_uploader, then the pinned queue
@@ -3224,7 +3289,7 @@ void logLoadSummary(){
 	Stats s;
 	if(cuMemcpyDtoH(&s, cptr_stats, sizeof(Stats)) != CUDA_SUCCESS) return;
 
-	double seconds = now() - double(loadStart);
+	double seconds = now() - loadStart;
 	double inserted = double(s.numPointsProcessed);
 
 	logLine("[load] done in %.1f s: %.2f M of %.2f M points inserted (%.1f M/s), %.2f M decoded%s\n",
@@ -3243,7 +3308,7 @@ void logLoadSummary(){
 		double(s.allocatedBytes_persistent) / std::max(double(s.numPoints), 1.0),
 		s.allocatedBytes_momentary / 1e6, momentaryBufferCapacity / 1e6,
 		freeNow / 1e6);
-	logLine("[load] integrity: %u points dropped (no chunk), %u upload-ring slots refilled while still in use, %u points outside the header box (stored on its faces)\n",
+	logLine("[load] integrity: %u points dropped (no chunk, or no room among the spilled points), %u upload-ring slots refilled while still in use, %u points outside the header box (stored on its faces)\n",
 		s.numDroppedPoints, s.numRingMismatches, s.numClampedPoints);
 }
 
@@ -3261,17 +3326,24 @@ void reset(shared_ptr<GLRenderer> renderer){
 	cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
 
 	// now reset octree-construction related state on device
-	resetCUDA(renderer);
+	bool resetDone = resetCUDA(renderer);
 	cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
 
-	// read stats just to make sure device and host are on the same page
-	// (sync before the memcpy, or this copies the previous, stale contents)
-	cuMemcpyDtoHAsync(h_stats_pinned, cptr_stats, sizeof(Stats), ((CUstream)CU_STREAM_DEFAULT));
-	cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
-	memcpy(&stats, h_stats_pinned, sizeof(Stats));
+	if(resetDone){
+		// read stats just to make sure device and host are on the same page
+		// (sync before the memcpy, or this copies the previous, stale contents)
+		cuMemcpyDtoHAsync(h_stats_pinned, cptr_stats, sizeof(Stats), ((CUstream)CU_STREAM_DEFAULT));
+		cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
+		memcpy(&stats, h_stats_pinned, sizeof(Stats));
 
-	// finally, reset host state to start reloading current data set from disk
-	reload();
+		// finally, reset host state to start reloading current data set from disk
+		reload();
+	}else{
+		// The device kept the previous load's counters, from which the
+		// construct kernel would have read stale upload slots. The cloud
+		// already loaded stays.
+		notice("The octree could not be reset (see the log) - keeping the current cloud");
+	}
 
 	requestReset = false;
 
@@ -3305,12 +3377,20 @@ void spawnLoader(size_t i, int maxLazThreads) {
 			// }
 
 			if (everythingIsDone || processingLagsBehind || resetInProgress.load()) {
-				std::this_thread::sleep_for(1ms);
+				// Nothing left to load until the next drop: sleep longer, and
+				// free the LAS read buffer. The loaders used to wake 1000
+				// times a second each for the whole session.
+				if(everythingIsDone && !resetInProgress.load()){
+					releaseLasReadBuffer();
+					std::this_thread::sleep_for(20ms);
+				}else{
+					std::this_thread::sleep_for(1ms);
+				}
 				continue;
 			}
 
 			// lock thread's own mutex
-			lock_guard<mutex> lock_loader(*mtx_loader[i]);
+			unique_lock<mutex> lock_loader(*mtx_loader[i]);
 
 			PointBatch batch;
 
@@ -3323,7 +3403,7 @@ void spawnLoader(size_t i, int maxLazThreads) {
 				// Tested and counted under this lock, so the cap is exact. Capped
 				// threads used to retry without sleeping and kept this mutex busy
 				// for the threads that were decoding.
-				if(next.count > 0 && iEndsWith(next.file, "laz") && numThreadsLoading >= uint64_t(maxLazThreads)){
+				if(next.count > 0 && iEndsWith(next.file, ".laz") && numThreadsLoading >= uint64_t(maxLazThreads)){
 					mtx_batchesToProcess.unlock();
 					std::this_thread::sleep_for(1ms);
 					continue;
@@ -3335,8 +3415,9 @@ void spawnLoader(size_t i, int maxLazThreads) {
 				if(batch.count > 0) numThreadsLoading++;
 			}
 			mtx_batchesToProcess.unlock();
+			bool tookBatch = batch.count > 0;
 
-			if (batch.count > 0) {
+			if (tookBatch) {
 				// load points in batch
 
 				// Taken only with work in hand. Idle loaders took and returned a
@@ -3345,15 +3426,18 @@ void spawnLoader(size_t i, int maxLazThreads) {
 				PinnedMemorySlot pinnedMemSlot = pinnedMemPool.acquire();
 				Point* pinnedPoints = (Point*)pinnedMemSlot.memLocation;
 
-				int batchID = batch.first / MAX_BATCH_SIZE;
-				double t_start = now();
-				// printfmt("start loading batch {} at {:.3f} \n", batchID, t_start);
-
-				if(iEndsWith(batch.file, "las")){
+				if(iEndsWith(batch.file, ".las")){
 					void* target = (void*)pinnedPoints;
 
 					double translation[3] = {-boxMin.x, -boxMin.y, -boxMin.z};
-					loadLasNative(batch.file, batch.lasHeader, batch.first, batch.count, target, translation);
+					if(!loadLasNative(batch.file, batch.lasHeader, batch.first, batch.count, target, translation)){
+						logLine("[load] cannot read points %llu to %llu of %s; skipped\n",
+							(unsigned long long)batch.first, (unsigned long long)(batch.first + batch.count), batch.file.c_str());
+						skipUnreadableBatch(batch);
+						pinnedMemPool.release(pinnedMemSlot);
+						numThreadsLoading--;
+						continue;
+					}
 					numBytesLoaded += batch.count * batch.lasHeader.bytesPerPoint;
 					if(loadKeepPer10k < 10000){   // --set keep: compact what is kept
 						int kept = 0;
@@ -3370,7 +3454,7 @@ void spawnLoader(size_t i, int maxLazThreads) {
 					lock_guard<mutex> lock_batchesInPinnedMemory(mtx_batchesInPinnedMemory);
 					batchesInPinnedMemory.push_back(batch);
 
-				}else if(iEndsWith(batch.file, "laz")){
+				}else if(iEndsWith(batch.file, ".laz")){
 					laszip_POINTER laszip_reader = nullptr;
 					laszip_header* header = nullptr;
 					laszip_point* laz_point = nullptr;
@@ -3401,12 +3485,18 @@ void spawnLoader(size_t i, int maxLazThreads) {
 
 					laszip_get_header_pointer(laszip_reader, &header);
 					laszip_get_point_pointer(laszip_reader, &laz_point);
-					laszip_seek_point(laszip_reader, batch.first);
+
+					// A failed seek or read leaves the whole batch out: the
+					// points it gave would not be the file's.
+					bool readFailed = laszip_seek_point(laszip_reader, batch.first) != 0;
 
 					int kept = 0;
-					for (int i = 0; i < batch.count; i++) {
+					for (int i = 0; i < batch.count && !readFailed; i++) {
 						double XYZ[3];
-						laszip_read_point(laszip_reader);
+						if(laszip_read_point(laszip_reader) != 0){
+							readFailed = true;
+							break;
+						}
 						if(!keepPoint(uint64_t(batch.first) + i)) continue;   // --set keep
 						laszip_get_coordinates(laszip_reader, XYZ);
 
@@ -3428,6 +3518,19 @@ void spawnLoader(size_t i, int maxLazThreads) {
 
 						pinnedPoints[kept++] = point;
 					}
+					if(readFailed){
+						laszip_CHAR* err = nullptr;
+						laszip_get_error(laszip_reader, &err);
+						logLine("[load] cannot read points %llu to %llu of %s: %s; skipped\n",
+							(unsigned long long)batch.first, (unsigned long long)(batch.first + batch.count), batch.file.c_str(),
+							err ? err : "unknown laszip error");
+						laszip_close_reader(laszip_reader);
+						laszip_destroy(laszip_reader);
+						skipUnreadableBatch(batch);
+						pinnedMemPool.release(pinnedMemSlot);
+						numThreadsLoading--;
+						continue;
+					}
 					batch.count = kept;
 
 					laszip_close_reader(laszip_reader);
@@ -3439,13 +3542,20 @@ void spawnLoader(size_t i, int maxLazThreads) {
 
 					lock_guard<mutex> lock_batchesInPinnedMemory(mtx_batchesInPinnedMemory);
 					batchesInPinnedMemory.push_back(batch);
-				}else if(iEndsWith(batch.file, "simlod")){
+				}else if(iEndsWith(batch.file, ".simlod")){
 					
 					batch.pinnedMem = pinnedMemSlot;
 
 					// At least on windows, this uses winapi to do unbuffered loading to maximize SSD perf
-					uint64_t padding;
-					loadFileNative(batch.file, 24llu + 16llu * uint64_t(batch.first), 16llu * batch.count, pinnedMemSlot.memLocation, &padding);
+					uint64_t padding = 0;
+					if(!loadFileNative(batch.file, 24llu + 16llu * uint64_t(batch.first), 16llu * batch.count, pinnedMemSlot.memLocation, &padding)){
+						logLine("[load] cannot read points %llu to %llu of %s; skipped\n",
+							(unsigned long long)batch.first, (unsigned long long)(batch.first + batch.count), batch.file.c_str());
+						skipUnreadableBatch(batch);
+						pinnedMemPool.release(pinnedMemSlot);
+						numThreadsLoading--;
+						continue;
+					}
 					batch.pinnedMem.memOffset = padding;
 
 					numBytesLoaded += 16llu * batch.count;
@@ -3455,14 +3565,13 @@ void spawnLoader(size_t i, int maxLazThreads) {
 					batchesInPinnedMemory.push_back(batch);
 				}
 
-				// double t_end = now();
-				// double millies = (t_end - t_start) * 1000.0;
-				// printfmt("finished loading batch {} at {:.3f}. duration: {:.3f} ms \n", batchID, t_end, millies);
-
 				numThreadsLoading--;
 			}
 
-			std::this_thread::sleep_for(1ms);
+			// An empty queue stays empty until the next load. Not while
+			// holding this loader's mutex, which reset() waits for.
+			lock_loader.unlock();
+			std::this_thread::sleep_for(tookBatch ? 1ms : 20ms);
 		}
 
 		});
@@ -3472,21 +3581,14 @@ void spawnLoader(size_t i, int maxLazThreads) {
 // Spawns a thread that uploads data to the GPU
 // - Asynchronously schedules uploads in stream_upload
 // - After every async copy, it also asynchronously updates the number of uploaded points
-void spawnUploader(shared_ptr<GLRenderer> renderer) {
-	double timestamp = now();
+void spawnUploader() {
 
-	thread t([&]() {
+	thread t([]() {
 		installThreadTerminateHandler();
 
 		vector<PinnedMemorySlot> availableSlots;
 
 		while (true) {
-
-			double t_start = now();
-			double spintime = 0.0001;
-
-			// actually seems to wait way, way longer than 100ns.
-			// std::this_thread::sleep_for(100ns);
 
 			// go to sleep if reset is in progress
 			if (resetInProgress.load()) {
@@ -3494,21 +3596,30 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 				continue;
 			}
 
-			// this lock ensures that we don't reset and upload at the same time
-			lock_guard<mutex> lock_uploader(mtx_uploader);
-
-			// spin instead of sleep, because sleep takes too long
-			while (now() < t_start + spintime) {
-				// do some spinning to avoid attempting locks too often
-			}
-
-			if(requestStepthrough){
-				if(requestStep){
-					requestStep = false;
-				}else{
+			// Every batch uploaded and no upload in flight: nothing to do
+			// until the next load. This thread used to spin here, keeping a
+			// core busy for the whole session.
+			if (batchStreamUploadIndex == numBatchesTotal) {
+				bool uploadsInFlight;
+				{
+					lock_guard<mutex> lock_pinnedMemoryInUpload(mtx_pinnedMemoryInUpload);
+					uploadsInFlight = !pinnedMemoryInUpload.empty();
+				}
+				if (!uploadsInFlight) {
+					std::this_thread::sleep_for(20ms);
 					continue;
 				}
 			}
+
+			// Spin for 100 us between passes, to avoid attempting locks too
+			// often: sleep_for(100us) seems to wait way, way longer. Outside
+			// the lock, which reset() and stopLoadingAtCapacity() wait for.
+			double t_start = now();
+			while (now() < t_start + 0.0001) {
+			}
+
+			// this lock ensures that we don't reset and upload at the same time
+			lock_guard<mutex> lock_uploader(mtx_uploader);
 
 			// reclaim all pinned memory slots that are no longer needed and give them back to the pool
 			mtx_pinnedMemoryInUpload.lock();
@@ -3534,8 +3645,6 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 
 			if (everythingIsDone) continue;
 			if (ringFull) continue;
-
-			auto t_00 = now();
 
 			// acquire work, or keep spinning if there is none
 			PointBatch batch;
@@ -3585,8 +3694,6 @@ void spawnUploader(shared_ptr<GLRenderer> renderer) {
 
 		});
 	t.detach();
-
-	setThreadPriorityHigh(t);
 }
 
 // ---- screenshots from the command line ------------------------------------
@@ -3673,7 +3780,12 @@ int main(int argc, char** argv){
 		if(string(argv[i]) == "--hidden") GLRenderer::startHidden = true;
 	}
 
+	// GLFW errors and window start-up failures go to the run log
+	GLRenderer::log = [](const string& message){ logLine("[host] %s\n", message.c_str()); };
 	auto renderer = make_shared<GLRenderer>();
+	// Minimised, the window waits for events instead of drawing frames no one
+	// sees, except while a load needs frames to insert its points.
+	renderer->workPending = [](){ return !lastBatchFinishedDevice || requestReset; };
 	{
 		// Which GPU draws the window. On a hybrid-graphics laptop it must be
 		// the NVIDIA one, or CUDA cannot register the frame texture and every
@@ -3743,10 +3855,29 @@ int main(int argc, char** argv){
 		}
 	}
 
+	// Kernel compile and link messages, a line at a time: a compiler's log
+	// can run past the 2,048 characters of one log line
+	cudaProgramLog = [](const string& message){
+		std::stringstream lines(message);
+		string line;
+		int numLines = 0;
+		while(std::getline(lines, line)){
+			if(++numLines > 60){ logLine("[kernels]   (the rest is on the console)\n"); break; }
+			logLine("%s\n", line.c_str());
+		}
+	};
+	for(int i = 1; i < argc; i++){
+		if(string(argv[i]) == "--no-kernel-cache") kernelCacheEnabled = false;   // compile the kernels, as every start did
+	}
 	initCuda();
 	initCudaProgram(renderer);
 
-	pinnedMemPool.reserveSlots(PINNED_MEM_POOL_SIZE);
+	// Loaders stop taking batches once MAX_DECODED_AHEAD decoded batches wait
+	// for the kernel, so at most that many slots, plus one per loader taking a
+	// batch as the limit is reached, are in use. 200 slots (3.4 GB of RAM that
+	// cannot be paged out) used to be reserved, of which about 70 were ever
+	// used. acquire() adds a slot if the pool runs out.
+	pinnedMemPool.reserveSlots(int(MAX_DECODED_AHEAD) + numThreads + 2);
 
 	mtx_loader.reserve(numThreads);
 	for(int i = 0; i < numThreads; i++){
@@ -3756,7 +3887,7 @@ int main(int argc, char** argv){
 
 	cudaprint.init();
 	
-	spawnUploader(renderer);
+	spawnUploader();
 
 	// Command line: SimLOD.exe [cloud.las|.laz|.simlod ...] [--view yaw pitch radius tx ty tz]
 	// Files load as if dropped on the window; --view sets the camera afterwards
@@ -3814,6 +3945,8 @@ int main(int argc, char** argv){
 			benchFrames = std::max(0, std::atoi(argv[++i]));
 		}else if(arg == "--hidden"){
 			// applied before the window was created
+		}else if(arg == "--no-kernel-cache"){
+			// applied before the kernels were built
 		}else if(arg == "--look" && i + 1 < argc){
 			// a saved look, as a file or by name in the looks folder; a --set
 			// after it changes it further
@@ -3825,11 +3958,14 @@ int main(int argc, char** argv){
 			size_t eq = kv.find('=');
 			string key = kv.substr(0, eq);
 			double v = (eq == string::npos) ? 1.0 : std::atof(kv.c_str() + eq + 1);
+			// Values are kept within the sliders' ranges, as a look file's
+			// are: splat=1000 used to allow 1000-pixel splats against a slider
+			// limit of 64.
 			if     (key == "hqs")       settings.useHighQualityShading = v != 0.0;
-			else if(key == "splat")     settings.maxSplatPx            = int(v);
-			else if(key == "detail")    settings.minNodeSize           = float(v);
+			else if(key == "splat")     settings.maxSplatPx            = std::clamp(int(v), 2, 64);           // Max splat px
+			else if(key == "detail")    settings.minNodeSize           = std::clamp(float(v), 8.0f, 256.0f);  // Detail
 			else if(key == "adaptive")  settings.adaptiveDetail        = v != 0.0;
-			else if(key == "budget")    settings.frameBudgetMs         = float(v);
+			else if(key == "budget")    settings.frameBudgetMs         = std::clamp(float(v), 10.0f, 100.0f); // Budget ms
 			else if(key == "vsync")     settings.vsync                 = v != 0.0;
 			else if(key == "insects")   settings.numInsects            = int(v);
 			else if(key == "grain")     settings.grain                 = float(v);
@@ -3846,18 +3982,27 @@ int main(int argc, char** argv){
 			else if(key == "whitefix")  settings.whiteFix              = v != 0.0;
 			else if(key == "skycast")   settings.tintMargin            = float(v);   // Scan clean-up > Sky cast
 			else if(key == "torch")     settings.torchOn               = v != 0.0;   // aims at the frame centre
-			else if(key == "radius")  { g_eventRadiusArg = float(v); if(v > 0.0) g_eventRadius = float(v); }
+			else if(key == "radius")  { g_eventRadiusArg = v > 0.0 ? std::clamp(float(v), 0.1f, 1000.0f) : 0.0f; if(v > 0.0) g_eventRadius = g_eventRadiusArg; }
 			else if(key == "exposure")  settings.exposure              = float(v);
 			else if(key == "unedited" || key == "native") settings.showUnedited = v != 0.0;   // 1 = the unedited view; "native" was its old name
 			else if(key == "tone")      settings.toneCurve             = float(v);
 			else if(key == "keep")      loadKeepPer10k = uint32_t(std::clamp(v, 0.01, 1.0) * 10000.0 + 0.5);   // fraction of each file loaded
-			else printfmt("unknown --set key: {} (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze, hazefall, hazefloor, hazesky, light, sunbeams, whitefix, skycast, torch, radius, exposure, tone, unedited, keep)\n", key);
-		}else if(iEndsWith(arg, "las") || iEndsWith(arg, "laz") || iEndsWith(arg, "simlod")){
+			else logLine("[host] unknown --set key %s, ignored (hqs, splat, detail, adaptive, budget, vsync, insects, grain, bloom, markers, pointsize, gain, haze, hazefall, hazefloor, hazesky, light, sunbeams, whitefix, skycast, torch, radius, exposure, tone, unedited, keep)\n", key.c_str());
+			// the keys that are look settings take the look's limits
+			static const std::map<string, const char*> lookNameOf = {
+				{"insects", "insects"}, {"grain", "grain"}, {"bloom", "bloom_strength"}, {"pointsize", "point_size_m"},
+				{"gain", "emission_gain"}, {"haze", "depth_haze"}, {"hazefall", "haze_thins_with_height"},
+				{"hazefloor", "haze_floor_m"}, {"sunbeams", "sunbeams"}, {"skycast", "sky_cast"},
+				{"exposure", "exposure"}, {"tone", "tone_curve"},
+			};
+			auto look = lookNameOf.find(key);
+			if(look != lookNameOf.end()) clampLookSetting(look->second);
+		}else if(isPointFile(arg)){
 			std::error_code ec;
 			auto absolute = std::filesystem::absolute(arg, ec);   // dropped files are absolute too
 			argFiles.push_back(ec ? arg : absolute.string());
 		}else{
-			printfmt("ignoring command-line argument: {}\n", arg);
+			logLine("[host] command-line argument not recognised, ignored: %s\n", arg.c_str());
 		}
 	}
 	if(argc > 1){
@@ -3875,6 +4020,10 @@ int main(int argc, char** argv){
 		settings.enableBloom = settings.bloomStrength > 0.0f;
 		logLine("[calls] %s: %d calls, %s\n", argCalls.c_str(), int(g_calls.size()), g_callsLoaded ? "playing" : "none loaded");
 	}
+	g_drawEveryFrame = benchFrames > 0;   // --bench times frames, so none is skipped
+	if(benchFrames > 0 && shots.empty()){
+		logLine("[shot] --bench times frames at each shot's camera, and no shot was given (--shots or --screenshot): nothing is timed\n");
+	}
 	if(!shots.empty()){
 		logLine("[shot] %d screenshot(s) after loading, %.1f s each%s\n", int(shots.size()), shotDelay, exitAfterShots ? ", then exit" : "");
 		GLRenderer::inputLocked = true;   // a stray click or scroll would move the shots' camera
@@ -3889,7 +4038,7 @@ int main(int argc, char** argv){
 	// here with real files deadlocked against the already-running loaders.
 	bool startCameraPending = false;
 	if(!argFiles.empty()){
-		paths = argFiles;   // replaces the "NONE" placeholder
+		paths = argFiles;
 		requestReset = true;
 		startCameraPending = true;
 	}
@@ -3910,25 +4059,25 @@ int main(int argc, char** argv){
 	renderer->onFileDrop([&](vector<string> files){
 		vector<string> pointCloudFiles;
 
-		t_drop_start = now();
-		printfmt("drop at {:.3f} \n", now());
-
 		for(auto file : files){
 			logLine("[load] dropped: %s\n", file.c_str());
 
-			if(iEndsWith(file, "las") || iEndsWith(file, "laz")){
-				pointCloudFiles.push_back(file);
-			}else if(iEndsWith(file, "simlod")){
+			if(isPointFile(file)){
 				pointCloudFiles.push_back(file);
 			}
 		}
 
-		// a stray CSV or folder must not clear the scene (and a reload of the
-		// full scan takes minutes)
+		// A stray CSV or folder must not clear the scene (and a reload of the
+		// full scan takes minutes), nor a point file that cannot be loaded.
+		bool anyPointFiles = !pointCloudFiles.empty();
+		string refusal;
+		pointCloudFiles = loadablePointFiles(pointCloudFiles, &refusal);
 		if(pointCloudFiles.empty()){
-			notice("No .las, .laz or .simlod in the drop - keeping the current cloud");
+			if(anyPointFiles) notice("%s - keeping the current cloud", refusal.c_str());
+			else notice("No .las, .laz or .simlod in the drop - keeping the current cloud");
 			return;
 		}
+		if(!refusal.empty()) notice("%s", refusal.c_str());
 
 		paths = pointCloudFiles;
 
@@ -3955,7 +4104,7 @@ int main(int argc, char** argv){
 
 	auto render = [&](){
 
-		timeSinceLastFrame = static_cast<float>(now()) - lastFrameTime;
+		timeSinceLastFrame = now() - lastFrameTime;
 
 		// ---- walking (apply_navigate.ps1) --------------------------------
 		// W/S forward and back along the view, A/D sideways, Q/E down and up.
@@ -3964,7 +4113,7 @@ int main(int argc, char** argv){
 		{
 			ImGuiIO& io = ImGui::GetIO();
 			if(!io.WantCaptureKeyboard && !GLRenderer::inputLocked){
-				float dt = timeSinceLastFrame > 0.0f && timeSinceLastFrame < 0.5f ? timeSinceLastFrame : 0.016f;
+				float dt = timeSinceLastFrame > 0.0 && timeSinceLastFrame < 0.5 ? float(timeSinceLastFrame) : 0.016f;
 				double d = double(g_walkSpeed) * double(dt);
 				auto held = [](int key){ return Runtime::keyStates[key] > 0; };
 				double fwd = 0.0, side = 0.0, up = 0.0;
@@ -4062,21 +4211,38 @@ int main(int argc, char** argv){
 				g_pickWaiting = false;
 			}
 		}
-		lastFrameTime = static_cast<float>(now());
+		lastFrameTime = now();
 
 		if(renderer->width > 0 && renderer->height > 0){   // 0 x 0 while minimised
-			renderer->view.framebuffer->setSize(renderer->width, renderer->height);
+			auto& framebuffer = renderer->view.framebuffer;
+			if(framebuffer->width != renderer->width || framebuffer->height != renderer->height){
+				releaseFrameTexture();   // setSize deletes the texture and makes a new one
+			}
+			framebuffer->setSize(renderer->width, renderer->height);
 		}
 
 		glBindFramebuffer(GL_FRAMEBUFFER, renderer->view.framebuffer->handle);
 
-		if(!lastBatchFinishedDevice){
-			processFrameTimes.push_back(timeSinceLastFrame);
-		}
-
 		if(requestReset){
 			reset(renderer);
-			if(startCameraPending){ applyStartCamera(); startCameraPending = false; }   // boxSize is known now
+			if(startCameraPending){
+				applyStartCamera();   // boxSize is known now
+				startCameraPending = false;
+				if(numPointsTotal == 0){
+					// Every file on the command line was refused (reload logged
+					// why). Shots would be of empty sky, and --exit would end
+					// as if all had gone well.
+					if(!shots.empty()){
+						logLine("[shot] nothing was loaded, so no screenshots are taken\n");
+						shots.clear();
+					}
+					if(exitAfterShots){
+						logLine("[host] --exit: nothing was loaded; exiting with code 1\n");
+						GLRenderer::exitCode = 1;
+						glfwSetWindowShouldClose(renderer->window, 1);
+					}
+				}
+			}
 		}
 
 		{   // GLRenderer starts with vsync off (glfwSwapInterval(0)); follow the setting
@@ -4091,11 +4257,11 @@ int main(int argc, char** argv){
 		// ---- command-line screenshots (--shots, --screenshot) -------------
 		// After the load: move to each shot's camera, wait shotDelay for the
 		// occupancy grid, light and glow to settle, then save the frame just
-		// rendered. A camera set here takes effect from the next frame. The
-		// window still takes mouse and keys, so if the camera moves while a
-		// shot waits (anything but the controls' own adjustment on the first
-		// frame, such as pinning the radius in walk mode), the shot's camera
-		// is set again and the wait starts over.
+		// rendered. A camera set here takes effect from the next frame. Mouse
+		// and keys are locked out while shots run (inputLocked), but if the
+		// camera still moves while a shot waits (anything but the controls'
+		// own adjustment on the first frame, such as pinning the radius in
+		// walk mode), the shot's camera is set again and the wait starts over.
 		if(exitAfterShots && shots.empty() && lastBatchFinishedDevice){
 			glfwSetWindowShouldClose(renderer->window, 1);
 		}
@@ -4196,18 +4362,10 @@ int main(int argc, char** argv){
 			updateOctree(renderer);
 		}
 
-		// if(requestColorFiltering){
-		// 	doColorFiltering(renderer);
-		// }
-
 		if(!lastBatchFinishedDevice){
-			totalUpdateDuration = 1000.0f * (static_cast<float>(now()) - loadStart);
-		}else if(requestBenchmark && lastBatchFinishedDevice){
-			requestBenchmark = false;
-			printfmt("finished loading, disabling benchmarking. \n");
+			totalUpdateDuration = float(1000.0 * (now() - loadStart));
 		}
 
-		static int statsAge = 0;
 		{
 			// copy stats from gpu to cpu.
 			// actually laggs behind because we do async copy.
@@ -4220,11 +4378,9 @@ int main(int argc, char** argv){
 			batchesProcessedHost = stats.batchletIndex;
 			pointsProcessedHost  = stats.numPointsProcessed;
 
-			statsAge = static_cast<int>(renderer->frameCount) - stats.frameID;
-
 			if(!lastBatchFinishedDevice && numPointsTotal > 0){
 				logIfChanged("load", 2.0, "[load] %.1f s: %.1f M decoded, %.1f M uploaded, %.1f M of %.1f M inserted; octree pool %.0f of %.0f MB\n",
-					now() - double(loadStart), numPointsLoaded / 1e6, numPointsUploaded / 1e6,
+					now() - loadStart, numPointsLoaded / 1e6, numPointsUploaded / 1e6,
 					stats.numPointsProcessed / 1e6, numPointsTotal / 1e6,
 					stats.allocatedBytes_persistent / 1e6, persistentBufferCapacity / 1e6);
 			}
@@ -4233,15 +4389,6 @@ int main(int argc, char** argv){
 				stopLoadingAtCapacity();
 			}
 
-			static uint64_t previousNumPointsProcessed = 0;
-			uint64_t numPointsProcessed = stats.numPointsProcessed;
-
-			// if(numPointsProcessed != previousNumPointsProcessed){
-			// 	printfmt("processed {} at {:.3f}. since drop: {:.3f} \n", numPointsProcessed, now(), now() - t_drop_start);
-
-			// 	previousNumPointsProcessed = numPointsProcessed;
-			// }
-			
 
 			{   // batches a loader could not read (skipUnreadableBatch)
 				static uint64_t reportedUnreadable = 0;
@@ -4408,7 +4555,7 @@ int main(int argc, char** argv){
 					settings.lookUpDeg = float(renderer->controls->pitch * 180.0 / 3.14159265358979);
 				}
 				ImGui::SliderFloat("Walk speed (m/s)", &g_walkSpeed, 0.2f, 15.0f);
-				tipFor("W/S walk along the view, A/D sideways, Q/E down and up, when the mouse is over the forest rather than the panel. The wheel walks too when the camera is standing in the forest.");
+				tipFor("W/S walk along the view, A/D sideways, Q/E down and up, when the mouse is over the forest rather than the panel. In Walk mode the wheel walks too.");
 				ImGui::Checkbox("Walk mode", &renderer->controls->walkMode);
 				tipFor("On: the wheel and W/S walk. Off: the wheel zooms the orbit.");
 				if(ImGui::Button("Go to centre")){
@@ -4481,7 +4628,7 @@ int main(int argc, char** argv){
 				lm |= ImGui::SliderFloat("Azimuth",          &settings.lightAzimuth,   0.0f, 360.0f);
 				lm |= ImGui::SliderFloat("Elevation",        &settings.lightElevation, 0.0f,  89.0f);
 				tipFor("Where the light comes FROM. The reference is backlit and high.");
-				lm |= ImGui::SliderFloat("Strength",         &settings.lightIntensity, 0.0f,   6.0f);
+				ImGui::SliderFloat("Strength",         &settings.lightIntensity, 0.0f,   6.0f);   // scales the light at draw time: no grid rebuild
 				ImGui::ColorEdit3 ("Light colour",     settings.lightColour, ImGuiColorEditFlags_NoInputs);
 				ImGui::SliderFloat("Ambient",          &settings.ambient,        0.0f, 1.0f);
 				tipFor("Floor under the key light, so shadowed points keep some of their own colour. The haze in shade darkens to the same level.");
@@ -4577,10 +4724,16 @@ int main(int argc, char** argv){
 						"../rotokare_test_kit/kit/data/calls.csv",
 						"S:/SimLodMod/rotokare_test_kit/kit/data/calls.csv",
 					};
+					bool found = false;
 					for(const char* p : candidates){
-						if(std::filesystem::exists(p)){ loadCallSchedule(p); break; }
+						if(std::filesystem::exists(p)){ loadCallSchedule(p); found = true; break; }
 					}
-					if(!g_callsLoaded) printf("[calls] no calls.csv found in any candidate location\n");
+					if(!found){
+						g_calls.clear();
+						g_callsLoaded = false;
+						logLine("[calls] no calls.csv in the working directory or the test kit's folders\n");
+						notice("No calls.csv found in the working directory or the test kit");
+					}
 					g_showClock = 0.0;
 				}
 				ImGui::SameLine(0.0f);
@@ -4680,7 +4833,14 @@ int main(int argc, char** argv){
 					if(ImGui::InputFloat3("##survey", sv, "%.3f")){
 						mk.sx = sv[0]; mk.sy = sv[1]; mk.sz = sv[2]; mk.hasSurvey = true;
 					}
-					if(!mk.hasSurvey){ ImGui::SameLine(0.0f); ImGui::TextDisabled("(not set)"); }
+					ImGui::SameLine(0.0f);
+					if(!mk.hasSurvey){
+						ImGui::TextDisabled("(not set)");
+					}else if(ImGui::SmallButton("clear")){
+						// a value typed by mistake left the marker in every fit
+						mk.sx = mk.sy = mk.sz = 0.0f;
+						mk.hasSurvey = false;
+					}
 					if(g_surveyValid && mk.hasSurvey){
 						double px, py, pz;
 						fileToSurvey(double(mk.x) + boxMin.x, double(mk.y) + boxMin.y, double(mk.z) + boxMin.z, px, py, pz);
@@ -4709,9 +4869,9 @@ int main(int argc, char** argv){
 					ImGui::TextDisabled("not fitted");
 				}
 				if(ImGui::Checkbox("calls.csv is in survey coordinates", &g_callsInSurvey)){
-					if(g_callsLoaded) notice("Reload calls.csv for this to take effect");
+					if(g_callsInSurvey && !g_surveyValid) notice("No survey fit yet: calls are placed as file (LAS) coordinates until there is one");
 				}
-				tipFor("On: call positions are converted from the survey frame into the file frame when calls.csv is loaded, using the fit above. Off: calls.csv is taken to be in file (LAS) coordinates already.");
+				tipFor("On: call positions are converted from the survey frame into the file frame with the fit above, as it stands, so fitting again or clearing the markers moves them at once. Until there is a fit they are used as file coordinates. Off: calls.csv is taken to be in file (LAS) coordinates already.");
 			}
 
 			// ---- DETAIL AND SPEED ---------------------------------------------
@@ -4753,6 +4913,12 @@ int main(int argc, char** argv){
 				}
 				ImGui::Checkbox("VSync", &settings.vsync);
 				tipFor("Caps the frame rate at the display refresh. Saves GPU power and heat, which matters on a laptop GPU; turn it off only to measure raw speed.");
+				ImGui::Checkbox("Skip unchanged frames", &settings.skipUnchanged);
+				tipFor("Keeps the last frame while nothing that would change it has changed: the camera, a setting, a load, the calls or the insects. Saves GPU power on a still view. Turn it off if the view ever fails to update.");
+				if(settings.skipUnchanged){
+					ImGui::SameLine(0.0f);
+					ImGui::Text("%.0f%% of recent frames kept", 100.0f * g_keptShare);
+				}
 				ImGui::SliderInt  ("Max splat px",     &settings.maxSplatPx,     2, 64);
 				tipFor("Cap on how large a near point may be drawn. Lower if the frame rate drops when the camera is close to foliage.");
 			}
@@ -4817,7 +4983,7 @@ int main(int argc, char** argv){
 				}
 				if(ImGui::Button("Rebuild grid counts")){ g_gridRefill = true; }
 				ImGui::Checkbox   ("Use voxel grid",    &settings.useVoxelGrid);
-				tipFor("Off stops the stray-point cull, insect placement near foliage, the grid view and the calls' medium from using the occupancy grid. The grid is still built, and the key light's canopy shade and the canopy colour repair are not affected.");
+				tipFor("Off stops the stray-point cull, insect placement near foliage, the grid view, the calls' medium and the canopy's dimming of the sunbeams along each view ray from using the occupancy grid. The grid is still built, and the key light's shade on the points and the canopy colour repair are not affected.");
 			}
 
 			// ---- DISPLAY AND DEBUG --------------------------------------------
@@ -4847,10 +5013,6 @@ int main(int argc, char** argv){
 					ImGui::SetClipboardText(g_logPath.c_str());
 				}
 			}
-
-			// if(ImGui::Button("Do Color Filtering!")){
-			// 	requestColorFiltering = true;
-			// }
 
 			ImGui::End();
 			if(smallText){
@@ -4954,11 +5116,6 @@ int main(int argc, char** argv){
 				return leftPad(str, 14);
 			};
 
-			auto toB = [locale](double number) {
-				string str = format(locale, "{:.1Lf} B", number / 1'000'000'000.0);
-				return leftPad(str, 14);
-			};
-
 			auto toMB = [locale](double number){
 				string str = format(locale, "{:.1Lf} MB", number / 1'000'000.0);
 				return leftPad(str, 15);
@@ -4973,50 +5130,31 @@ int main(int argc, char** argv){
 				return leftPad(str, 10);
 			};
 
-			double pointsSecUpdate = double(stats.numPointsProcessed) / (double(kernelUpdateDuration) / 1000.0);
+			// Rates over the load so far. The rows for the kernels' own
+			// durations and the rendering rates were filled only by a
+			// benchmark that nothing switched on, so they read "-" or 0; the
+			// stage rows below give the render kernel's times.
 			double pointsSecTotal = double(stats.numPointsProcessed) / (double(totalUpdateDuration) / 1000.0);
 			double gbs_file = double(numBytesLoaded) / (totalUpdateDuration / 1000.0);
 			double gbs_gpu = double(16llu * stats.numPointsProcessed) / (totalUpdateDuration / 1000.0);
 
-			double millionPointsSecRendered = 1000.0 * float(stats.numVisiblePoints) / renderingDuration;
-			double millionVoxelsSecRendered = 1000.0 * float(stats.numVisibleVoxels) / renderingDuration;
-			double millionSamplesSecRendered = 1000.0 * (float(stats.numVisiblePoints + stats.numVisibleVoxels) / renderingDuration);
-
-			if(!settings.benchmarkRendering){
-				millionPointsSecRendered = 0.0;
-				millionVoxelsSecRendered = 0.0;
-				millionSamplesSecRendered = 0.0;
-				renderingDuration = 0.0;
-			}
-
 			double M = 1'000'000.0;
-			double B = 1'000'000'000.0;
 			double MB = 1'000'000.0; // TIL: MB = 1'000'000 vs. MiB = 1024 * 1024
 			double GB = 1'000'000'000.0;
 
 			vector<vector<string>> table = {
-				{"#update kernel duration  ", toMS(kernelUpdateDuration)                            , format("{:.1f}", kernelUpdateDuration)},
-				{"    max                  ", toMS(maxKernelUpdateDuration)                         , format("{:.1f}", maxKernelUpdateDuration)},
-				{"    avg                  ", toMS(avgKernelUpdateDuration)                         , format("{:.1f}", avgKernelUpdateDuration)},
 				{"#update total duration   ", toMS(totalUpdateDuration)                             , format("{:.1f}", totalUpdateDuration)},
-				{"points/sec update kernel ", toM(pointsSecUpdate)                                  , format("{:.1f}", totalUpdateDuration / M)},
 				{"points/sec total         ", toM(pointsSecTotal)                                   , format("{:.1f}", pointsSecTotal / M)},
-				{"GB/s (disk I/O)          ", toGB(gbs_file)                                        , format("{:.1f}", gbs_file / GB)},
+				// LAZ batches are not counted in numBytesLoaded
+				{"GB/s (disk I/O)          ", lazInBatches ? leftPad("-", 15) : toGB(gbs_file)    , lazInBatches ? string("-") : format("{:.1f}", gbs_file / GB)},
 				{"GB/s (gpu)               ", toGB(gbs_gpu)                                         , format("{:.1f}", gbs_gpu / GB)},
-				{"=========================", " "                                                   , " "},
-				{"#render kernel duration  ", toMS(kernelRenderDuration)                            , format("{:.1f}", kernelRenderDuration)},
-				{"=========================", " "                                                   , " "},
-				{"rendering duration       ", toMS(renderingDuration)                               , format("{:.1f}", renderingDuration)},
-				{"    points / sec         ", toB(millionPointsSecRendered)                        , format("{:.1f}", millionPointsSecRendered / B)},
-				{"    voxels / sec         ", toB(millionVoxelsSecRendered)                        , format("{:.1f}", millionVoxelsSecRendered / B)},
-				{"    samples / sec        ", toB(millionSamplesSecRendered)                       , format("{:.1f}", millionSamplesSecRendered / B)},
 				{"=========================", " "                                                   , " "},
 				{"#points processed        ", toM(double(stats.numPointsProcessed))                 , format("{:.1f}", stats.numPointsProcessed / M)},
 				{"#nodes                   ", toIntString(stats.numNodes)                           , format("{}", stats.numNodes)},
 				{"    #inner               ", toIntString(stats.numInner)                           , format("{}", stats.numInner)},
 				{"    #leaves (nonempty)   ", toIntString(stats.numNonemptyLeaves)                  , format("{}", stats.numNonemptyLeaves)},
 				{"    #leaves (empty)      ", toIntString(numEmptyLeaves)                           , format("{}", numEmptyLeaves)},
-				{"#chunks                  ", toIntString(stats.numNodes)                           , format("{}", stats.numNodes)},
+				{"#chunks                  ", toIntString(stats.numChunksPoints + stats.numChunksVoxels), format("{}", stats.numChunksPoints + stats.numChunksVoxels)},
 				{"    #voxels              ", toIntString(stats.numChunksVoxels)                    , format("{}", stats.numChunksVoxels)},
 				{"    #points              ", toIntString(stats.numChunksPoints)                    , format("{}", stats.numChunksPoints)},
 				{"#samples                 ", toM(stats.numPoints + stats.numVoxels)                , format("{:.1f}", (stats.numPoints + stats.numVoxels) / M)},

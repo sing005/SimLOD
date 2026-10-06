@@ -54,14 +54,18 @@ python tools/recolour_eval.py data/samples/column_3m.laz --output out.laz       
 
 Every attribute other than red, green and blue is left unchanged, and so are the points that need no change. `--show classes` writes the structure classes as false colour (orange trunk/branch, green leaf, magenta pages). `--show paths` shows which step coloured each point.
 
-Time and memory, measured in a 4-core cloud session:
+Time and memory, measured in a 4-core cloud session (peak memory with one worker):
 
 | | Points | 1 worker | 3 workers | Peak memory |
 |---|---|---|---|---|
-| `column_3m.laz` | 4.8 M | 64 s | | 1.3 GB |
-| `every100.laz` | 3.5 M | 66 s | 33 s | 1.2 GB |
+| `column_3m.laz` | 4.8 M | 69 s | 43 s | 1.1 GB |
+| `every100.laz` | 3.5 M | 65 s | 31 s | 0.9 GB |
 
-A worker's memory depends on how many points it holds at once: about 0.32 GB per million points, measured on `column_3m.laz` and on a 58 M-point tile made of copies of it. A tile with at most `--slab-points` own points (12 M) is held whole, with its halo. A denser tile is read from disk one slab at a time. A slab is a band across the tile with up to 12 M own points, held together with the points within 0.6 m of it, its context. Near the scanner the full scan's slabs are only about 1 m wide, so the context holds more points than the slab: up to about 27 M points in all, which needs about 10 GB (estimated from `every100.laz`). After the split, the log reports the most points a worker will hold at once and the memory that needs. Earlier versions also held each dense tile whole while working through its slabs, which added about 6 GB for the densest tile of the full scan. The output is the same, except with `--texture` on a scan with dense tiles: its fit now measures such a tile slab by slab, so pairs of points in different slabs are no longer compared. The full scan has not been run with this version.
+A worker's memory depends on how many points it holds at once: about 0.32 GB per million points, measured on `column_3m.laz` and on a 58 M-point tile made of copies of it. A tile with at most `--slab-points` own points (12 M) is processed whole, with its halo. A denser tile is processed in slabs. A slab is a band across the tile with up to 12 M own points, read from disk with the points within 0.6 m of it, its context. Near the scanner the full scan's slabs are only about 1 m wide, so the context holds more points than the slab: up to about 27 M points in all, which needs about 10 GB (estimated from `every100.laz`). After the split, the log reports the most points a worker will hold at once and the memory that needs. Earlier versions also held each dense tile whole while working through its slabs, which added about 6 GB for the densest tile of the full scan. The output is the same, except with `--texture` on a scan with dense tiles: its fit now measures such a tile slab by slab, so pairs of points in different slabs are no longer compared.
+
+Each whole tile, and each slab, is a separate job, and the largest jobs start first. Earlier versions gave all the slabs of a dense tile to one worker, one after another. In WhiteCanopy one tile holds about 35 % of all the work, so a run could not end before that tile did, however many workers there were: about 31 minutes at this session's rate. With its slabs spread over 8 workers, the longest worker's share is estimated at about 11 minutes (both estimates from `every100.laz`). On `column_3m.laz` cut into 1 M-point slabs (`--slab-points 1000000`), 3 workers took 56 s, against 76 s when one worker took each tile. The output is byte-identical either way, and with any number of workers. The full scan has not been run with this version.
+
+The scratch folder, next to the output unless `--scratch` names one, holds every tile's points and its halo. To these the run adds the recoloured copy of each whole tile, and the new colours of each slab at 3 bytes a point: about 15 GB in all for WhiteCanopy, estimated from `every100.laz`. Earlier versions also copied every dense tile whole, about 25 GB in all. After the split the log gives the space the rest of the run needs, and the run stops if that space is not free. A folder the run made itself is removed when the run ends, whether or not it succeeds.
 
 A quick test on the full scan: `--crop 8 -4 12 0` recolours a 4 × 4 m patch, about 3.4 M points with 16 % blown, through the full canopy height. A patch around the scanner is not a quick test: `--crop -10 -10 10 10` holds half the scan.
 

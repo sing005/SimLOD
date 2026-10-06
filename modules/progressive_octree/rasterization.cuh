@@ -199,8 +199,8 @@ void rasterizePlane(uint64_t* target, int width, int height, mat4 transform){
 		float v = float(uy) / float(cells - 1);
 
 		float4 pos = {
-			20.0 * (u - 0.5), 
-			20.0 * (v - 0.5), 
+			20.0f * (u - 0.5f), 
+			20.0f * (v - 0.5f), 
 			0.0f, 
 			1.0f};
 

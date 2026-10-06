@@ -2,7 +2,7 @@
 Markus Schütz, Lukas Herzberger, Michael Wimmer
 
 Paper: <a href="https://www.cg.tuwien.ac.at/research/publications/2023/SCHUETZ-2023-SIMLOD/SCHUETZ-2023-SIMLOD-paper.pdf">"SimLOD: Simultaneous LOD Generation and Rendering"</a><br>
-Binaries: <a href="https://github.com/m-schuetz/SimLOD/releases/">SimLOD 1.0</a> (May require a CUDA 11.8 installation due to hot reload? We'll work on a standalone binary)
+Binaries: <a href="https://github.com/m-schuetz/SimLOD/releases/">SimLOD 1.0</a>, upstream's, without this fork's additions.
 
 This project loads point clouds, creates an LOD structure on-the-fly, and immediatelly displays the results in real time. 
 
@@ -10,6 +10,8 @@ This project loads point clouds, creates an LOD structure on-the-fly, and immedi
 On an RTX 4090 and PCIe 5.0 SSD (12GB/s), we are able to load and real-time render point clouds at rates of about 200-300 million points per second (MP/s) from the LAS format, 30 MP/s from compressed LAZ files, and up to 580 MP/s from an optimal XYZRGBA(16bytes/point) format.
 
 Right now we only display data sets that fit in GPU memory, but support for arbitarily large point clouds is in development.
+
+This repository is a modified fork. It adds a fisheye lens, a key light with volumetric haze, a colour grade, an occupancy grid (stray-point removal, canopy shade, insect placement), survey markers fitted to a survey frame, walking navigation, and call playback for the Rotokare acoustic project. terrestrial.md describes these, and how to build, run and test the fork.
 
 <table>
 <tr style="border: none">
@@ -23,7 +25,7 @@ Right now we only display data sets that fit in GPU memory, but support for arbi
 </tr>
 </table>
 
-The generated LOD structure is an octree that stores voxels in inner nodes and original point cloud data in leaf nodes [WBB08]. Voxels are created by sampling on a 128³ grid. Due to the sparsity in surfacic data sets, the voxels themselves are stored in lists instead of grids. In order to support growing amounts of voxels and points as new data is inserted into the octree, we use linked lists of chunks of points/voxels. 
+The generated LOD structure is an octree that stores voxels in inner nodes and original point cloud data in leaf nodes [WBB08]. Voxels are created by sampling on a 64³ grid (GRID_SIZE in structures.cuh). Due to the sparsity in surfacic data sets, the voxels themselves are stored in lists instead of grids. In order to support growing amounts of voxels and points as new data is inserted into the octree, we use linked lists of chunks of points/voxels. 
 
 <table>
 <tr style="border: none">
@@ -40,7 +42,7 @@ The generated LOD structure is an octree that stores voxels in inner nodes and o
 </tr>
 <tr style="border: none">
 	<td colspan="4" style="border: none">
-	Figure: Inner nodes comprise representative voxels with a resolution of 128³ and leaf nodes store the full-precision point cloud data. We render the LOD at a resolution that results in pixel-sized voxels to give the impression of looking at the full-res data. 
+	Figure: Inner nodes comprise representative voxels with a resolution of 64³ and leaf nodes store the full-precision point cloud data. We render the LOD at a resolution that results in pixel-sized voxels to give the impression of looking at the full-res data. 
 	</td>
 </tr>
 </table>
@@ -71,7 +73,7 @@ During rendering, a CUDA kernel first computes a list of visible octree nodes. E
 
 #### Prebuilt windows binaries
 
-* Prebuilt binaries are available at the release page: https://github.com/m-schuetz/SimLOD/releases/
+* Upstream's prebuilt binaries, without this fork's additions, are on its release page: https://github.com/m-schuetz/SimLOD/releases/
 
 #### Windows with Visual Studio 2022
 
@@ -80,7 +82,7 @@ During rendering, a CUDA kernel first computes a list of visible octree nodes. E
 ```
 mkdir build
 cd build
-cmake ../ -G "Visual Studio 17 2022" -A x64
+cmake ../ -G "Visual Studio 17 2022" -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 ```
 
 * Open build/SimLOD.sln
@@ -88,18 +90,17 @@ cmake ../ -G "Visual Studio 17 2022" -A x64
 * Compile and Run (Ctrl + F5)
 * Drag&Drop point clouds in *.las, *.laz or *.simlod format into the application.
 
-#### Windows or Linux with CMake
+The policy flag is needed with CMake 4.x, because the GLFW the build fetches declares a minimum below 3.5.
 
-```
-mkdir out && cd out         # Create a build directory
-cmake .. && make            # Configure CMake and build the SimLOD target
-./SimLOD                    # Run SimLOD
-```
+#### Linux
+
+The host code does not compile with g++ 13 at present: `std::format` and `fmt::format` calls are ambiguous there (57 errors). The Windows build is the one in use.
 
 
 ### Notes
 
-* The environment variable ```CUDA_PATH``` needs to point to the install location of CUDA Toolkit 11.8 (e.g., ```/usr/local/cuda-11.8```)
+* The environment variable ```CUDA_PATH``` needs to point to a CUDA Toolkit, 12.4 or later (the version the exe was built with): NVRTC compiles the kernels against its headers. Its `bin` folder must be on `PATH` for NVRTC and nvJitLink.
+* The compiled kernels are cached in `%LOCALAPPDATA%\SimLOD\kernels` and rebuilt whenever a file under `modules` changes; `--no-kernel-cache` compiles them at every start.
 * If you want to modify and hot reload CUDA code at runtime, make sure to set the work directory to the top-most folder of this repository instead of the binary target path. The project loads cuda files located relative to "./modules".
 
 ## Software Architecture

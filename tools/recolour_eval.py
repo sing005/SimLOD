@@ -137,15 +137,16 @@ def part0(xyz, rgb, inten, a):
         ti = np.flatnonzero(trusted & (inten > 0))
         rng = np.random.default_rng(0)
         q = rng.choice(ti, min(20_000, len(ti)), replace=False)
-        nbrs = cKDTree(xyz[ti]).query_ball_point(xyz[q], r=0.10, workers=-1)
+        tree = cKDTree(xyz[ti])
         cs = []
-        for nb in nbrs:
-            if len(nb) < 30:
-                continue
-            nb = np.asarray(nb[:2000])
-            A = inten[ti[nb]]; B = lab[ti[nb], 0]
-            if A.std() > 0 and B.std() > 0:
-                cs.append(np.corrcoef(A, B)[0, 1])
+        for b0 in range(0, len(q), 1000):   # in batches: the neighbour lists of all 20,000 at once took 6 GB
+            for nb in tree.query_ball_point(xyz[q[b0:b0 + 1000]], r=0.10, workers=-1):
+                if len(nb) < 30:
+                    continue
+                nb = np.asarray(nb[:2000])
+                A = inten[ti[nb]]; B = lab[ti[nb], 0]
+                if A.std() > 0 and B.std() > 0:
+                    cs.append(np.corrcoef(A, B)[0, 1])
         if cs:
             print(f'   laser intensity against lightness L* within 10 cm: median correlation {np.median(cs):.3f} ({len(cs):,} neighbourhoods)')
 
@@ -342,6 +343,10 @@ def main():
                     help='the recolour script --blowout runs (default: this version)')
     ap.add_argument('--tool-args', default='', help='options passed to that script, for example "--texture 1"')
     e = ap.parse_args()
+    # checked now rather than when their part comes, after minutes of measurement
+    for path, needed in ((e.input, True), (e.output, e.output), (e.tool, e.blowout)):
+        if needed and not os.path.isfile(path):
+            ap.error(f'{path} does not exist')
     a = rc.build_parser().parse_args(['in', 'out'])
     xyz, rgb, t, inten = load(e.input, with_intensity=True)
     part0(xyz, rgb, inten, a)

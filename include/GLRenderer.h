@@ -80,7 +80,6 @@ struct Texture {
 struct Framebuffer {
 
 	vector<shared_ptr<Texture>> colorAttachments;
-	shared_ptr<Texture> depth;
 	GLuint handle = -1;
 	GLRenderer* renderer = nullptr;
 
@@ -107,11 +106,6 @@ struct Framebuffer {
 				glNamedFramebufferTexture(this->handle, GL_COLOR_ATTACHMENT0 + i, attachment->handle, 0);
 			}
 
-			{ // DEPTH
-				this->depth->setSize(width, height);
-				glNamedFramebufferTexture(this->handle, GL_DEPTH_ATTACHMENT, this->depth->handle, 0);
-			}
-			
 			this->width = width;
 			this->height = height;
 		}
@@ -150,7 +144,9 @@ struct Camera{
 	void setSize(int width, int height){
 		this->width = width;
 		this->height = height;
-		this->aspect = double(width) / double(height);
+		// 0 x 0 while minimised: keep the last aspect ratio, as NaN failed an
+		// assertion in glm::perspective and aborted a Debug build
+		if(width > 0 && height > 0) this->aspect = double(width) / double(height);
 	}
 
 	void update(){
@@ -174,8 +170,6 @@ struct GLRenderer{
 	shared_ptr<Camera> camera = nullptr;
 	shared_ptr<OrbitControls> controls = nullptr;
 
-	bool vrEnabled = false;
-	
 	View view;
 
 	vector<function<void(vector<string>)>> fileDropListeners;
@@ -197,13 +191,21 @@ struct GLRenderer{
 	int presentY = 0;
 	int presentWidth = 0;
 	int presentHeight = 0;
-	string selectedMethod = "";
 
 	// For unattended runs (--hidden, --shots): create the window invisible,
 	// and ignore mouse and keyboard so a stray click cannot move the camera.
 	// Set before the renderer is constructed / once shots are known.
 	static inline bool startHidden = false;
 	static inline bool inputLocked = false;
+	static inline int  exitCode    = EXIT_SUCCESS;   // the process's exit code when the window closes
+
+	// Where GLFW errors and start-up failures are reported: the application's
+	// run log, if it is set before the renderer is constructed; stderr if not.
+	static inline function<void(const string&)> log;
+
+	// True while the application has work that needs frames, such as a load.
+	// Otherwise a minimised window waits for events instead of drawing.
+	function<bool()> workPending;
 
 	GLRenderer();
 

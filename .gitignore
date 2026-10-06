@@ -35,6 +35,7 @@ build_old/
 log/
 *.log
 markers.csv
+survey_transform.txt
 
 # point-cloud data (too large for git), except the small development samples
 *.las

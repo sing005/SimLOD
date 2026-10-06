@@ -5,7 +5,6 @@
 // License: MIT https://github.com/mrdoob/three.js/blob/dev/LICENSE
 
 #include <cooperative_groups.h>
-#include <curand_kernel.h>
 
 #include "utils.h.cu"
 #include "builtin_types.h"
@@ -21,12 +20,16 @@
 namespace cg = cooperative_groups;
 
 Allocator* allocator;
-Uniforms uniforms;
+// The frame's settings, in constant memory: the host copies them to this
+// symbol before each launch (renderCUDA). As a device global written by
+// thread 0 they were reloaded from global memory after every atomic, two to
+// five loads per splat pixel; constant memory is read-only on the device, so
+// the compiler need not reload it.
+__constant__ Uniforms uniforms;
 Lines* _lines = nullptr;
 float* _emission = nullptr;   // RGB per pixel, added by apply_emission.ps1
 PointCodec g_codec;           // decodes the octree's stored points; set with uniforms each frame
-uint32_t _numEmitting = 0;    // debug counter, apply_debug_log.ps1
-uint32_t _numDrawn    = 0;    // points that survived the density gate, apply_sweep_fixes.ps1
+uint32_t _numDrawn    = 0;    // points that survived the density gate
 
 // ---- warp-aggregated counting (apply_counter_opt.ps1) -------------------
 // A plain atomicAdd(&counter, 1) per point sends 31 MILLION atomics to one
@@ -43,11 +46,8 @@ inline void countUp(uint32_t* counter){
 
 constexpr int VISIBLITY_DISJUNCT = 0;
 constexpr int VISIBLITY_ADDING = 1;
-constexpr int VISIBLITY_SKIP = 2;
 constexpr int visiblityMethod = VISIBLITY_DISJUNCT;
 
-constexpr int SPLAT_SIZE = 1;
-constexpr uint32_t BACKGROUND_COLOR = 0x00332211;
 // constexpr uint32_t BACKGROUND_COLOR = 0x00ffff00;
 // constexpr uint32_t BACKGROUND_COLOR = 0x00ffffff;
 // constexpr uint32_t BACKGROUND_COLOR = 0x000000ff;
@@ -136,10 +136,13 @@ inline float eventFalloff(float d, float r){
 	return feather + core * 4.0f;
 }
 
+inline bool showUnedited();   // defined below, before cullActive
+
 inline void evalEmission(float px, float py, float pz,
 						 float& emR, float& emG, float& emB)
 {
 	emR = 0.0f; emG = 0.0f; emB = 0.0f;
+	if(showUnedited()) return;   // the unedited view shows no glow, so none is accumulated
 	for(int e = 0; e < uniforms.numEvents; e++){
 		float dx = px - uniforms.eventX[e];
 		float dy = py - uniforms.eventY[e];
@@ -383,8 +386,8 @@ inline bool isStrayPoint(float px, float py, float pz){
 //
 // This computes, ONCE per cell rather than per point per frame, how much light
 // reaches that cell from the light direction: march through the occupancy grid
-// and accumulate extinction. 5.3 M cells at 32 steps is a one-off pass; at draw
-// time it is a single lookup.
+// until the ray leaves it, accumulating extinction. That is a one-off pass, on
+// a light change or a grid rebuild; at draw time it is a single lookup.
 inline float lightAt(float px, float py, float pz){
 	if(uniforms.lightGridPtr == 0) return 1.0f;
 	float c = uniforms.cellSize;
@@ -526,7 +529,7 @@ void finishColourGrid(){
 	const uint32_t* occ = (const uint32_t*)uniforms.voxelGridPtr;
 	int numCells = uniforms.gridX * uniforms.gridY * uniforms.gridZ;
 
-	processRange(0, numCells, [&](int i){
+	processRangeStrided(numCells, [&](int i){
 		uint64_t v = cg64[i];
 		uint64_t n = v & 0x3ffull;
 		if(n == 0){ cg64[i] = 0; return; }
@@ -538,7 +541,7 @@ void finishColourGrid(){
 	grid.sync();
 
 	int reach = uniforms.whiteReach;
-	processRange(0, numCells, [&](int i){
+	processRangeStrided(numCells, [&](int i){
 		if(cg64[i] != 0 || occ[i] == 0) return;   // has colour, or nothing to colour
 		int x = i % uniforms.gridX;
 		int y = (i / uniforms.gridX) % uniforms.gridY;
@@ -778,28 +781,25 @@ inline float pxPerMetreAt(float depth){
 	return ((0.5f * uniforms.height) / halfFov) / d;
 }
 
-inline void drawMarkerBall(float px, float py, float pz, uint64_t* framebuffer){
+// One pixel (ox, oy) of a marker ball's square of side 2 MARKER_MAX_R + 1.
+// Drawn one item a pixel (kernel_render), so a ball near the camera no longer
+// keeps one thread looping over 16,641 pixels while the rest wait.
+constexpr int MARKER_MAX_R = 64;
+inline void drawMarkerBallPixel(float px, float py, float pz, int ox, int oy, uint64_t* framebuffer){
 	int x, y; float depth;
 	if(!projectPoint(px, py, pz, x, y, depth)) return;
 	if(depth < uniforms.nearClip) return;
-	float pxPerMetre = pxPerMetreAt(depth);
-	int R = int(0.5f * uniforms.markerScale * pxPerMetre + 0.5f);
+	int R = int(0.5f * uniforms.markerScale * pxPerMetreAt(depth) + 0.5f);
 	if(R < 3)  R = 3;
-	if(R > 64) R = 64;
+	if(R > MARKER_MAX_R) R = MARKER_MAX_R;
+	if(ox*ox + oy*oy > R*R) return;
+	int qx = x + ox, qy = y + oy;
+	if(qx < 0 || qx >= int(uniforms.width) || qy < 0 || qy >= int(uniforms.height)) return;
 	float dz = depth * 0.999f;
 	uint64_t udz = *((uint32_t*)&dz);
 	uint64_t encoded = (udz << 32) | 0x00ff00ffull;   // aabbggrr: magenta
-	for(int oy = -R; oy <= R; oy++){
-		int qy = y + oy;
-		if(qy < 0 || qy >= int(uniforms.height)) continue;
-		for(int ox = -R; ox <= R; ox++){
-			if(ox*ox + oy*oy > R*R) continue;
-			int qx = x + ox;
-			if(qx < 0 || qx >= int(uniforms.width)) continue;
-			uint32_t pixelID = qx + int(uniforms.width) * qy;
-			if(encoded < framebuffer[pixelID]) atomicMin(&framebuffer[pixelID], encoded);
-		}
-	}
+	uint32_t pixelID = qx + int(uniforms.width) * qy;
+	if(encoded < framebuffer[pixelID]) atomicMin(&framebuffer[pixelID], encoded);
 }
 
 // ---- world-space point size and sphere shading (apply_look.ps1) ---------
@@ -854,6 +854,41 @@ inline float splatShade(int ox, int oy, int R, float half){
 	return (1.0f - uniforms.pointShading) + uniforms.pointShading * lit;
 }
 
+// The pixels of an R x R splat centred on (x, y), row by row, as f(ox, oy,
+// pixelID) with ox and oy from 0 to R - 1 (the offsets splatShade takes).
+// a = 2 ox - (R - 1) and b = 2 oy - (R - 1) are offsets in half pixels, so the
+// round test (ox - half)^2 + (oy - half)^2 <= (R/2)^2 is a^2 + b^2 <= R^2, and
+// each row keeps |a| <= floor(sqrt(R^2 - b^2)) of the parity of R - 1. This
+// visits exactly the pixels the column-by-column loop with the test inside
+// visited, for every R from 1 to 64 (tested), with the test once a row.
+// Pixels off the frame are skipped rather than moved onto its edge.
+template<typename F>
+inline void forEachSplatPixel(int x, int y, int R, F&& f){
+	int W = int(uniforms.width), H = int(uniforms.height);
+	bool clip = uniforms.roundSplats && R > 2;
+	for(int oy = 0; oy < R; oy++){
+		int b  = 2 * oy - (R - 1);
+		int py = y + (b >> 1);
+		if(py < 0 || py >= H) continue;
+		int amax = R - 1;
+		if(clip){
+			int m = R * R - b * b;
+			int r = int(sqrtf(float(m)));
+			if((r + 1) * (r + 1) <= m) r++;
+			if(r * r > m) r--;
+			if(((r ^ (R - 1)) & 1) != 0) r--;
+			if(r < 0) continue;
+			amax = r;
+		}
+		int row = W * py;
+		for(int a = -amax; a <= amax; a += 2){
+			int px = x + (a >> 1);
+			if(px < 0 || px >= W) continue;
+			f((a + R - 1) >> 1, oy, uint32_t(px + row));
+		}
+	}
+}
+
 inline uint32_t shadeColour(uint32_t c, float s){
 	if(s >= 0.999f) return c;
 	uint32_t r = uint32_t(fminf(float((c      ) & 0xff) * s, 255.0f));
@@ -873,8 +908,13 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 	if(!projectPoint(point.x, point.y, point.z, x, y, depth)) return;   // apply_fisheye.ps1
 	if(depth < uniforms.nearClip) return;
 
-	if(x > 1 && x < uniforms.width  - 2.0)
-	if(y > 1 && y < uniforms.height - 2.0)
+	// Drawn when its splat can reach the frame; forEachSplatPixel skips the
+	// pixels off it. The test used to want the centre 2 px inside, which left
+	// a border up to 2 px wide that small splats never reached, and moved the
+	// off-frame pixels of larger splats onto the edge.
+	int R = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
+	if(x > -R && x < int(uniforms.width)  + R)
+	if(y > -R && y < int(uniforms.height) + R)
 	{
 		// stray-point culling (apply_stray_cull.ps1). Up to seven grid reads,
 		// so it runs only for points that land on screen; projection is
@@ -911,46 +951,29 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 		float emR, emG, emB;
 		evalEmission(point.x, point.y, point.z, emR, emG, emB);
 		bool emitting = (emR + emG + emB) > 0.0001f;
-		if(emitting) countUp(&_numEmitting);   // debug
 
-		// Centred, optionally circular splat. The original loop offset only
-		// in +x/+y, so the splat sat below-right of the point. Clamp to
-		// width-1/height-1 also closes a latent one-past-the-end write.
-		int   R    = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
+		// Centred, optionally round splat, visited row by row
+		// (forEachSplatPixel).
 		float half = float(R - 1) * 0.5f;
-		float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
-
-		for(int ox = 0; ox < R; ox++)
-		for(int oy = 0; oy < R; oy++)
-		{
-			if(uniforms.roundSplats && R > 2){
-				float ddx = float(ox) - half;
-				float ddy = float(oy) - half;
-				if(ddx * ddx + ddy * ddy > rad2) continue;
-			}
-
-			uint32_t px = clamp(int(x + ox - half), 0, int(uniforms.width)  - 1);
-			uint32_t py = clamp(int(y + oy - half), 0, int(uniforms.height) - 1);
-
-			uint32_t pixelID = px + int(uniforms.width) * py;
-
+		float* em = emitting ? _emission : nullptr;   // read once a point
+		uint64_t udepth = *((uint32_t*)&depth);
+		forEachSplatPixel(x, y, R, [&](int ox, int oy, uint32_t pixelID){
 			// Additive, and deliberately outside the depth test: overlapping
 			// excited points sum, which atomicMin cannot do. A point behind a
 			// trunk still glows through it - move this inside the depth test
 			// below to occlude instead.
-			if(emitting && _emission != nullptr){
-				atomicAdd(&_emission[3 * pixelID + 0], emR);
-				atomicAdd(&_emission[3 * pixelID + 1], emG);
-				atomicAdd(&_emission[3 * pixelID + 2], emB);
+			if(em != nullptr){
+				atomicAdd(&em[3 * pixelID + 0], emR);
+				atomicAdd(&em[3 * pixelID + 1], emG);
+				atomicAdd(&em[3 * pixelID + 2], emB);
 			}
-			uint64_t udepth = *((uint32_t*)&depth);
 			uint32_t shaded = shadeColour(color, splatShade(ox, oy, R, half));   // apply_look.ps1
 			uint64_t encoded = (udepth << 32) | shaded;
 
 			if(encoded < framebuffer[pixelID]){
 				atomicMin(&framebuffer[pixelID], encoded);
 			}
-		}
+		});
 
 	}
 }
@@ -967,13 +990,18 @@ inline bool lodKeep(const Node* node, int index){
 	return node->lodRole == 1 ? (u >= node->lodBlend) : (u < node->lodBlend);
 }
 
-// Point density as a loop stride: keep every step-th point.
-inline int densityStep(){
-	if(uniforms.pointDensity >= 0.999f) return 1;
+// Point density as a fractional loop stride: the k-th kept point is
+// floor(k / d), with 1/d in 16.16 fixed point, so a node keeps the fraction d
+// of its points whatever d is. An integer stride, 1/round(1/d), kept all of
+// them for any d above two thirds and half of them from 0.4 to two thirds.
+// Deterministic, so the same points are kept from frame to frame, and the
+// depth and colour passes keep the same ones.
+inline uint32_t densityStepFx(){
+	if(uniforms.pointDensity >= 0.999f) return 65536u;
 	float d = uniforms.pointDensity < 0.0005f ? 0.0005f : uniforms.pointDensity;
-	int step = int(1.0f / d + 0.5f);
-	return step < 1 ? 1 : step;
+	return uint32_t(65536.0f / d + 0.5f);
 }
+inline int keptIndex(int k, uint32_t stepFx){ return int((uint64_t(k) * stepFx) >> 16); }
 
 // ---- shared point test for the high-quality (HQS) passes ------------------
 // The depth pass and the colour pass must agree exactly on which points exist,
@@ -986,8 +1014,9 @@ inline bool hqsAcceptPoint(const Point& point, Node* node, float minWorldSize,
                            int& x, int& y, float& depth, int& R, uint32_t& color){
 	if(!projectPoint(point.x, point.y, point.z, x, y, depth)) return false;   // apply_fisheye.ps1
 	if(!(depth > 0.0f) || depth < uniforms.nearClip) return false;
-	if(!(x > 1 && x < uniforms.width  - 2.0)) return false;
-	if(!(y > 1 && y < uniforms.height - 2.0)) return false;
+	R = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
+	if(!(x > -R && x < int(uniforms.width)  + R)) return false;   // as drawPoint: the splat can reach the frame
+	if(!(y > -R && y < int(uniforms.height) + R)) return false;
 
 	// stray-point culling, after the cheaper on-screen test (apply_stray_cull.ps1)
 	bool stray = isStrayPoint(point.x, point.y, point.z);
@@ -1004,7 +1033,6 @@ inline bool hqsAcceptPoint(const Point& point, Node* node, float minWorldSize,
 		color = (node->getID() % 127) * 123456789;
 	}
 
-	R = splatRadiusPx(depth, minWorldSize);   // world-sized (apply_look.ps1)
 	return true;
 }
 
@@ -1026,13 +1054,11 @@ void drawNode(Chunk* chunk, Node* node, uint32_t numElements, uint64_t* framebuf
 	// walk, no 16-byte load, no hash. The traversal shrinks by the same factor
 	// as the density. Deterministic, so the same points are kept frame to
 	// frame, as with the hash.
-	int step = densityStep();
+	uint32_t stepFx = densityStepFx();
 
-	for(
-		int pointIndex = block.thread_rank() * step; 
-		pointIndex < numElements; 
-		pointIndex += block.num_threads() * step
-	){
+	for(int k = block.thread_rank(); ; k += block.num_threads()){
+		int pointIndex = keptIndex(k, stepFx);
+		if(pointIndex >= int(numElements)) break;
 		int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
 		// while, not if: with a stride the target can jump several chunks at
@@ -1121,7 +1147,7 @@ void countNodeIntoGrid(Chunk* chunk, uint32_t numElements){
 	}
 }
 
-void refillVoxelGrid(Node* nodes){
+void refillVoxelGrid(Node* nodes, Stats* stats){
 	if(uniforms.gridRefill == 0) return;
 	if(uniforms.voxelGridPtr == 0) return;
 
@@ -1129,7 +1155,7 @@ void refillVoxelGrid(Node* nodes){
 	auto block = cg::this_thread_block();
 
 	// zero first: a refill must not add to whatever was already there
-	processRange(0, uniforms.gridX * uniforms.gridY * uniforms.gridZ, [&](int i){
+	processRangeStrided(uniforms.gridX * uniforms.gridY * uniforms.gridZ, [&](int i){
 		((uint32_t*)uniforms.voxelGridPtr)[i] = 0;
 		if(uniforms.colourGridPtr != 0) ((uint64_t*)uniforms.colourGridPtr)[i] = 0;
 	});
@@ -1146,7 +1172,8 @@ void refillVoxelGrid(Node* nodes){
 		block.sync();
 		if(block.thread_rank() == 0){ sh_n = atomicAdd(&_refillNextNode, 1); }
 		block.sync();
-		if(sh_n >= uniforms.numNodesTotal) break;
+		// the device's own count: the host's copy of it lags by a frame or more
+		if(sh_n >= int(stats->numNodes)) break;
 
 		Node* node = &nodes[sh_n];
 		// points only. Voxels are coarse summaries of the same surfaces, and
@@ -1169,7 +1196,6 @@ void drawNodes(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 
 	float3 boxSize = uniforms.boxMax - uniforms.boxMin;
 	float cubeSize = max(max(boxSize.x, boxSize.y), boxSize.z);
-	float3 cubeMin = uniforms.boxMin;
 
 	uint32_t& numNodesDrawn = *allocator->alloc<uint32_t*>(4);
 	if(grid.thread_rank() == 0){
@@ -1195,12 +1221,6 @@ void drawNodes(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 		Node* node = &nodes[sh_nodeIndex];
 
 		float nodeSize = cubeSize / pow(2.0f, float(node->level));
-		float scale = cubeSize / pow(2.0f, float(node->level));
-		float3 nodeMin = {
-			cubeMin.x + float(node->X + 0.0f) * scale,
-			cubeMin.y + float(node->Y + 0.0f) * scale,
-			cubeMin.z + float(node->Z + 0.0f) * scale,
-		};
 
 		drawNode(node->points, node, node->numPoints, framebuffer, 0.0f);
 		// A leaf's voxels duplicate its own points. Only a root that never
@@ -1216,13 +1236,17 @@ void drawNodes(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 	grid.sync();
 }
 
-void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
+// fb_depth (4 B a pixel) and fb_color (16 B: red, green, blue and a count)
+// are allocated by kernel_render and passed in. Allocated here, through the
+// allocator global, the compiler could not tell they were in global memory,
+// and the depth test and colour sums used generic atomics.
+void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_t* fb_depth, uint32_t* fb_color){
 
 	if(!uniforms.showPoints) return;
 
 	// density as a loop stride, as in drawNode: skipped points are never read,
 	// and both passes step identically so they keep the same points
-	int hqsStep = densityStep();
+	uint32_t hqsStepFx = densityStepFx();
 
 	auto grid = cg::this_grid();
 	auto block = cg::this_thread_block();
@@ -1238,13 +1262,11 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 	}
 
 	int numPixels = int(uniforms.width) * int(uniforms.height);
-	uint32_t* fb_depth = allocator->alloc<uint32_t*>(1 * numPixels * sizeof(uint32_t));
-	uint32_t* fb_color = allocator->alloc<uint32_t*>(4 * numPixels * sizeof(uint32_t));
 
-	processRange(numPixels, [&](int pixelID){
+	processRangeStrided(numPixels, [&](int pixelID){
 		fb_depth[pixelID] = 0x7f800000;
 	});
-	processRange(numPixels, [&](int pixelID){
+	processRangeStrided(numPixels, [&](int pixelID){
 		fb_color[4 * pixelID + 0] = 0;
 		fb_color[4 * pixelID + 1] = 0;
 		fb_color[4 * pixelID + 2] = 0;
@@ -1282,7 +1304,9 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 			Chunk* chunk = node->points;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numPoints; pointIndex += block.num_threads() * hqsStep){
+			for(int k = block.thread_rank(); ; k += block.num_threads()){
+				int pointIndex = keptIndex(k, hqsStepFx);
+				if(pointIndex >= int(node->numPoints)) break;
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
@@ -1298,30 +1322,15 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				int x, y, R; float depth; uint32_t color;
 				if(!hqsAcceptPoint(point, node, 0.0f, x, y, depth, R, color)) continue;
 				{
-					// HQS depth pass, brought into line with drawPoint by
-					// apply_test_source.ps1: centred, optionally round, and
-					// clamped to width-1/height-1. Must match the colour pass
-					// below exactly or the depth test and the colour disagree.
-					float half = float(R - 1) * 0.5f;
-					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
-					for(int ox = 0; ox < R; ox++)
-					for(int oy = 0; oy < R; oy++)
-					{
-						if(uniforms.roundSplats && R > 2){
-							float ddx = float(ox) - half;
-							float ddy = float(oy) - half;
-							if(ddx * ddx + ddy * ddy > rad2) continue;
-						}
-						uint32_t px = clamp(int(x + ox - half), 0, int(uniforms.width)  - 1);
-						uint32_t py = clamp(int(y + oy - half), 0, int(uniforms.height) - 1);
-
-						uint32_t pixelID = px + int(uniforms.width) * py;
-						uint32_t udepth = *((uint32_t*)&depth);
-
+					// HQS depth pass: the same pixels as the colour pass
+					// below (forEachSplatPixel), or the depth test and the
+					// colour disagree.
+					uint32_t udepth = *((uint32_t*)&depth);
+					forEachSplatPixel(x, y, R, [&](int ox, int oy, uint32_t pixelID){
 						if(udepth < fb_depth[pixelID]){
 							atomicMin(&fb_depth[pixelID], udepth);
 						}
-					}
+					});
 				}
 			}
 		}
@@ -1346,7 +1355,9 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 			Chunk* chunk = node->voxelChunks;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numVoxels; pointIndex += block.num_threads() * hqsStep){
+			for(int k = block.thread_rank(); ; k += block.num_threads()){
+				int pointIndex = keptIndex(k, hqsStepFx);
+				if(pointIndex >= int(node->numVoxels)) break;
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
@@ -1379,30 +1390,15 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 				if(!hqsAcceptPoint(point, node, voxelSplatMetres(nodeSize), x, y, depth, R, color)) continue;
 				{
 
-					// HQS depth pass, brought into line with drawPoint by
-					// apply_test_source.ps1: centred, optionally round, and
-					// clamped to width-1/height-1. Must match the colour pass
-					// below exactly or the depth test and the colour disagree.
-					float half = float(R - 1) * 0.5f;
-					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
-					for(int ox = 0; ox < R; ox++)
-					for(int oy = 0; oy < R; oy++)
-					{
-						if(uniforms.roundSplats && R > 2){
-							float ddx = float(ox) - half;
-							float ddy = float(oy) - half;
-							if(ddx * ddx + ddy * ddy > rad2) continue;
-						}
-						uint32_t px = clamp(int(x + ox - half), 0, int(uniforms.width)  - 1);
-						uint32_t py = clamp(int(y + oy - half), 0, int(uniforms.height) - 1);
-
-						uint32_t pixelID = px + int(uniforms.width) * py;
-						uint32_t udepth = *((uint32_t*)&depth);
-
+					// HQS depth pass: the same pixels as the colour pass
+					// below (forEachSplatPixel), or the depth test and the
+					// colour disagree.
+					uint32_t udepth = *((uint32_t*)&depth);
+					forEachSplatPixel(x, y, R, [&](int ox, int oy, uint32_t pixelID){
 						if(udepth < fb_depth[pixelID]){
 							atomicMin(&fb_depth[pixelID], udepth);
 						}
-					}
+					});
 
 				}
 			}
@@ -1444,7 +1440,9 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 			Chunk* chunk = node->points;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numPoints; pointIndex += block.num_threads() * hqsStep){
+			for(int k = block.thread_rank(); ; k += block.num_threads()){
+				int pointIndex = keptIndex(k, hqsStepFx);
+				if(pointIndex >= int(node->numPoints)) break;
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
@@ -1453,7 +1451,6 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 					chunkIndex++;
 				}
 
-				// if(chunkIndex > (int(10 * uniforms.time) % 50)) break;
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
 				if(!lodKeep(node, pointIndex)) continue;   // LOD cross-fade
@@ -1480,28 +1477,15 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 					float emR, emG, emB;
 					evalEmission(point.x, point.y, point.z, emR, emG, emB);
 					bool emitting = (emR + emG + emB) > 0.0001f;
-					if(emitting) countUp(&_numEmitting);
 					countUp(&_numDrawn);   // colour pass only, once per point
 
 					float half = float(R - 1) * 0.5f;
-					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
-					for(int ox = 0; ox < R; ox++)
-					for(int oy = 0; oy < R; oy++)
-					{
-						if(uniforms.roundSplats && R > 2){
-							float ddx = float(ox) - half;
-							float ddy = float(oy) - half;
-							if(ddx * ddx + ddy * ddy > rad2) continue;
-						}
-						uint32_t px = clamp(int(x + ox - half), 0, int(uniforms.width)  - 1);
-						uint32_t py = clamp(int(y + oy - half), 0, int(uniforms.height) - 1);
-
-						uint32_t pixelID = px + int(uniforms.width) * py;
-
-						if(emitting && _emission != nullptr){
-							atomicAdd(&_emission[3 * pixelID + 0], emR);
-							atomicAdd(&_emission[3 * pixelID + 1], emG);
-							atomicAdd(&_emission[3 * pixelID + 2], emB);
+					float* em = emitting ? _emission : nullptr;   // read once a point
+					forEachSplatPixel(x, y, R, [&](int ox, int oy, uint32_t pixelID){
+						if(em != nullptr){
+							atomicAdd(&em[3 * pixelID + 0], emR);
+							atomicAdd(&em[3 * pixelID + 1], emG);
+							atomicAdd(&em[3 * pixelID + 2], emB);
 						}
 
 						float fbDepth = *((float*)&fb_depth[pixelID]);
@@ -1509,12 +1493,16 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 						if(depth < fbDepth * 1.01f)
 						{
 							float sh = splatShade(ox, oy, R, half);   // apply_look.ps1
-							atomicAdd(&fb_color[4 * pixelID + 0], uint32_t(float(rgba[0]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 1], uint32_t(float(rgba[1]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 2], uint32_t(float(rgba[2]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 3], 1);
+							// The four sums as two 64-bit adds, (green << 32 | red)
+							// and (count << 32 | blue): the same layout in memory.
+							// A field carries into the next only after 16.8 M
+							// contributions to one pixel, where the 32-bit sums
+							// used to wrap.
+							unsigned long long* c64 = (unsigned long long*)&fb_color[4 * pixelID];
+							atomicAdd(&c64[0], (unsigned long long)uint32_t(float(rgba[0]) * sh) | ((unsigned long long)uint32_t(float(rgba[1]) * sh) << 32));
+							atomicAdd(&c64[1], (unsigned long long)uint32_t(float(rgba[2]) * sh) | (1ull << 32));
 						}
-					}
+					});
 				}
 			}
 		}
@@ -1539,7 +1527,9 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 			Chunk* chunk = node->voxelChunks;
 			int chunkIndex = 0;
 
-			for(int pointIndex = block.thread_rank() * hqsStep; pointIndex < node->numVoxels; pointIndex += block.num_threads() * hqsStep){
+			for(int k = block.thread_rank(); ; k += block.num_threads()){
+				int pointIndex = keptIndex(k, hqsStepFx);
+				if(pointIndex >= int(node->numVoxels)) break;
 
 				int targetChunkIndex = pointIndex / POINTS_PER_CHUNK;
 
@@ -1548,7 +1538,6 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 					chunkIndex++;
 				}
 
-				// if(chunkIndex > (int(10 * uniforms.time) % 30)) break;
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
 				if(!lodKeep(node, pointIndex)) continue;   // LOD cross-fade
@@ -1592,28 +1581,15 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 					float emR, emG, emB;
 					evalEmission(point.x, point.y, point.z, emR, emG, emB);
 					bool emitting = (emR + emG + emB) > 0.0001f;
-					if(emitting) countUp(&_numEmitting);
 					countUp(&_numDrawn);   // colour pass only, once per point
 
 					float half = float(R - 1) * 0.5f;
-					float rad2 = (float(R) * 0.5f) * (float(R) * 0.5f);
-					for(int ox = 0; ox < R; ox++)
-					for(int oy = 0; oy < R; oy++)
-					{
-						if(uniforms.roundSplats && R > 2){
-							float ddx = float(ox) - half;
-							float ddy = float(oy) - half;
-							if(ddx * ddx + ddy * ddy > rad2) continue;
-						}
-						uint32_t px = clamp(int(x + ox - half), 0, int(uniforms.width)  - 1);
-						uint32_t py = clamp(int(y + oy - half), 0, int(uniforms.height) - 1);
-
-						uint32_t pixelID = px + int(uniforms.width) * py;
-
-						if(emitting && _emission != nullptr){
-							atomicAdd(&_emission[3 * pixelID + 0], emR);
-							atomicAdd(&_emission[3 * pixelID + 1], emG);
-							atomicAdd(&_emission[3 * pixelID + 2], emB);
+					float* em = emitting ? _emission : nullptr;   // read once a point
+					forEachSplatPixel(x, y, R, [&](int ox, int oy, uint32_t pixelID){
+						if(em != nullptr){
+							atomicAdd(&em[3 * pixelID + 0], emR);
+							atomicAdd(&em[3 * pixelID + 1], emG);
+							atomicAdd(&em[3 * pixelID + 2], emB);
 						}
 
 						float fbDepth = *((float*)&fb_depth[pixelID]);
@@ -1621,12 +1597,16 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 						if(depth < fbDepth * 1.01f)
 						{
 							float sh = splatShade(ox, oy, R, half);   // apply_look.ps1
-							atomicAdd(&fb_color[4 * pixelID + 0], uint32_t(float(rgba[0]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 1], uint32_t(float(rgba[1]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 2], uint32_t(float(rgba[2]) * sh));
-							atomicAdd(&fb_color[4 * pixelID + 3], 1);
+							// The four sums as two 64-bit adds, (green << 32 | red)
+							// and (count << 32 | blue): the same layout in memory.
+							// A field carries into the next only after 16.8 M
+							// contributions to one pixel, where the 32-bit sums
+							// used to wrap.
+							unsigned long long* c64 = (unsigned long long*)&fb_color[4 * pixelID];
+							atomicAdd(&c64[0], (unsigned long long)uint32_t(float(rgba[0]) * sh) | ((unsigned long long)uint32_t(float(rgba[1]) * sh) << 32));
+							atomicAdd(&c64[1], (unsigned long long)uint32_t(float(rgba[2]) * sh) | (1ull << 32));
 						}
-					}
+					});
 
 				}
 			}
@@ -1636,12 +1616,12 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer){
 	grid.sync();
 
 	// RESOLVE
-	processRange(numPixels, [&](int pixelID){
+	processRangeStrided(numPixels, [&](int pixelID){
 		
-		uint32_t R = fb_color[4 * pixelID + 0];
-		uint32_t G = fb_color[4 * pixelID + 1];
-		uint32_t B = fb_color[4 * pixelID + 2];
-		uint32_t C = fb_color[4 * pixelID + 3];
+		// one 16-byte load: the Allocator aligns every buffer to 16 bytes,
+		// and a pixel's four sums take 16
+		ulonglong2 v = ((const ulonglong2*)fb_color)[pixelID];
+		uint32_t R = uint32_t(v.x), G = uint32_t(v.x >> 32), B = uint32_t(v.y), C = uint32_t(v.y >> 32);
 
 		if(C == 0) return;
 
@@ -1708,14 +1688,7 @@ void drawNodesBoundingBoxes(
 
 		color = 0x0000ff00;
 
-		drawBoundingBox(lines, pos, {scale, scale, scale}, color);
-		int steps = 1;
-		for(int si = 0; si < steps; si++){
-			float s = 1.0 + 0.02 * float(si) / 5.0f;
-			drawBoundingBox(lines, pos, float3{s * scale, scale, scale}, color);
-			drawBoundingBox(lines, pos, float3{scale, s * scale, scale}, color);
-			drawBoundingBox(lines, pos, float3{scale, s * scale, s * scale}, color);
-		}
+		drawBoundingBox(lines, pos, {scale, scale, scale}, color);   // once: a loop added three identical copies
 	});
 }
 
@@ -1812,12 +1785,6 @@ void compute_visibility_disjunct(
 			cubeMin.y + float(node->Y + 1.0f) * nodeSize,
 			cubeMin.z + float(node->Z + 1.0f) * nodeSize,
 		};
-		float3 nodeCenter = {
-			cubeMin.x + float(node->X + 0.5f) * nodeSize,
-			cubeMin.y + float(node->Y + 0.5f) * nodeSize,
-			cubeMin.z + float(node->Z + 0.5f) * nodeSize,
-		};
-
 		// compute node boundaries in screen space
 		float4 p000 = {nodeMin.x, nodeMin.y, nodeMin.z, 1.0f};
 		float4 p001 = {nodeMin.x, nodeMin.y, nodeMax.z, 1.0f};
@@ -1899,7 +1866,6 @@ void compute_visibility_disjunct(
 		// 	float d = proj.w;
 		// 	float r = nodeSize;
 		// 	float aspect = fwidth / fheight;
-		// 	float pr = 1.0 / tan(uniforms.fovy_rad) * r / sqrt(d * d - r * r);
 		// 	float pixels = pr * fheight * 2.0;
 		// 	float projSize = aspect * fheight * nodeSize / proj.w;
 		// 	if(proj.w > 0.0){
@@ -1920,7 +1886,7 @@ void compute_visibility_disjunct(
 		if(!hasSamples) visible = false;
 
 		node->visible = visible;
-		node->isLarge = dx > 2.0 * uniforms.minNodeSize || dy > 2.0 * uniforms.minNodeSize;
+		node->isLarge = dx > 2.0f * uniforms.minNodeSize || dy > 2.0f * uniforms.minNodeSize;
 		node->screenSize = fmaxf(dx, dy);
 
 		// if(strequal(node->name, "r")){
@@ -2015,6 +1981,10 @@ void compute_visibility_disjunct(
 			}
 		}else if(node->isLarge && node->isLeafFn() && node->visible){
 			makeVisible(node, 0, 0.0f);
+		}else if(nodeIndex == 0 && !node->isLarge && node->visible){
+			// The root has no parent to draw it, so a cloud whose whole cube
+			// is under 2 x minNodeSize on screen drew nothing.
+			makeVisible(node, 0, 0.0f);
 		}
 	});
 }
@@ -2079,11 +2049,6 @@ void compute_visibility_add(
 		Node* node = &nodes[nodeIndex];
 
 		float nodeSize = cubeSize / pow(2.0f, float(node->level));
-		// node-center
-		float ncx = (float(node->X) + 0.5f) * nodeSize + cubeMin.x;
-		float ncy = (float(node->Y) + 0.5f) * nodeSize + cubeMin.y;
-		float ncz = (float(node->Z) + 0.5f) * nodeSize + cubeMin.z;
-
 		float scale = cubeSize / pow(2.0f, float(node->level));
 		float3 nodeMin = {
 			cubeMin.x + float(node->X + 0.0f) * scale,
@@ -2193,13 +2158,11 @@ void compute_visibility_add(
 
 // The host launches this with 256-thread blocks (workgroupSize in renderCUDA),
 // as many as fit on each SM, and every stage of the frame shares those
-// threads. Two blocks fit only at 128 registers per thread or fewer. The
-// kernel used about 120 on every generation measured (Maxwell 52, Volta 70,
-// Turing 75, Ampere 86, Ada 89) until the haze composite pushed the compiler
-// toward 140, which would halve the threads drawing points even with the
-// haze off. The bound keeps two blocks; the few registers the composite
-// gives up are spilled there, once per pixel, not in the point loops.
-// Pascal already ran one block (about 130 registers) and is left unbounded.
+// threads. Two blocks fit only at 128 registers per thread or fewer. With the
+// uniforms in constant memory the kernel needs 117 at compute 8.6 and 8.9
+// (NVRTC 12.4) and spills nothing; the bound stays so that a later change
+// cannot quietly halve the threads drawing points. Pascal ran one block
+// (about 130 registers) and is left unbounded.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600 && __CUDA_ARCH__ < 700
 #define RENDER_LAUNCH_BOUNDS
 #else
@@ -2226,11 +2189,9 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		*frameStartTimestamp = nanotime();
 	}
 
-	// One thread copies the ~2 KB uniforms into the device global. Every thread
-	// used to do it, which on an 80k-thread launch meant ~150 MB of redundant
-	// global stores per frame.
+	// The uniforms are already in constant memory, copied by the host before
+	// the launch. Thread 0 sets up the per-frame globals derived from them.
 	if(grid.thread_rank() == 0){
-		uniforms = _uniforms;
 		g_codec  = PointCodec::forBox(_uniforms.boxMin, _uniforms.boxMax);   // stored points
 		float3 td;
 		_torchValid = (uniforms.torchOn != 0 && pixelRayDir(uniforms.torchX + 0.5f, uniforms.torchY + 0.5f, td)) ? 1 : 0;
@@ -2279,24 +2240,28 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	int volH = int(uniforms.height) / 4; if(volH < 1) volH = 1;
 	float* volBuf = allocator->alloc<float*>(volW * volH * 4 * sizeof(float));
 
+	// the high-quality passes' depth (4 B a pixel) and colour sums (16 B)
+	uint32_t* hqsDepth = allocator->alloc<uint32_t*>(int64_t(uniforms.width) * int64_t(uniforms.height) * 4);
+	uint32_t* hqsColor = allocator->alloc<uint32_t*>(int64_t(uniforms.width) * int64_t(uniforms.height) * 16);
+
 	// The host sizes the buffer for the window (renderBufferBytesFor) and
 	// skips the launch when it cannot. Should the frame's layout ever outgrow
 	// it, draw nothing rather than write past its end: a fixed 200 MB used to
-	// be overrun by any window above 3.8 Mpx. drawNodesHQS allocates its depth
-	// and colour buffers (20 B a pixel) later in the frame, where returning is
-	// no longer safe, so they are counted here. Every thread computes the
-	// same offset, so the return is uniform across the grid.
-	int64_t laterBytes = 1024 + 20 * int64_t(uniforms.width) * int64_t(uniforms.height);
+	// be overrun by any window above 3.8 Mpx. Only small allocations come
+	// later in the frame, where returning is no longer safe (a counter in
+	// drawNodes and drawNodesHQS); 1 KB covers them. Every thread computes
+	// the same offset, so the return is uniform across the grid.
+	int64_t laterBytes = 1024;
 	if(allocator->offset + laterBytes > int64_t(uniforms.renderBufferCapacity)){
 		return;
 	}
 
-	if(grid.thread_rank() == 0){ _numEmitting = 0; _numDrawn = 0; }
+	if(grid.thread_rank() == 0){ _numDrawn = 0; }
 
 	// Recount the occupancy grid first: the light grid below is derived from
 	// these counts, and the host requests both together after a reallocation.
 	grid.sync();
-	refillVoxelGrid(nodes);   // apply_grid_refill.ps1: only when the host says stale
+	refillVoxelGrid(nodes, stats);   // only when the host says the counts are stale
 
 	// ---- build the light transmittance grid (apply_keylight.ps1) ----------
 	// Only when the host says it is stale: after a load, or when a light
@@ -2305,7 +2270,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	if(uniforms.lightOn != 0 && uniforms.lightDirty != 0 && uniforms.lightGridPtr != 0 && uniforms.voxelGridPtr != 0){
 		grid.sync();
 		int nCells = uniforms.gridX * uniforms.gridY * uniforms.gridZ;
-		processRange(0, nCells, [&](int i){
+		processRangeStrided(nCells, [&](int i){
 			int cx = i % uniforms.gridX;
 			int cy = (i / uniforms.gridX) % uniforms.gridY;
 			int cz = i / (uniforms.gridX * uniforms.gridY);
@@ -2331,10 +2296,19 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		grid.sync();
 	}
 	grid.sync();
+	// the grid rebuilds end here; adaptive detail leaves them out
+	if(grid.thread_rank() == 0) stats->stageNs[7] = nanotime() - tStart;
+
+	// Only an event (a call playing, or the test source) puts anything in the
+	// emission buffer: evalEmission adds nothing without one, nor in the
+	// unedited view. Without one the buffer is neither cleared nor read, and
+	// the bloom, whose only source it is, does not run: 24 B a pixel less
+	// memory traffic, 199 MB a frame at 4K.
+	const bool emissive = uniforms.numEvents > 0 && !showUnedited();
 
 	// clear framebuffer
 	// integer product: as a float it rounds above 2^24 pixels (--render 4097 4097)
-	processRange(0, int(uniforms.width) * int(uniforms.height), [&](int pixelIndex){
+	processRangeStrided(int(uniforms.width) * int(uniforms.height), [&](int pixelIndex){
 		// depth:            7f800000 (Infinity)
 		// background color: 00332211 (aabbggrr)
 		// framebuffer[pixelIndex] = 0x7f800000'00332211ull;
@@ -2346,9 +2320,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			uint32_t sky = (sb << 16) | (sg << 8) | sr;
 			framebuffer[pixelIndex] = (0x7f800000ull << 32) | uint64_t(sky);
 		}
-		_emission[3 * pixelIndex + 0] = 0.0f;
-		_emission[3 * pixelIndex + 1] = 0.0f;
-		_emission[3 * pixelIndex + 2] = 0.0f;
+		if(emissive){
+			_emission[3 * pixelIndex + 0] = 0.0f;
+			_emission[3 * pixelIndex + 1] = 0.0f;
+			_emission[3 * pixelIndex + 2] = 0.0f;
+		}
 	});
 
 	grid.sync();
@@ -2404,22 +2380,50 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	{ // draw nodes, boxes, lines, ...
 		if(grid.thread_rank() == 0) stats->stageNs[0] = nanotime() - tStart;   // apply_stage_timers.ps1
 		if(uniforms.useHighQualityShading){
-			drawNodesHQS(visibleNodes, numVisibleNodes, framebuffer);
+			drawNodesHQS(visibleNodes, numVisibleNodes, framebuffer, hqsDepth, hqsColor);
 		}else{
 			drawNodes(visibleNodes, numVisibleNodes, framebuffer);
 		}
 
 		grid.sync();
 
-		// draw point cloud cube
-		// if(uniforms.showBoundingBox)
-		// if(grid.thread_rank() == 0)
-		// {
-		// 	float3 size = {cubeSize, cubeSize, cubeSize};
-		// 	drawBoundingBox(lines, cubePosition, size, 0x000000ff);
-		// }
-
-		grid.sync();
+		// ---- pick -----------------------------------------------------------
+		// After the scan is drawn but before anything else (bounding boxes and
+		// the frustum, the voxel-grid view, event markers), so a pick always
+		// lands on the scan: read the depth under the requested pixel, turn it
+		// back into a world position, hand it to the host via Stats. Each
+		// request id is answered exactly once and the answer is left in place,
+		// so the host cannot miss it however far its asynchronous Stats copy
+		// lags behind. It came after the bounding boxes and the frustum, so
+		// with those shown a pick could land on one of their lines.
+		if(grid.thread_rank() == 0 && uniforms.pickSeq != stats->pickSeqDone){
+			int valid = 0;
+			// Reject the background explicitly. The clear writes 0x7f800000, which
+			// is +infinity; comparing a float against 1.0e30 relies on that bit
+			// pattern decoding cleanly, and a NaN would pass every comparison.
+			// Test the bits.
+			if(uniforms.pickX >= 0 && uniforms.pickY >= 0
+			   && uniforms.pickX < int(uniforms.width) && uniforms.pickY < int(uniforms.height)){
+				uint64_t fbv = framebuffer[uniforms.pickX + int(uniforms.width) * uniforms.pickY];
+				uint32_t dbits = uint32_t(fbv >> 32);
+				float depth = *((float*)&dbits);
+				float3 rd;
+				bool hitGeometry = (dbits != 0x7f800000u)          // not the cleared background
+								&& ((dbits & 0x7f800000u) != 0x7f800000u)   // not inf or NaN
+								&& depth > 0.0f && depth < 1.0e6f;
+				if(hitGeometry && pixelRayDir(float(uniforms.pickX) + 0.5f, float(uniforms.pickY) + 0.5f, rd)){
+					float dist = depthToDistance(depth, rd);
+					stats->pickWX = uniforms.camPos.x + rd.x * dist;
+					stats->pickWY = uniforms.camPos.y + rd.y * dist;
+					stats->pickWZ = uniforms.camPos.z + rd.z * dist;
+					valid = 1;
+				}
+			}
+			stats->pickValid = valid;
+			__threadfence();
+			stats->pickSeqDone = uniforms.pickSeq;   // written last
+		}
+		grid.sync();   // nothing may draw over the pixel while thread 0 reads it
 
 		if(uniforms.showBoundingBox)
 		if(grid.thread_rank() == 0)
@@ -2476,49 +2480,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		stats->numVisiblePoints = numVisiblePoints;
 		stats->numVisibleVoxels = numVisibleVoxels;
 		stats->frameID          = uniforms.frameCounter;
-		stats->numEmitting      = _numEmitting;
 		stats->numDrawn         = _numDrawn;
 	}
 
 	// if(false)
 	if(grid.thread_rank() == 0) stats->stageNs[1] = nanotime() - tStart;   // apply_stage_timers.ps1
-
-	// ---- pick (apply_navigate.ps1) ----------------------------------------
-	// After the scan is drawn but before debug geometry (voxel-grid view,
-	// event markers), so a pick always lands on the scan: read the depth
-	// under the requested pixel, turn it back into a world position, hand it
-	// to the host via Stats. Each request id is answered exactly once and the
-	// answer is left in place, so the host cannot miss it however far its
-	// asynchronous Stats copy lags behind.
-	grid.sync();
-	if(grid.thread_rank() == 0 && uniforms.pickSeq != stats->pickSeqDone){
-		int valid = 0;
-		// Reject the background explicitly. The clear writes 0x7f800000, which
-		// is +infinity; comparing a float against 1.0e30 relies on that bit
-		// pattern decoding cleanly, and a NaN would pass every comparison.
-		// Test the bits.
-		if(uniforms.pickX >= 0 && uniforms.pickY >= 0
-		   && uniforms.pickX < int(uniforms.width) && uniforms.pickY < int(uniforms.height)){
-			uint64_t fbv = framebuffer[uniforms.pickX + int(uniforms.width) * uniforms.pickY];
-			uint32_t dbits = uint32_t(fbv >> 32);
-			float depth = *((float*)&dbits);
-			float3 rd;
-			bool hitGeometry = (dbits != 0x7f800000u)          // not the cleared background
-							&& ((dbits & 0x7f800000u) != 0x7f800000u)   // not inf or NaN
-							&& depth > 0.0f && depth < 1.0e6f;
-			if(hitGeometry && pixelRayDir(float(uniforms.pickX) + 0.5f, float(uniforms.pickY) + 0.5f, rd)){
-				float dist = depthToDistance(depth, rd);
-				stats->pickWX = uniforms.camPos.x + rd.x * dist;
-				stats->pickWY = uniforms.camPos.y + rd.y * dist;
-				stats->pickWZ = uniforms.camPos.z + rd.z * dist;
-				valid = 1;
-			}
-		}
-		stats->pickValid = valid;
-		__threadfence();
-		stats->pickSeqDone = uniforms.pickSeq;   // written last
-	}
-	grid.sync();   // nothing may draw over the pixel while thread 0 reads it
 
 	// ---- voxel grid debug view (apply_voxel_grid.ps1) ------------------
 	// Draws the centre of every occupied cell, coloured by count: blue for
@@ -2526,7 +2492,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	// axes - it should sit exactly on the foliage and nowhere else.
 	if(uniforms.useVoxelGrid && uniforms.showVoxelGrid && uniforms.voxelGridPtr != 0){
 		int nCells = uniforms.gridX * uniforms.gridY * uniforms.gridZ;
-		processRange(0, nCells, [&](int i){
+		processRangeStrided(nCells, [&](int i){
 			const uint32_t* g = (const uint32_t*)uniforms.voxelGridPtr;
 			uint32_t n = g[i];
 			if(n == 0) return;
@@ -2579,8 +2545,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	// 0.15 m each - fine in principle, but drawn as a line it made any bad
 	// pick look like a beam running off to the horizon. A cube cannot do that.
 	if(uniforms.numMarkers > 0 && uniforms.showMarkers != 0){   // apply_markers2.ps1
-		processRange(0, uniforms.numMarkers, [&](int m){
-			drawMarkerBall(uniforms.markerX[m], uniforms.markerY[m], uniforms.markerZ[m], framebuffer);
+		constexpr int SIDE = 2 * MARKER_MAX_R + 1;
+		processRangeStrided(uniforms.numMarkers * SIDE * SIDE, [&](int k){
+			int m = k / (SIDE * SIDE), r = k - m * (SIDE * SIDE);
+			drawMarkerBallPixel(uniforms.markerX[m], uniforms.markerY[m], uniforms.markerZ[m],
+								r % SIDE - MARKER_MAX_R, r / SIDE - MARKER_MAX_R, framebuffer);
 		});
 		grid.sync();
 	}
@@ -2628,12 +2597,13 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 				if(!ok) return;
 			}
 
-			float t = uniforms.time * uniforms.insectSpeed;
+			// insectPhase[k]: seconds x speed x rate k, reduced to [0, 2 pi)
+			// on the host, for the rates 0.83, 2.7, 0.71, 3.1, 1.13 and 3.7
 			float a = u3 * 6.2831853f;
 
-			float px = hx + 2.2f * sin(t * 0.83f + a)        + 0.8f * sin(t * 2.7f + a * 3.1f);
-			float py = hy + 2.2f * cos(t * 0.71f + a * 1.7f) + 0.8f * sin(t * 3.1f + a * 2.3f);
-			float pz = hz + 1.1f * sin(t * 1.13f + a * 2.9f) + 0.4f * cos(t * 3.7f + a);
+			float px = hx + 2.2f * sin(uniforms.insectPhase[0] + a)        + 0.8f * sin(uniforms.insectPhase[1] + a * 3.1f);
+			float py = hy + 2.2f * cos(uniforms.insectPhase[2] + a * 1.7f) + 0.8f * sin(uniforms.insectPhase[3] + a * 2.3f);
+			float pz = hz + 1.1f * sin(uniforms.insectPhase[4] + a * 2.9f) + 0.4f * cos(uniforms.insectPhase[5] + a);
 
 			drawInsect(px, py, pz, 0x00171c22u, uniforms.insectGlow, framebuffer);
 		});
@@ -2651,35 +2621,35 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			float depth;
 		};
 
-		float* framebuffer_f = (float*)framebuffer;
-		uint32_t* framebuffer_u32 = (uint32_t*)framebuffer;
 		Pixel* framebuffer_p = (Pixel*)framebuffer;
 
 		int width = uniforms.width;
 		int height = uniforms.height;
 
+		// Every tile, the partial ones at the right and top edges included,
+		// each block stepping through them. Only whole tiles used to be
+		// counted, and only numTiles / numBlocks of them per block, so the
+		// last few tiles and an edge strip up to 15 px wide went unshaded.
+		// The pass reads depths and writes colours, so no barrier is needed
+		// between tiles.
 		uint32_t tileSize = 16;
-		uint32_t numTiles_x = width / tileSize;
-		uint32_t numTiles_y = height / tileSize;
+		uint32_t numTiles_x = (width  + tileSize - 1) / tileSize;
+		uint32_t numTiles_y = (height + tileSize - 1) / tileSize;
 		uint32_t numTiles = numTiles_x * numTiles_y;
-		uint32_t tilesPerBlock = numTiles / grid.num_blocks();
 
-		for(int i = 0; i < tilesPerBlock; i++){
+		for(uint32_t tileID = block.group_index().x; tileID < numTiles; tileID += grid.num_blocks()){
 
-			block.sync();
-
-			int tileID = i * grid.num_blocks() + block.group_index().x;
 			int tileX = tileID % numTiles_x;
 			int tileY = tileID / numTiles_x;
-			int tileStart = tileX * tileSize + tileY * width * tileSize;
-
-			int pixelID = tileStart + block.thread_rank() % tileSize + (block.thread_rank() / tileSize) * width;
+			int px = tileX * tileSize + block.thread_rank() % tileSize;
+			int py = tileY * tileSize + block.thread_rank() / tileSize;
+			if(px >= width || py >= height) continue;
+			int pixelID = px + py * width;
 
 			Pixel& pixel = framebuffer_p[pixelID];
 
 			float PI = 3.1415;
 			float numSamples = 50;
-			float stepsize = 2.0 * PI / numSamples;
 			float r = 1.5;
 			// The EDL Strength slider and the "enable Eye Dome Lighting" checkbox
 			// have never done anything: this local shadowed uniforms.edlStrength,
@@ -2702,11 +2672,13 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 
 				Pixel neighbour = framebuffer_p[index];
 				
-				sum = sum + max(log2(pixel.depth) - log2(neighbour.depth), 0.0);
+				// single precision: the double literals made this, and the
+				// shade below, double-precision arithmetic at every pixel
+				sum = sum + fmaxf(log2f(pixel.depth) - log2f(neighbour.depth), 0.0f);
 			}
 			
 			float response = sum / numSamples;
-			float shade = __expf(-response * 300.0 * edlStrength);
+			float shade = __expf(-response * 300.0f * edlStrength);
 			// shade = 1.0;
 
 			uint32_t R = shade * ((pixel.color >>  0) & 0xff);
@@ -2715,20 +2687,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			uint32_t color = R | (G << 8) | (B << 16) | (255u << 24);
 
 			pixel.color = color;
-
-			block.sync();
 		}
 		grid.sync();
 	}
 
 	grid.sync();
-
-	// auto tEnd = nanotime();
-	// double millies = double(tEnd - tStart) / 1'000'000.0;
-	// PRINT("duration: %.1f ms \n", millies);
-
-	// (device-side printf removed by apply_voxel_grid.ps1: the host run log
-	//  carries every field, including the emitting count via Stats)
 
 	if(grid.thread_rank() == 0) stats->stageNs[3] = nanotime() - tStart;   // apply_stage_timers.ps1
 	// ---- volumetric light -------------------------------------------------
@@ -2755,13 +2718,13 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		// constant over the frame; the phase function is constant along each ray
 		float3 sunCol = hazeSunColour();
 
-		processRange(0, volW * volH, [&](int i){
+		processRangeStrided(volW * volH, [&](int i){
 			int vx = i % volW;
 			int vy = i / volW;
 
-			// volBuf is scratch memory that also serves other kernels, and the
-			// composite reads every entry, so clear it before any early return
-			// (fisheye corners beyond the lens, or nothing to march through).
+			// The composite reads every entry while the march runs, so clear
+			// it before any early return (fisheye corners beyond the lens, or
+			// nothing to march through).
 			volBuf[4*i + 0] = 0.0f;
 			volBuf[4*i + 1] = 0.0f;
 			volBuf[4*i + 2] = 0.0f;
@@ -2933,14 +2896,6 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		});
 		grid.sync();
 
-	}else{
-		processRange(0, volW * volH, [&](int i){
-			volBuf[4*i + 0] = 0.0f;
-			volBuf[4*i + 1] = 0.0f;
-			volBuf[4*i + 2] = 0.0f;
-			volBuf[4*i + 3] = SKY_DISTANCE;
-		});
-		grid.sync();
 	}
 
 	// ---- tier 1 shading composite ------------------------------------------
@@ -2983,11 +2938,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			}
 		}
 
-		if(uniforms.enableBloom && !showUnedited()){
+		if(uniforms.enableBloom && emissive){   // emissive also excludes the unedited view
 
 			// level 0: 2x2 box from the emission buffer. Reads emission, not a
 			// luminance threshold, so only actual sources bloom.
-			processRange(0, mipW[0] * mipH[0], [&](int i){
+			processRangeStrided(mipW[0] * mipH[0], [&](int i){
 				int x = i % mipW[0];
 				int y = i / mipW[0];
 				float sr = 0.0f, sg = 0.0f, sb = 0.0f;
@@ -3009,7 +2964,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 
 			// downsample: each level a 2x2 box of the one above
 			for(int L = 1; L < numMips; L++){
-				processRange(0, mipW[L] * mipH[L], [&](int i){
+				processRangeStrided(mipW[L] * mipH[L], [&](int i){
 					int x = i % mipW[L];
 					int y = i / mipW[L];
 					float sr = 0.0f, sg = 0.0f, sb = 0.0f;
@@ -3033,7 +2988,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			// upsample: bilinear from L+1, added into L. Accumulating on the way
 			// down is what makes the falloff smooth rather than banded.
 			for(int L = numMips - 2; L >= 0; L--){
-				processRange(0, mipW[L] * mipH[L], [&](int i){
+				processRangeStrided(mipW[L] * mipH[L], [&](int i){
 					int x = i % mipW[L];
 					int y = i / mipW[L];
 
@@ -3076,7 +3031,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		// the whole pixel graded with the backdrop left out: haze and beams in
 		// front of the sky are graded the same as in front of the trunk beside
 		// it, and nothing changes colour at the silhouette.
-		bool volActive = (uniforms.enableVolumetric && uniforms.numEvents > 0) || sunbeamsOn();
+		bool volActive = volEvents || volSun;   // exactly when the march above filled volBuf
 		// grid-stride: coalesced, and with the tone curve's amount the
 		// contiguous form made this loop reload two spilled registers a pixel
 		processRangeStrided(W * H, [&](int pixelIndex){
@@ -3172,9 +3127,11 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 			}
 
 			// unblurred emission core, before the blurred halo
-			r += _emission[3 * pixelIndex + 0];
-			g += _emission[3 * pixelIndex + 1];
-			b += _emission[3 * pixelIndex + 2];
+			if(emissive){
+				r += _emission[3 * pixelIndex + 0];
+				g += _emission[3 * pixelIndex + 1];
+				b += _emission[3 * pixelIndex + 2];
+			}
 
 			// Volumetric light from quarter resolution. The march stopped at the
 			// geometry under one pixel of each 4x4 block, so beside a silhouette
@@ -3218,14 +3175,19 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 					r += vr * n;
 					g += vg * n;
 					b += vb * n;
-				}else{
+				}else if(isGeometry || uniforms.fogSky != 0 || volEvents){
+					// No sample is near this pixel's distance: take the closest.
+					// A sky pixel takes none while only the sunbeams light the
+					// haze and Haze over sky is off, as a sky ray gets none
+					// then; in a canopy gap narrower than the 4 px sample
+					// spacing it used to take a leaf's beam light.
 					r += volBuf[best + 0];
 					g += volBuf[best + 1];
 					b += volBuf[best + 2];
 				}
 			}
 
-			if(uniforms.enableBloom){
+			if(uniforms.enableBloom && emissive){
 				// bilinear upsample from half resolution
 				float fx = (float(x) - 0.5f) * 0.5f;
 				float fy = (float(y) - 0.5f) * 0.5f;

@@ -53,8 +53,6 @@ struct CudaPrint{
 		uint32_t entryIndex = atomicAdd(&entryCounter, 1) % 1000;
 		CudaPrintEntry *entry = &entries[entryIndex];
 
-		constexpr uint32_t numargs{ sizeof...(Args) };
-
 		int argsSize = 0;
 
 		for(const auto p : {args...}) {

@@ -4,7 +4,6 @@
 // License: MIT https://github.com/mrdoob/three.js/blob/dev/LICENSE
 
 #include <cooperative_groups.h>
-#include <curand_kernel.h>
 
 #include "utils.h.cu"
 #include "builtin_types.h"
@@ -207,8 +206,14 @@ bool doCounting(
 			if(group.thread_rank() == 0){
 				old = atomicAdd(&leaf->counter, group.num_threads());
 
+				// A leaf at MAX_DEPTH keeps its points however many there are:
+				// the descents stop at that level, so its children would be out
+				// of reach, and the split leaf's points were all dropped. Only
+				// more than 50,000 points in one 1/2^20 cell (0.2 mm across
+				// the Rotokare cube) get there.
 				if(old <= MAX_POINTS_PER_NODE)
 				if(old + group.num_threads() > MAX_POINTS_PER_NODE)
+				if(leaf->level < MAX_DEPTH)
 				{
 					// needs splitting
 					uint32_t spillIndex = atomicAdd(numSpillingNodes, 1);
@@ -266,7 +271,6 @@ bool doCounting(
 
 		Node* node = spillingNodes[sh_nodeIndex];
 
-		int numChunks = (node->numPoints + POINTS_PER_CHUNK - 1) / POINTS_PER_CHUNK;
 		Chunk* chunk = node->points;
 		int chunkIndex = 0;
 
@@ -287,13 +291,21 @@ bool doCounting(
 			// moved as stored: decoding and encoding again could shift it a unit
 			int pIndex = pointIndex % POINTS_PER_CHUNK;
 			uint32_t spillID = atomicAdd(numSpilledPoints, 1);
-			spilledPoints[spillID] = chunk->points[pIndex];
+			// Written past CONSTRUCT_SPILLED_POINTS unchecked before. A point
+			// that does not fit is dropped and counted, as one with no chunk is.
+			if(spillID < CONSTRUCT_SPILLED_POINTS){
+				spilledPoints[spillID] = chunk->points[pIndex];
+			}else{
+				atomicAdd(&stats->numDroppedPoints, 1);
+			}
 		}
 	}
 
 	grid.sync();
 	// now revert to original value
 	*numSpillingNodes = realNumSpillingNodes;
+	// what is read back below is what the buffer holds
+	if(grid.thread_rank() == 0 && *numSpilledPoints > CONSTRUCT_SPILLED_POINTS) *numSpilledPoints = CONSTRUCT_SPILLED_POINTS;
 
 	grid.sync();
 	auto t_40 = nanotime();
@@ -308,7 +320,7 @@ bool doCounting(
 	return *numSpillingNodes == 0;
 }
 
-bool doSplitting(Node* nodes, Node** spillingNodes, uint32_t* numSpillingNodes){
+void doSplitting(Node* nodes, Node** spillingNodes, uint32_t* numSpillingNodes){
 	auto grid = cg::this_grid();
 
 	// split the spilling nodes
@@ -335,7 +347,8 @@ bool doSplitting(Node* nodes, Node** spillingNodes, uint32_t* numSpillingNodes){
 			child.Z = 2 * spillingNode->Z + cz;
 			child.countIteration = 0;
 			memcpy(&child.name[0], &spillingNode->name[0], 20);
-			child.name[child.level] = i + '0';
+			// name holds levels 0 to 19; a level-20 child wrote one past it
+			if(child.level < 20) child.name[child.level] = i + '0';
 			// child.voxels = Array<Point>();
 			child.numVoxels = 0;
 			child.numVoxelsStored = 0;
@@ -656,12 +669,9 @@ void insertPoints(
 
 	// INSERT POINTS FROM SPILLED NODES
 	// (essentially redistributing from spilled to new leaves)
+	// Every spilled point the buffer holds. Those past 3 M were skipped with
+	// a printf each, and counted nowhere, though their chunks were allocated.
 	processRange(*numSpilledPoints, [&](int pointID){
-
-		if(pointID > 3'000'000){
-			printf("too many spilled points \n");
-			return;
-		}
 
 		// placed by its decoded position, as doCounting placed it; kept as stored
 		StoredPoint stored = spilledPoints[pointID];
@@ -925,7 +935,6 @@ void kernel_construct(
 	float3 octreeMax    = octreeMin + octreeSize;
 	float3 cubePosition = uniforms.boxMin + octreeSize * 0.5f;
 
-	auto tStartExpand = nanotime();
 
 	grid.sync();
 
@@ -939,7 +948,6 @@ void kernel_construct(
 
 	grid.sync();
 
-	constexpr int MAX_SUBPATCH_SIZE      = 1'000'000;
 	constexpr uint64_t MAX_BATCH_SIZE    = 1'000'000;
 
 	uint32_t numBatches = min(numBatchesUploaded - stats->batchletIndex, 20);
@@ -1026,9 +1034,6 @@ void kernel_construct(
 			break;
 		}
 	}
-
-	auto tEndExpand = nanotime();
-	float durationExpandMS = double(tEndExpand - tStartExpand) / 1'000'000.0;
 
 	grid.sync();
 
