@@ -30,8 +30,7 @@ __constant__ Uniforms uniforms;
 Lines* _lines = nullptr;
 float* _emission = nullptr;   // RGB per pixel, added by apply_emission.ps1
 PointCodec g_codec;           // decodes the octree's stored points; set with uniforms each frame
-uint32_t _numEmitting = 0;    // debug counter, apply_debug_log.ps1
-uint32_t _numDrawn    = 0;    // points that survived the density gate, apply_sweep_fixes.ps1
+uint32_t _numDrawn    = 0;    // points that survived the density gate
 
 // ---- warp-aggregated counting (apply_counter_opt.ps1) -------------------
 // A plain atomicAdd(&counter, 1) per point sends 31 MILLION atomics to one
@@ -956,7 +955,6 @@ void drawPoint(Point point, Node* node, uint64_t* framebuffer, float minWorldSiz
 		float emR, emG, emB;
 		evalEmission(point.x, point.y, point.z, emR, emG, emB);
 		bool emitting = (emR + emG + emB) > 0.0001f;
-		if(emitting) countUp(&_numEmitting);   // debug
 
 		// Centred, optionally round splat, visited row by row
 		// (forEachSplatPixel).
@@ -1464,7 +1462,6 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 					chunkIndex++;
 				}
 
-				// if(chunkIndex > (int(10 * uniforms.time) % 50)) break;
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
 				if(!lodKeep(node, pointIndex)) continue;   // LOD cross-fade
@@ -1491,7 +1488,6 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 					float emR, emG, emB;
 					evalEmission(point.x, point.y, point.z, emR, emG, emB);
 					bool emitting = (emR + emG + emB) > 0.0001f;
-					if(emitting) countUp(&_numEmitting);
 					countUp(&_numDrawn);   // colour pass only, once per point
 
 					float half = float(R - 1) * 0.5f;
@@ -1553,7 +1549,6 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 					chunkIndex++;
 				}
 
-				// if(chunkIndex > (int(10 * uniforms.time) % 30)) break;
 
 				int pointInChunkIndex = pointIndex % POINTS_PER_CHUNK;
 				if(!lodKeep(node, pointIndex)) continue;   // LOD cross-fade
@@ -1597,7 +1592,6 @@ void drawNodesHQS(Node* nodes, uint32_t numNodes, uint64_t* framebuffer, uint32_
 					float emR, emG, emB;
 					evalEmission(point.x, point.y, point.z, emR, emG, emB);
 					bool emitting = (emR + emG + emB) > 0.0001f;
-					if(emitting) countUp(&_numEmitting);
 					countUp(&_numDrawn);   // colour pass only, once per point
 
 					float half = float(R - 1) * 0.5f;
@@ -1889,7 +1883,6 @@ void compute_visibility_disjunct(
 		// 	float d = proj.w;
 		// 	float r = nodeSize;
 		// 	float aspect = fwidth / fheight;
-		// 	float pr = 1.0 / tan(uniforms.fovy_rad) * r / sqrt(d * d - r * r);
 		// 	float pixels = pr * fheight * 2.0;
 		// 	float projSize = aspect * fheight * nodeSize / proj.w;
 		// 	if(proj.w > 0.0){
@@ -2285,7 +2278,7 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		return;
 	}
 
-	if(grid.thread_rank() == 0){ _numEmitting = 0; _numDrawn = 0; }
+	if(grid.thread_rank() == 0){ _numDrawn = 0; }
 
 	// Recount the occupancy grid first: the light grid below is derived from
 	// these counts, and the host requests both together after a reallocation.
@@ -2509,7 +2502,6 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 		stats->numVisiblePoints = numVisiblePoints;
 		stats->numVisibleVoxels = numVisibleVoxels;
 		stats->frameID          = uniforms.frameCounter;
-		stats->numEmitting      = _numEmitting;
 		stats->numDrawn         = _numDrawn;
 	}
 
@@ -2722,13 +2714,6 @@ void RENDER_LAUNCH_BOUNDS kernel_render(
 	}
 
 	grid.sync();
-
-	// auto tEnd = nanotime();
-	// double millies = double(tEnd - tStart) / 1'000'000.0;
-	// PRINT("duration: %.1f ms \n", millies);
-
-	// (device-side printf removed by apply_voxel_grid.ps1: the host run log
-	//  carries every field, including the emitting count via Stats)
 
 	if(grid.thread_rank() == 0) stats->stageNs[3] = nanotime() - tStart;   // apply_stage_timers.ps1
 	// ---- volumetric light -------------------------------------------------

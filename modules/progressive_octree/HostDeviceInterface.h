@@ -49,10 +49,7 @@ struct Uniforms{
 	float width;
 	float height;
 	float insectPhase[6];   // radians in [0, 2 pi): the insects' six motion phases (getUniforms)
-	float fovy_rad;
-	mat4 world;
 	mat4 view;
-	mat4 proj;
 	mat4 transform;
 	mat4 transform_updateBound;
 	mat4 transformInv_updateBound;
@@ -242,7 +239,6 @@ struct Stats{
 	uint32_t numVisibleLeaves           = 0;
 	uint32_t numVisiblePoints           = 0;
 	uint32_t numVisibleVoxels           = 0;
-	uint32_t numEmitting                = 0;   // apply_insects.ps1
 	uint32_t numDrawn                   = 0;   // apply_sweep_fixes.ps1
 	uint64_t stageNs[8]                 = {0,0,0,0,0,0,0,0};   // apply_stage_timers.ps1: ns since kernel start at each stage boundary
 	int      pickValid                  = 0;   // apply_navigate.ps1: a pick landed on geometry
@@ -257,7 +253,6 @@ struct Stats{
 	uint64_t numPointsProcessed         = 0;
 	uint64_t numAllocatedChunks         = 0;
 	uint64_t chunkPoolSize              = 0;
-	uint32_t dbg                        = 0;
 	uint32_t numDroppedPoints           = 0;   // points whose leaf had no chunk for them; not stored
 	uint32_t numRingMismatches          = 0;   // upload-ring slots refilled before the kernel had finished their batch
 	uint32_t numClampedPoints           = 0;   // points outside the box, stored on its faces (header bounds too small)

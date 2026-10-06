@@ -56,7 +56,6 @@ extern "C" { __declspec(dllexport) unsigned long NvOptimusEnablement = 0x0000000
 constexpr uint64_t MAX_DECODED_AHEAD    = 50;          // batches the loaders may decode ahead of the kernel, in pinned host memory
 constexpr uint64_t MAX_BATCH_SIZE       = 1'000'000;   // each loaded batch comprises <size> points
 constexpr uint64_t VRAM_RESERVE_BYTES   = 512'000'000; // left free beside the octree pool: grids, GL framebuffers, headroom
-constexpr int MAX_LOADQUEUE_SIZE        = 300;         // stop loading from disk if processing lags behind
 
 CudaPrint cudaprint;
 
@@ -146,13 +145,10 @@ static void releaseFrameTexture(){
 	g_registeredFrameTexture = 0;
 }
 
-CUevent ce_render_start, ce_render_end;
-CUevent ce_update_start, ce_update_end;
 cudaStream_t stream_upload, stream_download;
 
 CudaModularProgram* cuda_program_update = nullptr;
 CudaModularProgram* cuda_program_render = nullptr;
-// CudaModularProgram* cuda_program_filter = nullptr;
 CudaModularProgram* cuda_program_reset  = nullptr;
 
 glm::mat4 transform;
@@ -160,8 +156,6 @@ glm::mat4 transform_updatebound;
 
 Stats stats;
 void* h_stats_pinned = nullptr;
-
-double t_drop_start = 0.0;
 
 // Settings. Everything that changes how the cloud is represented starts at the
 // value that changes nothing, the unedited baseline: each point in the colour
@@ -178,7 +172,6 @@ struct {
 	bool colorByNode                 = false;
 	bool colorByLOD                  = false;
 	bool autoFocusOnLoad             = true;
-	bool benchmarkRendering          = false;
 	float minNodeSize                = 64.0f;
 	bool  adaptiveDetail             = true;    // coarsen LOD when frames exceed the budget
 	float frameBudgetMs              = 33.0f;   // render-kernel time to aim for (30 fps)
@@ -391,25 +384,10 @@ struct PinnedMemPool{
 
 
 bool requestReset                  = false;
-bool requestBenchmark              = false;
-bool requestColorFiltering         = false;
-float renderingDuration            = 0.0f;
 atomic_uint64_t numPointsUploaded  = 0;   // written by the uploader, read by the main thread's progress log
 double loadStart                   = 0.0;   // now() when the load began
 
-float kernelUpdateDuration         = 0.0f;
-float totalUpdateDuration          = 0.0f;
-double minKernelUpdateDuration     = Infinity;
-double maxKernelUpdateDuration     = 0.0;
-double avgKernelUpdateDuration     = 0.0;
-double cntKernelUpdateDuration     = 0.0;
-
-float kernelRenderDuration         = 0.0f;
-float totalRenderDuration          = 0.0f;
-double minKernelRenderDuration     = Infinity;
-double maxKernelRenderDuration     = 0.0;
-double avgKernelRenderDuration     = 0.0;
-double cntKernelRenderDuration     = 0.0;
+float totalUpdateDuration          = 0.0f;   // ms since the load began, for the Stats window
 
 atomic_uint64_t numPointsTotal     = 0;
 atomic_uint64_t numPointsLoaded    = 0;
@@ -417,7 +395,6 @@ atomic_uint64_t numBytesTotal      = 0;
 atomic_uint64_t numBytesLoaded     = 0;
 atomic_uint64_t numThreadsLoading  = 0;
 atomic_int numBatchesTotal         = 0;
-int numBatchesProcessed            = 0;
 bool lastBatchFinishedDevice       = false;
 bool loadStoppedAtCapacity         = false;
 
@@ -450,7 +427,6 @@ atomic_uint64_t pointsProcessedHost  = 0;
 uint64_t momentaryBufferCapacity   = 0;
 uint64_t persistentBufferCapacity  = 0;
 uint64_t renderBufferCapacity      = 0;
-vector<double> processFrameTimes; 
 
 PinnedMemPool pinnedMemPool;
 
@@ -628,8 +604,6 @@ static void cuCheck(CUresult res, const char* what){
 	fflush(stdout);
 	exit(3);
 }
-
-float toggle = 1.0;
 
 // ---- call schedule (inserted by apply_emission.ps1) -----------------------
 // Reads the CSV the test kit generates. Columns:
@@ -2286,14 +2260,10 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	glm::mat4 view = renderer->camera->view;
 	glm::mat4 proj = renderer->camera->proj;
 	glm::mat4 worldViewProj = proj * view * world;
-	world = glm::transpose(world);
 	view = glm::transpose(view);
-	proj = glm::transpose(proj);
 	worldViewProj = glm::transpose(worldViewProj);
 
-	memcpy(&uniforms.world, &world, sizeof(world));
 	memcpy(&uniforms.view, &view, sizeof(view));
-	memcpy(&uniforms.proj, &proj, sizeof(proj));
 	memcpy(&uniforms.transform, &worldViewProj, sizeof(worldViewProj));
 
 	// volumetric medium (apply_volumetric.ps1): clip -> world for view rays,
@@ -2346,7 +2316,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	
 	uniforms.width                    = static_cast<float>(renderer->width);
 	uniforms.height                   = static_cast<float>(renderer->height);
-	uniforms.fovy_rad                 = 3.1415f * renderer->camera->fovy / 180.0;
 	{
 		// The insects move along a sum of sines at six fixed rates, in radians
 		// a second at speed 1. Their phases are reduced here, in double: the
@@ -2509,7 +2478,6 @@ Uniforms getUniforms(shared_ptr<GLRenderer> renderer){
 	uniforms.cellSize        = g_cellSize;
 	uniforms.showVoxelGrid   = settings.showVoxelGrid;
 	uniforms.insectPlacement = settings.insectPlacement;
-	uniforms.numNodesTotal   = int(stats.numNodes);
 	uniforms.gridRefill = g_frameGridRefill ? 1 : 0;   // decided once per frame in beginFrameState
 	uniforms.showEventMarkers = settings.showEventMarkers;
 	uniforms.useVoxelGrid     = settings.useVoxelGrid;
@@ -2759,80 +2727,12 @@ void updateOctree(shared_ptr<GLRenderer> renderer){
 		&cptr_batchTags,
 	};
 
-	// printfmt("launching update!\n");
-	// printfmt("    frame:                   {} \n", renderer->frameCount);
-	// printfmt("    points:                  {} \n", batchStreamPointSize[processRingIndex]);
-	// printfmt("    uploadIndex:             {} \n", batchStreamUploadIndex);
-	// printfmt("    uploadRingIndex:         {} \n", batchStreamUploadIndex % BATCH_STREAM_SIZE);
-	// printfmt("    processIndex:            {} \n", batchStreamProcessIndex);
-	// printfmt("    processRingIndex:        {} \n", processRingIndex);
-	// printfmt("    cptr_points_ringbuffer:  {} \n", cptr_points_ringbuffer);
-	// printfmt("    ptrPoints:               {} \n", ptrPoints);
-
-	cuEventRecord(ce_update_start, 0);
-	// printfmt("launch update \n");
 	auto res_launch = cuLaunchCooperativeKernel(cuda_program_update->kernels["kernel_construct"],
 		numGroups, 1, 1,
 		workgroupSize, 1, 1,
 		0, 0, args);
-	// printfmt("update done\n");
-
 	logLaunch("construct", res_launch);
-
-	cuEventRecord(ce_update_end, 0);
-
-	// benchmark kernel- slows down overall loading!
-	if(requestBenchmark){ 
-		cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
-
-		float duration;
-		cuEventElapsedTime(&duration, ce_update_start, ce_update_end);
-
-		kernelUpdateDuration    += duration;
-		minKernelUpdateDuration = std::min(minKernelUpdateDuration, double(duration));
-		maxKernelUpdateDuration = std::max(maxKernelUpdateDuration, double(duration));
-		avgKernelUpdateDuration = (cntKernelUpdateDuration * avgKernelUpdateDuration + duration) / (cntKernelUpdateDuration + 1.0);
-		cntKernelUpdateDuration += 1.0;
-	}
-
-	numBatchesProcessed++;
-
-	// cuCtxSynchronize();
 }
-
-// post-process color-filtering.
-// computes average color values for voxels.
-// void doColorFiltering(shared_ptr<GLRenderer> renderer){
-
-// 	if(!lastBatchFinishedDevice) return;
-
-// 	Uniforms uniforms = getUniforms(renderer);
-
-// 	int workgroupSize = 256;
-// 	int numGroups = numSMs;
-
-// 	void* args[] = {
-// 		&uniforms,
-// 		&cptr_buffer, 
-// 		&cptr_nodes, 
-// 		&cptr_stats
-// 	};
-
-// 	printfmt("launching color filter!\n");
-
-// 	auto res_launch = cuLaunchCooperativeKernel(cuda_program_filter->kernels["kernel"],
-// 		numGroups, 1, 1,
-// 		workgroupSize, 1, 1,
-// 		0, 0, args);
-
-// 	if(res_launch != CUDA_SUCCESS){
-// 		const char* str; 
-// 		cuGetErrorString(res_launch, &str);
-// 		printf("error: %s \n", str);
-// 	}
-
-// 	requestColorFiltering = false;
-// }
 
 // The uniforms of a frame, with the insects' phases and the frame number
 // cleared where the kernel does not read them: the phases move only the
@@ -2937,8 +2837,6 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	CUsurfObject output_surf;
 	cuSurfObjectCreate(&output_surf, &res_desc);
 
-	cuEventRecord(ce_render_start, 0);
-
 	int workgroupSize = 256;   // kernel_render's __launch_bounds__ in render.cu assumes 256
 	
 	int maxActiveBlocksPerSM;
@@ -2978,27 +2876,6 @@ void renderCUDA(shared_ptr<GLRenderer> renderer){
 	if(g_frameDrawn && g_frameGridRefill) g_refillGen++;   // the bird's-eye view follows the grid
 	logLaunch("render", res_launch);
 	if(!g_frameDrawn) keepFrameRequests();
-
-	cuEventRecord(ce_render_end, 0);
-
-	// benchmark kernel- slows down overall loading!
-	if(requestBenchmark){ 
-		cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
-
-		float duration;
-		cuEventElapsedTime(&duration, ce_render_start, ce_render_end);
-
-		kernelRenderDuration    += duration;
-		minKernelRenderDuration = std::min(minKernelRenderDuration, double(duration));
-		maxKernelRenderDuration = std::max(maxKernelRenderDuration, double(duration));
-		avgKernelRenderDuration = (cntKernelRenderDuration * avgKernelRenderDuration + duration) / (cntKernelRenderDuration + 1.0);
-		cntKernelRenderDuration += 1.0;
-	}
-
-	if(settings.benchmarkRendering){
-		cuCheck(cuCtxSynchronize(), "cuCtxSynchronize");
-		cuEventElapsedTime(&renderingDuration, ce_render_start, ce_render_end);
-	}
 
 	cuSurfObjectDestroy(output_surf);
 	cuGraphicsUnmapResources(static_cast<int>(dynamic_resources.size()), dynamic_resources.data(), ((CUstream)CU_STREAM_DEFAULT));
@@ -3096,14 +2973,6 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 		.kernels = {"kernel_render"}
 	});
 
-	// cuda_program_filter = new CudaModularProgram({
-	// 	.modules = {
-	// 		"./modules/progressive_octree/colorfilter.cu",
-	// 		"./modules/progressive_octree/utils.cu",
-	// 	},
-	// 	.kernels = {"kernel"}
-	// });
-
 	// The octree pool gets the VRAM that is left, so it is sized only now that
 	// the kernels are compiled. Their local memory (register spills, stack) is
 	// claimed from the same VRAM when they are first launched, for every
@@ -3181,11 +3050,6 @@ void initCudaProgram(shared_ptr<GLRenderer> renderer){
 		cptr_buffer_persistent_bytes / 1e6, availableMem / 1e6,
 		double(availableMem - cptr_buffer_persistent_bytes) / 1e6, localMemBytes / 1e6);
 
-	cuEventCreate(&ce_render_start, 0);
-	cuEventCreate(&ce_render_end, 0);
-	cuEventCreate(&ce_update_start, 0);
-	cuEventCreate(&ce_update_end, 0);
-	
 	size_t freeAfterInit = 0;
 	cuMemGetInfo(&freeAfterInit, &totalMem);
 	logLine("[vram] %.0f MB free after allocating the octree pool\n", freeAfterInit / 1e6);
@@ -3232,18 +3096,6 @@ void reload(){
 
 	loadStart = now();
 	totalUpdateDuration     = 0.0f;
-	kernelUpdateDuration    = 0.0f;
-	minKernelUpdateDuration = Infinity;
-	maxKernelUpdateDuration = 0.0;
-	avgKernelUpdateDuration = 0.0;
-	cntKernelUpdateDuration = 0.0;
-
-	totalRenderDuration     = 0.0f;
-	kernelRenderDuration    = 0.0f;
-	minKernelRenderDuration = Infinity;
-	maxKernelRenderDuration = 0.0;
-	avgKernelRenderDuration = 0.0;
-	cntKernelRenderDuration = 0.0;
 
 	lock_guard<mutex> lock_batchesToProcess(mtx_batchesToProcess);
 	lock_guard<mutex> lock_batchesInPinnedMemory(mtx_batchesInPinnedMemory);
@@ -3384,11 +3236,9 @@ void reload(){
 	batchesProcessedHost    = 0;
 	pointsProcessedHost     = 0;
 	numPointsUploaded       = 0;
-	numBatchesProcessed     = 0;
 	lastBatchFinishedDevice = false;
 	loadStoppedAtCapacity   = false;
 	batchStreamUploadIndex  = 0;
-	processFrameTimes.clear();
 
 	if(numPointsTotal > 0){
 		logLine("[load] start: %.2f M points in %d batches, %.2f GB on disk%s\n",
@@ -3577,10 +3427,6 @@ void spawnLoader(size_t i, int maxLazThreads) {
 				PinnedMemorySlot pinnedMemSlot = pinnedMemPool.acquire();
 				Point* pinnedPoints = (Point*)pinnedMemSlot.memLocation;
 
-				int batchID = batch.first / MAX_BATCH_SIZE;
-				double t_start = now();
-				// printfmt("start loading batch {} at {:.3f} \n", batchID, t_start);
-
 				if(iEndsWith(batch.file, ".las")){
 					void* target = (void*)pinnedPoints;
 
@@ -3720,10 +3566,6 @@ void spawnLoader(size_t i, int maxLazThreads) {
 					batchesInPinnedMemory.push_back(batch);
 				}
 
-				// double t_end = now();
-				// double millies = (t_end - t_start) * 1000.0;
-				// printfmt("finished loading batch {} at {:.3f}. duration: {:.3f} ms \n", batchID, t_end, millies);
-
 				numThreadsLoading--;
 			}
 
@@ -3740,7 +3582,7 @@ void spawnLoader(size_t i, int maxLazThreads) {
 // Spawns a thread that uploads data to the GPU
 // - Asynchronously schedules uploads in stream_upload
 // - After every async copy, it also asynchronously updates the number of uploaded points
-void spawnUploader(shared_ptr<GLRenderer> renderer) {
+void spawnUploader() {
 
 	thread t([]() {
 		installThreadTerminateHandler();
@@ -4032,7 +3874,7 @@ int main(int argc, char** argv){
 
 	cudaprint.init();
 	
-	spawnUploader(renderer);
+	spawnUploader();
 
 	// Command line: SimLOD.exe [cloud.las|.laz|.simlod ...] [--view yaw pitch radius tx ty tz]
 	// Files load as if dropped on the window; --view sets the camera afterwards
@@ -4202,9 +4044,6 @@ int main(int argc, char** argv){
 	renderer->onFileDrop([&](vector<string> files){
 		vector<string> pointCloudFiles;
 
-		t_drop_start = now();
-		printfmt("drop at {:.3f} \n", now());
-
 		for(auto file : files){
 			logLine("[load] dropped: %s\n", file.c_str());
 
@@ -4369,10 +4208,6 @@ int main(int argc, char** argv){
 
 		glBindFramebuffer(GL_FRAMEBUFFER, renderer->view.framebuffer->handle);
 
-		if(!lastBatchFinishedDevice){
-			processFrameTimes.push_back(timeSinceLastFrame);
-		}
-
 		if(requestReset){
 			reset(renderer);
 			if(startCameraPending){
@@ -4512,18 +4347,10 @@ int main(int argc, char** argv){
 			updateOctree(renderer);
 		}
 
-		// if(requestColorFiltering){
-		// 	doColorFiltering(renderer);
-		// }
-
 		if(!lastBatchFinishedDevice){
 			totalUpdateDuration = float(1000.0 * (now() - loadStart));
-		}else if(requestBenchmark && lastBatchFinishedDevice){
-			requestBenchmark = false;
-			printfmt("finished loading, disabling benchmarking. \n");
 		}
 
-		static int statsAge = 0;
 		{
 			// copy stats from gpu to cpu.
 			// actually laggs behind because we do async copy.
@@ -4536,8 +4363,6 @@ int main(int argc, char** argv){
 			batchesProcessedHost = stats.batchletIndex;
 			pointsProcessedHost  = stats.numPointsProcessed;
 
-			statsAge = static_cast<int>(renderer->frameCount) - stats.frameID;
-
 			if(!lastBatchFinishedDevice && numPointsTotal > 0){
 				logIfChanged("load", 2.0, "[load] %.1f s: %.1f M decoded, %.1f M uploaded, %.1f M of %.1f M inserted; octree pool %.0f of %.0f MB\n",
 					now() - loadStart, numPointsLoaded / 1e6, numPointsUploaded / 1e6,
@@ -4549,15 +4374,6 @@ int main(int argc, char** argv){
 				stopLoadingAtCapacity();
 			}
 
-			static uint64_t previousNumPointsProcessed = 0;
-			uint64_t numPointsProcessed = stats.numPointsProcessed;
-
-			// if(numPointsProcessed != previousNumPointsProcessed){
-			// 	printfmt("processed {} at {:.3f}. since drop: {:.3f} \n", numPointsProcessed, now(), now() - t_drop_start);
-
-			// 	previousNumPointsProcessed = numPointsProcessed;
-			// }
-			
 
 			{   // batches a loader could not read (skipUnreadableBatch)
 				static uint64_t reportedUnreadable = 0;
@@ -5183,10 +4999,6 @@ int main(int argc, char** argv){
 				}
 			}
 
-			// if(ImGui::Button("Do Color Filtering!")){
-			// 	requestColorFiltering = true;
-			// }
-
 			ImGui::End();
 			if(smallText){
 				ImGui::PopStyleVar(3);
@@ -5289,11 +5101,6 @@ int main(int argc, char** argv){
 				return leftPad(str, 14);
 			};
 
-			auto toB = [locale](double number) {
-				string str = format(locale, "{:.1Lf} B", number / 1'000'000'000.0);
-				return leftPad(str, 14);
-			};
-
 			auto toMB = [locale](double number){
 				string str = format(locale, "{:.1Lf} MB", number / 1'000'000.0);
 				return leftPad(str, 15);
@@ -5308,50 +5115,31 @@ int main(int argc, char** argv){
 				return leftPad(str, 10);
 			};
 
-			double pointsSecUpdate = double(stats.numPointsProcessed) / (double(kernelUpdateDuration) / 1000.0);
+			// Rates over the load so far. The rows for the kernels' own
+			// durations and the rendering rates were filled only by a
+			// benchmark that nothing switched on, so they read "-" or 0; the
+			// stage rows below give the render kernel's times.
 			double pointsSecTotal = double(stats.numPointsProcessed) / (double(totalUpdateDuration) / 1000.0);
 			double gbs_file = double(numBytesLoaded) / (totalUpdateDuration / 1000.0);
 			double gbs_gpu = double(16llu * stats.numPointsProcessed) / (totalUpdateDuration / 1000.0);
 
-			double millionPointsSecRendered = 1000.0 * float(stats.numVisiblePoints) / renderingDuration;
-			double millionVoxelsSecRendered = 1000.0 * float(stats.numVisibleVoxels) / renderingDuration;
-			double millionSamplesSecRendered = 1000.0 * (float(stats.numVisiblePoints + stats.numVisibleVoxels) / renderingDuration);
-
-			if(!settings.benchmarkRendering){
-				millionPointsSecRendered = 0.0;
-				millionVoxelsSecRendered = 0.0;
-				millionSamplesSecRendered = 0.0;
-				renderingDuration = 0.0;
-			}
-
 			double M = 1'000'000.0;
-			double B = 1'000'000'000.0;
 			double MB = 1'000'000.0; // TIL: MB = 1'000'000 vs. MiB = 1024 * 1024
 			double GB = 1'000'000'000.0;
 
 			vector<vector<string>> table = {
-				{"#update kernel duration  ", toMS(kernelUpdateDuration)                            , format("{:.1f}", kernelUpdateDuration)},
-				{"    max                  ", toMS(maxKernelUpdateDuration)                         , format("{:.1f}", maxKernelUpdateDuration)},
-				{"    avg                  ", toMS(avgKernelUpdateDuration)                         , format("{:.1f}", avgKernelUpdateDuration)},
 				{"#update total duration   ", toMS(totalUpdateDuration)                             , format("{:.1f}", totalUpdateDuration)},
-				{"points/sec update kernel ", toM(pointsSecUpdate)                                  , format("{:.1f}", totalUpdateDuration / M)},
 				{"points/sec total         ", toM(pointsSecTotal)                                   , format("{:.1f}", pointsSecTotal / M)},
-				{"GB/s (disk I/O)          ", toGB(gbs_file)                                        , format("{:.1f}", gbs_file / GB)},
+				// LAZ batches are not counted in numBytesLoaded
+				{"GB/s (disk I/O)          ", lazInBatches ? leftPad("-", 15) : toGB(gbs_file)    , lazInBatches ? string("-") : format("{:.1f}", gbs_file / GB)},
 				{"GB/s (gpu)               ", toGB(gbs_gpu)                                         , format("{:.1f}", gbs_gpu / GB)},
-				{"=========================", " "                                                   , " "},
-				{"#render kernel duration  ", toMS(kernelRenderDuration)                            , format("{:.1f}", kernelRenderDuration)},
-				{"=========================", " "                                                   , " "},
-				{"rendering duration       ", toMS(renderingDuration)                               , format("{:.1f}", renderingDuration)},
-				{"    points / sec         ", toB(millionPointsSecRendered)                        , format("{:.1f}", millionPointsSecRendered / B)},
-				{"    voxels / sec         ", toB(millionVoxelsSecRendered)                        , format("{:.1f}", millionVoxelsSecRendered / B)},
-				{"    samples / sec        ", toB(millionSamplesSecRendered)                       , format("{:.1f}", millionSamplesSecRendered / B)},
 				{"=========================", " "                                                   , " "},
 				{"#points processed        ", toM(double(stats.numPointsProcessed))                 , format("{:.1f}", stats.numPointsProcessed / M)},
 				{"#nodes                   ", toIntString(stats.numNodes)                           , format("{}", stats.numNodes)},
 				{"    #inner               ", toIntString(stats.numInner)                           , format("{}", stats.numInner)},
 				{"    #leaves (nonempty)   ", toIntString(stats.numNonemptyLeaves)                  , format("{}", stats.numNonemptyLeaves)},
 				{"    #leaves (empty)      ", toIntString(numEmptyLeaves)                           , format("{}", numEmptyLeaves)},
-				{"#chunks                  ", toIntString(stats.numNodes)                           , format("{}", stats.numNodes)},
+				{"#chunks                  ", toIntString(stats.numChunksPoints + stats.numChunksVoxels), format("{}", stats.numChunksPoints + stats.numChunksVoxels)},
 				{"    #voxels              ", toIntString(stats.numChunksVoxels)                    , format("{}", stats.numChunksVoxels)},
 				{"    #points              ", toIntString(stats.numChunksPoints)                    , format("{}", stats.numChunksPoints)},
 				{"#samples                 ", toM(stats.numPoints + stats.numVoxels)                , format("{:.1f}", (stats.numPoints + stats.numVoxels) / M)},

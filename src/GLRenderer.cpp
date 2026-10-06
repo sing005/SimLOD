@@ -135,9 +135,6 @@ void GLRenderer::init(){
 
 	cout << "<create windows>" << endl;
 	if (numMonitors > 1) {
-		const GLFWvidmode * modeLeft = glfwGetVideoMode(monitors[0]);
-		const GLFWvidmode * modeRight = glfwGetVideoMode(monitors[1]);
-
 		window = glfwCreateWindow(1920, 1080, "SimLOD", nullptr, nullptr);
 
 		if (!window) {
@@ -209,7 +206,6 @@ void GLRenderer::init(){
 		IMGUI_CHECKVERSION();
 		ImGui::CreateContext();
 		ImPlot::CreateContext();
-		ImGuiIO& io = ImGui::GetIO();
 		ImGui_ImplGlfw_InitForOpenGL(window, true);
 		ImGui_ImplOpenGL3_Init("#version 450");
 		ImGui::StyleColorsDark();
@@ -385,7 +381,6 @@ void GLRenderer::loop(function<void(void)> update, function<void(void)> render){
 			// sFrames.AddPoint(t, 1000.0f * timeSinceLastFrame);
 			s60fps.AddPoint(t, 1000.0f / 60.0f);
 			s120fps.AddPoint(t, 1000.0f / 120.0f);
-			static ImPlotAxisFlags rt_axis = ImPlotAxisFlags_NoTickLabels;
 			ImPlot::SetNextPlotLimitsX(t - history, t, ImGuiCond_Always);
 			ImPlot::SetNextPlotLimitsY(0, 30, ImGuiCond_Always);
 
